@@ -10,11 +10,11 @@
 #include <signal.h>
 #include <thread>
 #include <vector>
+#include "Poller.h"
 
 namespace minidb {
 
 class Channel;
-class Poller;
 class EpollOperations;
 
 class EventLoop {
@@ -70,7 +70,7 @@ class EventLoop {
     std::atomic<bool> quit_;
     std::thread::id thread_id_;
     std::unique_ptr<Poller> poller_;
-    std::vector<Channel*> active_channels_;
+    std::vector<Poller::ActiveChannel> active_channels_;
 
     int wakeup_fd_;
     // Serializes cross-thread wakeup writes with descriptor teardown.

@@ -60,6 +60,7 @@ void TcpConnection::connect_established() {
     }
     set_state(kConnected);
     reading_ = true;
+    channel_->tie(shared_from_this());
     channel_->enable_reading();
     if (connection_callback_) {
         connection_callback_(shared_from_this());

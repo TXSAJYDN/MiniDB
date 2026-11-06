@@ -91,7 +91,7 @@ void Poller::fill_active_channels(int num_events,
         }
         Channel* channel = found->second;
         channel->set_revents(events_[i].events);
-        active_channels->push_back(channel);
+        active_channels->push_back(ActiveChannel{channel, events_[i].data.u64});
     }
 }
 
@@ -139,6 +139,11 @@ void Poller::update_channel(Channel* channel) {
             channels_.erase(it);
         }
     }
+}
+
+bool Poller::is_current(Channel* channel, std::uint64_t token) const {
+    const auto found = channels_by_token_.find(token);
+    return found != channels_by_token_.end() && found->second == channel;
 }
 
 void Poller::remove_channel(Channel* channel) {

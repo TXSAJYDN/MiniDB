@@ -164,8 +164,14 @@ void EventLoop::loop() {
     while (!quit_.load(std::memory_order_acquire)) {
         active_channels_.clear();
         poller_->poll(10000, &active_channels_);
-        for (Channel* channel : active_channels_) {
-            channel->handle_event();
+        for (const Poller::ActiveChannel& ready : active_channels_) {
+            // A callback earlier in this batch may have retired the channel
+            // (and even reused its descriptor).  The poller token is unique
+            // per registration, so stale entries are skipped without
+            // dereferencing a retired Channel.
+            if (poller_->is_current(ready.channel, ready.token)) {
+                ready.channel->handle_event();
+            }
         }
         do_pending_functors();
     }

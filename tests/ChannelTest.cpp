@@ -3,6 +3,7 @@
 #include "../src/net/Channel.h"
 
 #include <cerrno>
+#include <memory>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -109,6 +110,23 @@ TEST(ChannelTest, ErrorWithoutReadOrCloseBitsDoesNotInvokeThoseCallbacks) {
     EXPECT_EQ(errors, 1);
     EXPECT_EQ(reads, 0);
     EXPECT_EQ(closes, 0);
+}
+
+TEST(ChannelTest, CallbackMayDestroyChannelWithoutLaterCallbackAccess) {
+    auto channel = std::make_unique<Channel>(nullptr, 80);
+    int error_calls = 0;
+    int read_calls = 0;
+    channel->set_error_callback([&]() {
+        ++error_calls;
+        channel.reset();
+    });
+    channel->set_read_callback([&]() { ++read_calls; });
+
+    channel->set_revents(EPOLLERR | EPOLLIN);
+    channel->handle_event();
+
+    EXPECT_EQ(error_calls, 1);
+    EXPECT_EQ(read_calls, 0);
 }
 
 TEST(ChannelTest, MissingCallbacksAreIgnored) {

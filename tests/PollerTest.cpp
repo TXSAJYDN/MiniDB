@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -232,6 +233,38 @@ TEST(PollerTest, AddFailureDoesNotPublishTokenAndCanBeRetried) {
     EXPECT_EQ(read_calls, 1);
 
     channel.disable_all();
+}
+
+TEST(PollerTest, BatchSkipsChannelDestroyedByEarlierCallback) {
+    auto operations = std::make_shared<FakeEpollOperations>();
+    EventLoop loop(operations);
+    operations->ctl_calls.clear();
+
+    auto first = std::make_unique<Channel>(&loop, 59);
+    auto victim = std::make_unique<Channel>(&loop, 60);
+    int first_calls = 0;
+    int victim_calls = 0;
+    first->set_read_callback([&]() {
+        ++first_calls;
+        victim.reset();
+    });
+    victim->set_read_callback([&]() { ++victim_calls; });
+    first->enable_reading();
+    victim->enable_reading();
+    ASSERT_EQ(operations->ctl_calls.size(), 2u);
+    const std::uint64_t first_token = operations->ctl_calls[0].token;
+    const std::uint64_t victim_token = operations->ctl_calls[1].token;
+
+    operations->queued_events.push_back(
+        FakeEpollOperations::QueuedEvent{first_token, EPOLLIN});
+    operations->queued_events.push_back(
+        FakeEpollOperations::QueuedEvent{victim_token, EPOLLIN});
+    operations->quit_after_wait = [&loop]() { loop.quit(); };
+    loop.loop();
+
+    EXPECT_EQ(first_calls, 1);
+    EXPECT_EQ(victim_calls, 0);
+    first->disable_all();
 }
 
 TEST(PollerTest, DestructorClosesInjectedEpollDescriptor) {

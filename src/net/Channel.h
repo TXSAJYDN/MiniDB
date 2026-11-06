@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <memory>
 
 namespace minidb {
 class EventLoop;
@@ -23,6 +24,15 @@ class Channel {
     }
     void set_error_callback(EventCallback cb) {
         error_callback_ = std::move(cb);
+    }
+
+    // Ties the channel's dispatch lifetime to the owner object.  When set, an
+    // event dispatch holds a strong reference until all selected callbacks
+    // have returned, so a callback may retire the owner without leaving the
+    // dispatcher with a dangling object.
+    void tie(const std::shared_ptr<void>& owner) {
+        tie_ = owner;
+        tied_ = true;
     }
 
     int fd() const {
@@ -72,6 +82,10 @@ class Channel {
     void remove();
 
   private:
+    struct DispatchState {
+        bool alive = true;
+    };
+
     void update();
     static const int kNoneEvent;
     static const int kReadEvent;
@@ -85,6 +99,9 @@ class Channel {
     EventCallback write_callback_;
     EventCallback close_callback_;
     EventCallback error_callback_;
+    std::shared_ptr<DispatchState> dispatch_state_;
+    std::weak_ptr<void> tie_;
+    bool tied_;
     bool added_to_loop_;
 };
 } // namespace minidb

@@ -27,7 +27,11 @@ std::shared_ptr<EpollOperations> make_default_epoll_operations();
 
 class Poller {
   public:
-    using ChannelList = std::vector<Channel*>;
+    struct ActiveChannel {
+        Channel* channel;
+        std::uint64_t token;
+    };
+    using ChannelList = std::vector<ActiveChannel>;
     explicit Poller(EventLoop* loop);
     Poller(EventLoop* loop, std::shared_ptr<EpollOperations> operations);
     ~Poller();
@@ -37,6 +41,7 @@ class Poller {
     void poll(int timeout_ms, ChannelList* active_channels);
     void update_channel(Channel* channel);
     void remove_channel(Channel* channel);
+    bool is_current(Channel* channel, std::uint64_t token) const;
 
   private:
     struct Registration {

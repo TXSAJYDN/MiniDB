@@ -56,7 +56,8 @@ RDB v2 快照包含：
 |---|---|
 | 文件大小 | `67,108,864` 字节（恰好 64 MiB） |
 | record count | 64 |
-| SHA-256 | `4b399a1decfaa878950fc20ba22d164d1984e170069a783798945d5f06c4f555` |
+| 在线 SAVE 后、恢复启动前 SHA-256 | `4b399a1decfaa878950fc20ba22d164d1984e170069a783798945d5f06c4f555` |
+| 恢复服务优雅退出重写后 SHA-256 | `e8966c16b6f98db63e650a4cb4468f3bb908ff59eef421fc4ede0b38678dab21` |
 | 启动恢复 keys | 64/64 |
 | 在线 SAVE | HTTP 200 |
 | SAVE 请求耗时 | 1265.410 ms |
@@ -65,6 +66,8 @@ RDB v2 快照包含：
 | RSS 预算 | 512 MiB |
 | SAVE 暂停预算 | 30 秒 |
 | 临时文件残留 | 0 |
+
+第一个摘要是启动恢复实际加载的文件；恢复进程收到 SIGTERM 后按正常关停流程再次执行 SAVE，所以最终文件被重写为第二个摘要。两次文件大小均为精确 64 MiB，第二个摘要不表示恢复失败。
 
 所有断言均通过，`failed_assertions` 为空。
 
@@ -76,6 +79,7 @@ RDB v2 快照包含：
 /home/win11/minidb-ah-final-20261106-v3-evidence/stage-g/rss-startup-recovery.jsonl
 /home/win11/minidb-ah-final-20261106-v3-evidence/stage-g/logs/
 /home/win11/minidb-ah-final-20261106-v3-evidence/stage-g/work/stage-g-max.rdb
+/home/win11/minidb-ah-final-20261106-v3-evidence/stage-g/stage-g-post-recovery.sha256
 ```
 
 对应 CTest 日志位于六配置证据目录的 `ctest.log`。

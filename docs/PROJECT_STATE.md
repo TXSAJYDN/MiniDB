@@ -105,13 +105,14 @@ Debug / ASan / UBSan 均完成真实 echo：
 ### 4.3 Stage G
 
 - RDB 大小：`67,108,864` 字节，恰好 64 MiB；
-- SHA-256：`4b399a1decfaa878950fc20ba22d164d1984e170069a783798945d5f06c4f555`；
+- 在线 SAVE 后、恢复启动前 SHA-256：`4b399a1decfaa878950fc20ba22d164d1984e170069a783798945d5f06c4f555`；
 - 64 keys 完整恢复；
 - 在线 SAVE HTTP 200，1265.410 ms；
 - 在线 SAVE 峰值 RSS 200.785 MiB；
 - 启动恢复峰值 RSS 132.621 MiB；
+- 恢复服务优雅退出再次 SAVE 后独立审计 SHA-256：`e8966c16b6f98db63e650a4cb4468f3bb908ff59eef421fc4ede0b38678dab21`，文件仍为精确 64 MiB；
 - 512 MiB RSS 预算、30 秒 SAVE 暂停预算通过；
-- 无 `.tmp.*` 残留。
+- 首次在线 SAVE 后无 `.tmp.*` 残留。
 
 ### 4.4 Stage H
 

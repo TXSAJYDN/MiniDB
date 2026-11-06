@@ -255,15 +255,18 @@ RDB 格式和加载测试还覆盖 Varint 边界/真实溢出、CRC32C、网络�
 
 - 文件大小：`67,108,864` 字节，恰好 64 MiB；
 - record count：64；
-- SHA-256：`4b399a1decfaa878950fc20ba22d164d1984e170069a783798945d5f06c4f555`；
+- 在线 SAVE 后、恢复启动前 SHA-256：`4b399a1decfaa878950fc20ba22d164d1984e170069a783798945d5f06c4f555`；
 - 启动恢复 64 keys 完整；
 - 在线 SAVE HTTP 200，耗时 1265.410 ms；
 - 在线 SAVE 峰值 RSS 200.785 MiB；
 - 启动恢复峰值 RSS 132.621 MiB；
 - 进程 RSS 预算 512 MiB，SAVE 暂停预算 30 秒；
-- 无 `.tmp.*` 临时文件残留。
+- 恢复服务优雅退出时再次正常 SAVE，随后独立审计 SHA-256：`e8966c16b6f98db63e650a4cb4468f3bb908ff59eef421fc4ede0b38678dab21`，文件大小仍为 `67,108,864` 字节；
+- 首次在线 SAVE 后无 `.tmp.*` 临时文件残留。
 
-证据：`stage-g/stage-g-summary.json`、RSS JSONL、server logs、RDB 文件和 SHA-256 记录。
+两个摘要对应不同时间点：`4b399...` 是启动恢复实际加载的文件；恢复进程收到 SIGTERM 后按正常关停流程再次 SAVE，因此最终路径被重写为 `e896...`。这不是恢复失败，也不能用后者反推前者未经验证。
+
+证据：`stage-g/stage-g-summary.json`、RSS JSONL、server logs、RDB 文件、首次 SAVE 的进程内摘要和 `stage-g/stage-g-post-recovery.sha256`。
 
 ### 9.3 判定
 

@@ -108,9 +108,12 @@ advance_repeating_timer(std::chrono::steady_clock::time_point when,
 }
 } // namespace
 
-EventLoop::EventLoop()
+EventLoop::EventLoop() : EventLoop(nullptr) {}
+
+EventLoop::EventLoop(std::shared_ptr<EpollOperations> poller_operations)
     : looping_(false), quit_(false), thread_id_(std::this_thread::get_id()),
-      poller_(std::make_unique<Poller>(this)), wakeup_fd_(create_eventfd()),
+      poller_(std::make_unique<Poller>(this, std::move(poller_operations))),
+      wakeup_fd_(create_eventfd()),
       wakeup_channel_(std::make_unique<Channel>(this, wakeup_fd_)),
       timer_fd_(create_timerfd()),
       timer_channel_(std::make_unique<Channel>(this, timer_fd_)),

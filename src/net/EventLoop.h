@@ -15,12 +15,14 @@ namespace minidb {
 
 class Channel;
 class Poller;
+class EpollOperations;
 
 class EventLoop {
   public:
     using TimerId = uint64_t;
 
     EventLoop();
+    explicit EventLoop(std::shared_ptr<EpollOperations> poller_operations);
     ~EventLoop();
 
     void loop();

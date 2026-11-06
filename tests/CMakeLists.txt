@@ -124,6 +124,20 @@ target_link_libraries(event_loop_timer_test
 
 minidb_discover_tests(event_loop_timer_test)
 
+add_executable(net_unit_test
+    AcceptorTest.cpp
+    PollerTest.cpp
+)
+
+target_link_libraries(net_unit_test
+    minidb_net
+    minidb_base
+    GTest::gtest
+    GTest::gtest_main
+)
+
+minidb_discover_tests(net_unit_test RESOURCE_LOCK minidb_network)
+
 add_executable(server_options_test
     ServerOptionsTest.cpp
 )

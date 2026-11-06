@@ -4,15 +4,50 @@
 #include <cstring>
 #include <fcntl.h>
 #include <string>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace minidb {
 
+namespace {
+
+class PosixAcceptorIo final : public AcceptorIo {
+  public:
+    int accept_fd(int listen_fd, InetAddress* peer_addr) override {
+        struct sockaddr_in addr;
+        socklen_t len = sizeof(addr);
+        std::memset(&addr, 0, sizeof(addr));
+        const int fd =
+            ::accept4(listen_fd, reinterpret_cast<struct sockaddr*>(&addr),
+                      &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd >= 0 && peer_addr != nullptr) {
+            *peer_addr = InetAddress(addr);
+        }
+        return fd;
+    }
+
+    int open_idle_fd() override {
+        return ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    }
+
+    int close_fd(int fd) override {
+        return ::close(fd);
+    }
+};
+
+} // namespace
+
 Acceptor::Acceptor(EventLoop* loop, const InetAddress& listen_addr)
+    : Acceptor(loop, listen_addr, nullptr, 1000) {}
+
+Acceptor::Acceptor(EventLoop* loop, const InetAddress& listen_addr,
+                   std::shared_ptr<AcceptorIo> io, int64_t retry_delay_ms)
     : loop_(loop), accept_socket_(Socket::create_tcp_socket()),
-      accept_channel_(loop, accept_socket_.fd()), listening_(false),
-      accept_paused_(false),
-      idle_fd_(::open("/dev/null", O_RDONLY | O_CLOEXEC)), retry_timer_id_(0) {
+      accept_channel_(loop, accept_socket_.fd()),
+      io_(io ? std::move(io) : std::make_shared<PosixAcceptorIo>()),
+      listening_(false), accept_paused_(false), idle_fd_(io_->open_idle_fd()),
+      retry_timer_id_(0),
+      accept_retry_delay_ms_(retry_delay_ms > 0 ? retry_delay_ms : 1000) {
     accept_socket_.set_reuse_addr(true);
     accept_socket_.set_reuse_port(true);
     accept_socket_.bind(listen_addr);
@@ -29,7 +64,7 @@ Acceptor::~Acceptor() {
     accept_channel_.disable_all();
     accept_channel_.remove();
     if (idle_fd_ >= 0) {
-        ::close(idle_fd_);
+        io_->close_fd(idle_fd_);
     }
 }
 
@@ -46,7 +81,7 @@ void Acceptor::pause_accepting() {
     }
     accept_paused_ = true;
     accept_channel_.disable_reading();
-    retry_timer_id_ = loop_->run_after(kAcceptRetryDelayMs, [this]() {
+    retry_timer_id_ = loop_->run_after(accept_retry_delay_ms_, [this]() {
         retry_timer_id_ = 0;
         resume_accepting();
     });
@@ -68,12 +103,12 @@ void Acceptor::handle_read() {
 
     for (int accepted = 0; accepted < kMaxAcceptsPerEvent; ++accepted) {
         InetAddress peer_addr;
-        const int connfd = accept_socket_.accept(&peer_addr);
+        const int connfd = io_->accept_fd(accept_socket_.fd(), &peer_addr);
         if (connfd >= 0) {
             if (new_connection_callback_) {
                 new_connection_callback_(connfd, peer_addr);
             } else {
-                ::close(connfd);
+                io_->close_fd(connfd);
             }
             continue;
         }
@@ -87,13 +122,14 @@ void Acceptor::handle_read() {
         }
         if (saved_errno == EMFILE || saved_errno == ENFILE) {
             if (idle_fd_ >= 0) {
-                ::close(idle_fd_);
+                io_->close_fd(idle_fd_);
                 idle_fd_ = -1;
-                const int dummy_fd = accept_socket_.accept(&peer_addr);
+                const int dummy_fd =
+                    io_->accept_fd(accept_socket_.fd(), &peer_addr);
                 if (dummy_fd >= 0) {
-                    ::close(dummy_fd);
+                    io_->close_fd(dummy_fd);
                 }
-                idle_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+                idle_fd_ = io_->open_idle_fd();
                 if (idle_fd_ < 0) {
                     Log::Warning("Unable to restore idle fd after EMFILE");
                 }

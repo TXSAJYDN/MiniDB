@@ -58,7 +58,7 @@ License: DEFERRED BY OWNER
 ### 3.1 已核实
 
 - `main` 已推送至 GitHub `TXSAJYDN/MiniDB`。
-- 当前 `main` 跟踪 420 个文件，包含 `src/`、`app/`、`tests/`、`fuzz/`、`experiments/`、`CMakeLists.txt`、CMake presets、`.github/workflows/ci.yml`、基准工具和交付文档。
+- 当前 `main` 跟踪 403 个文件，包含 `src/`、`app/`、`tests/`、`fuzz/`、`experiments/`、`CMakeLists.txt`、CMake presets、`.github/workflows/ci.yml`、基准工具和交付文档。
 - 六种配置在仓库外全新目录完成 configure/build/CTest：
   - Debug、Release、ASan、UBSan、ASan+UBSan、TSan；
   - 每项 configure=0、build=0、ctest=0、214/214。

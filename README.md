@@ -120,8 +120,7 @@ only if the final snapshot and parent-directory durability steps succeed.
 
 ## Acceptance status
 
-The AI-018 repair and the complete stage A-H technical acceptance are recorded
-as PASS in `docs/AI_018_EXECUTION_REPORT.md` and
+The complete stage A-H technical acceptance is recorded as PASS in
 `docs/A_H_ACCEPTANCE_REPORT.md`.
 
 The accepted code baseline is commit `9da4b48f5fe78e4c2896ad1ca07464361b27e362`.
@@ -157,15 +156,12 @@ creation returned HTTP 401. No pull request was created.
 - [Developer tools](tools/README.md)
 - [Fuzzing](fuzz/README.md)
 - [Dependencies](docs/dependencies.md)
-- [Project retrospective](docs/project-retrospective.md)
+- [Project state](docs/PROJECT_STATE.md)
 
 ## Repository status
 
-The implementation, tests, workflows, and acceptance reports are tracked and
-pushed on `main`. The only intentionally uncommitted local files in the
-authoritative worktree are `-configure.log` and
-`docs/AI_013_FINAL_SUMMARY.md`, which are retained as historical artifacts and
-must not be deleted or added blindly.
+The implementation, tests, workflows, and final acceptance report are tracked
+and pushed on `main`. Local build artifacts are kept outside the repository.
 
 The project remains an educational single-node database. Passing A-H does not
 make it production-ready, and the documented feature limits and environment

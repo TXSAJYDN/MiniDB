@@ -5,7 +5,7 @@
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
 - 分支：`main`
 - 验收代码基线：`9da4b48f5fe78e4c2896ad1ca07464361b27e362`
-- 当前状态：**AI-018 PASS；阶段 A-H 技术验收 PASS**
+- 当前状态：**阶段 A-H 技术验收 PASS**
 License: DEFERRED BY OWNER
 
 ## 1. 当前结论
@@ -30,7 +30,6 @@ MiniDB 已完成原计划 P0 阶段的 A-H 技术验收。最终依据不是早�
 
 详细报告：
 
-- `docs/AI_018_EXECUTION_REPORT.md`
 - `docs/A_H_ACCEPTANCE_REPORT.md`
 
 ## 2. 阶段状态
@@ -56,7 +55,7 @@ fix: close AI-018 acceptance gaps
 19 files changed, 1172 insertions(+), 60 deletions(-)
 ```
 
-该提交已推送至 `origin/main`，仓库跟踪 420 个文件。
+该提交已推送至 `origin/main`，仓库跟踪 403 个文件。
 
 GitHub Actions：
 
@@ -67,14 +66,7 @@ GitHub Actions：
 - 组成：5 个 build/test matrix、TSan、format、static-analysis、fuzz-smoke
 - 备注：存在 `actions/checkout@v4` 的 Node.js 20 deprecation warning，非失败项
 
-工作树只保留两个明确不提交的历史文件：
-
-```text
-?? -configure.log
-?? docs/AI_013_FINAL_SUMMARY.md
-```
-
-禁止清理、覆盖或随意加入这两个文件；它们是保留的历史证据。
+本地构建、验收和 benchmark 产物均存放在仓库外；当前工作树不保留开发过程日志或其他未跟踪文件。
 
 ## 4. 关键验收数据
 
@@ -171,4 +163,4 @@ Debug / ASan / UBSan 均完成真实 echo：
 3. 若追求生产化，另行规划 TLS/认证、复制与一致性、多进程所有权、长稳/压力/多客户端基准和跨平台验证。
 4. 保持现有六配置、fuzz、故障注入和 CI 门禁，不要用单次 happy-path 测试替代验收。
 
-历史审查过程保留在 `docs/AI_REVIEW_REPORT.md` 和 AI-011 至 AI-018 的执行报告中；本文件只记录当前权威状态，早期 FAIL 结论已被本轮修复和验收关闭。
+早期审查和逐轮修复记录已从当前文档树移除；如需追溯，可从 Git 历史中查看相应旧版本。本文件只记录当前权威状态。

@@ -1,0 +1,6 @@
+GET /health HTTP/1.1
+Host: localhost
+
+tealth HTTP/1.1
+Host: localhost
+

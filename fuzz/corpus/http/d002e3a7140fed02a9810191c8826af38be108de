@@ -1,0 +1,3 @@
+GET /health HTTP/c1.1
+Host: localhost
+

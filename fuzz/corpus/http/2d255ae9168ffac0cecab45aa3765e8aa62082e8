@@ -1,0 +1,5 @@
+GET /kv/key?xÿ1 HTTP/1.1
+Host: localhost
+Connection: kest: one
+X-Test-Two: two
+

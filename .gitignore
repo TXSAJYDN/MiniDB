@@ -1,0 +1,45 @@
+# Build directories
+build/
+cmake-build-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled files
+*.o
+*.a
+*.so
+*.exe
+
+# Test outputs
+Testing/
+CTestTestfile.cmake
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!cmake/
+compile_commands.json
+
+# CMake dependency and local output directories
+_deps/
+bin/
+lib/
+experiments/socket_echo_blocking
+experiments/socket_echo_nonblocking
+app/minidb_http_server
+app/minidb_kv_server
+tests/*_test
+
+# Local patch/recovery artifacts (never part of a release)
+*.bak
+*.orig
+*.before_fix

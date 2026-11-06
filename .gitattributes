@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+# Fuzz corpus entries are arbitrary byte sequences and must remain byte-exact.
+fuzz/corpus/** -text
+
+# Build/test scripts must keep LF so they run unchanged in Linux CI.
+*.sh text eol=lf
+*.py text eol=lf

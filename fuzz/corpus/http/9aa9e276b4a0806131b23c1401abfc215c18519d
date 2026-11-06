@@ -1,0 +1,5 @@
+GET /health HTTP/1.1
+Host: localhoh HTTP/1.1
+Host: loc`
+Host: loc`lhost
+

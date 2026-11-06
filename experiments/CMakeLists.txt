@@ -1,0 +1,2 @@
+add_executable(socket_echo_blocking socket_echo_blocking.cpp)
+add_executable(socket_echo_nonblocking socket_echo_nonblocking.cpp)

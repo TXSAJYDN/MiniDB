@@ -1,0 +1,5 @@
+G`T /kv/key?x=1 HTTP/1.1
+Host: loc%lhost
+Connection: k: loc%lhost
+Connection:X-Test-Two: two
+

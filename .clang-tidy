@@ -1,0 +1,15 @@
+---
+Checks: >-
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-signal-handler,
+  -bugprone-suspicious-stringview-data-usage
+WarningsAsErrors: ''
+HeaderFilterRegex: '(^|/)(src|app)/.*\.(h|hpp)$'
+FormatStyle: file
+UseColor: false

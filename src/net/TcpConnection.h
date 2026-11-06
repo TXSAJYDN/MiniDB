@@ -97,6 +97,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     void handle_read();
     void handle_write();
     void handle_peer_close();
+    void complete_peer_close();
+    void schedule_peer_close();
     void handle_close();
     void handle_error();
     void note_peer_eof();
@@ -122,6 +124,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     bool reading_;
     bool channel_removed_;
     bool peer_eof_;
+    bool peer_close_scheduled_;
     bool close_after_write_;
     bool shutdown_write_done_;
 };

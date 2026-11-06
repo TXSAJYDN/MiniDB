@@ -30,7 +30,10 @@ void Channel::handle_event() {
         error_callback_();
     }
 
-    const bool readable = (revents_ & (EPOLLIN | EPOLLPRI | EPOLLRDHUP)) != 0;
+    // EPOLLHUP can arrive without EPOLLIN even while the receive queue
+    // still contains the peer's final payload.  Drain it before close.
+    const bool readable =
+        (revents_ & (EPOLLIN | EPOLLPRI | EPOLLRDHUP | EPOLLHUP)) != 0;
     if (readable && read_callback_) {
         read_callback_();
     }

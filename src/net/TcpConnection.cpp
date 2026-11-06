@@ -39,8 +39,8 @@ TcpConnection::TcpConnection(EventLoop* loop, const std::string& name,
       socket_(std::make_unique<Socket>(sockfd)),
       channel_(std::make_unique<Channel>(loop, sockfd)),
       local_addr_(local_addr), peer_addr_(peer_addr), reading_(true),
-      channel_removed_(false), peer_eof_(false), close_after_write_(false),
-      shutdown_write_done_(false) {
+      channel_removed_(false), peer_eof_(false), peer_close_scheduled_(false),
+      close_after_write_(false), shutdown_write_done_(false) {
     channel_->set_read_callback([this]() { handle_read(); });
     channel_->set_write_callback([this]() { handle_write(); });
     channel_->set_close_callback([this]() { handle_peer_close(); });
@@ -218,8 +218,36 @@ void TcpConnection::note_peer_eof() {
     if (state_ != kDisconnected) {
         channel_->disable_reading();
     }
+    schedule_peer_close();
+}
+
+void TcpConnection::schedule_peer_close() {
+    if (peer_close_scheduled_ || state_ == kDisconnected) {
+        return;
+    }
+    peer_close_scheduled_ = true;
+    auto self = shared_from_this();
+    loop_->queue_in_loop(
+        [self = std::move(self)]() { self->complete_peer_close(); });
+}
+
+void TcpConnection::complete_peer_close() {
+    loop_->assert_in_loop_thread();
+    peer_close_scheduled_ = false;
+    if (state_ == kDisconnected) {
+        return;
+    }
+    peer_eof_ = true;
+    reading_ = false;
     if (output_buffer_.readable_bytes() == 0 && !channel_->is_writing()) {
-        handle_close();
+        // Closing immediately after a read event can discard work that the
+        // session queued for this loop turn (for example an HTTP response
+        // produced after the final request arrived with FIN).  This callback
+        // runs after those queued tasks, and shutdown() keeps the response on
+        // the wire before the descriptor is retired.
+        finish_after_write();
+    } else if (!channel_->is_writing() && state_ != kDisconnected) {
+        channel_->enable_writing();
     }
 }
 
@@ -337,11 +365,9 @@ void TcpConnection::handle_peer_close() {
     peer_eof_ = true;
     reading_ = false;
     channel_->disable_reading();
-    if (output_buffer_.readable_bytes() == 0 && !channel_->is_writing()) {
-        handle_close();
-    } else if (!channel_->is_writing() && state_ != kDisconnected) {
-        channel_->enable_writing();
-    }
+    // Defer the decision until the rest of this loop turn's queued session
+    // work has had a chance to enqueue or write the final response.
+    schedule_peer_close();
 }
 
 void TcpConnection::finish_after_write() {

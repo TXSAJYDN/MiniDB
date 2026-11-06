@@ -968,5 +968,40 @@ TEST_F(HttpSessionIntegrationTest, PeerHupResetAndEpipeDoNotStopServer) {
     EXPECT_EQ(reply.body, "OK\n");
 }
 
+TEST_F(HttpSessionIntegrationTest,
+       CompleteRequestThenShutdownWriteReturnsResponse) {
+    StartServer();
+
+    HttpClient client(port_);
+    client.SendAll(BuildRequest("GET", "/health"));
+    client.ShutdownWrite();
+
+    const HttpReply reply = client.ReadResponse();
+    ExpectStatus(reply, 200);
+    EXPECT_EQ(reply.body, "OK\n");
+    client.ExpectEof(std::chrono::seconds(5));
+}
+
+TEST_F(HttpSessionIntegrationTest,
+       OneMiBEchoThenShutdownWriteSlowReadGetsCompleteResponse) {
+    StartServer();
+
+    HttpClient client(port_);
+    std::string payload(1024u * 1024u, 'f');
+    for (size_t i = 0; i < payload.size(); i += 4096) {
+        payload[i] = static_cast<char>('A' + ((i / 4096) % 26));
+    }
+
+    client.SendAll(BuildRequest("POST", "/echo", payload));
+    client.ShutdownWrite();
+
+    const HttpReply reply =
+        client.ReadResponseSlowly(4096, std::chrono::milliseconds(1));
+    ExpectStatus(reply, 200);
+    EXPECT_EQ(reply.body.size(), payload.size());
+    EXPECT_EQ(reply.body, payload);
+    client.ExpectEof(std::chrono::seconds(5));
+}
+
 } // namespace
 } // namespace minidb

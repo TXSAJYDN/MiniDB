@@ -11,6 +11,8 @@ implemented in this repository rather than delegated to a database or web
 framework. The project is intended for learning, deterministic testing, and
 systems-level benchmarking; it is not a production database.
 
+License: DEFERRED BY OWNER
+
 ## Implemented P0 capabilities
 
 - Linux **level-triggered epoll** reactor with one owner thread per server.
@@ -77,13 +79,13 @@ For a fully fresh six-configuration matrix with preserved logs:
 ~~~bash
 python3 tools/run_acceptance_matrix.py \
   --source "$PWD" \
-  --root /home/win11/minidb-final-matrix-v2 \
-  --evidence /home/win11/minidb-final-evidence-v2 \
+  --root /home/win11/minidb-ah-final-20261106-v3-matrix \
+  --evidence /home/win11/minidb-ah-final-20261106-v3-evidence \
   --gtest-source "$PWD/build/_deps/googletest-src"
 ~~~
 
 The build and evidence roots must be absent or empty; the script never deletes
-or reuses them.
+or reuses them. The final matrix ran 214 CTest cases in every configuration.
 
 ## Run
 
@@ -116,6 +118,33 @@ python3 test_kv_client.py 6379
 SIGINT and SIGTERM trigger a graceful save and process exit. Exit status is 0
 only if the final snapshot and parent-directory durability steps succeed.
 
+## Acceptance status
+
+The AI-018 repair and the complete stage A-H technical acceptance are recorded
+as PASS in `docs/AI_018_EXECUTION_REPORT.md` and
+`docs/A_H_ACCEPTANCE_REPORT.md`.
+
+The accepted code baseline is commit `9da4b48f5fe78e4c2896ad1ca07464361b27e362`.
+Its push-triggered GitHub Actions run is
+[42182440543](https://github.com/TXSAJYDN/MiniDB/actions/runs/42182440543);
+all 9 jobs completed successfully: five build/test matrix entries, TSan,
+format, static analysis, and fixed-seed fuzz smoke.
+
+The evidence root is `/home/win11/minidb-ah-final-20261106-v3-evidence` on the
+acceptance machine. It contains the six-configuration matrix, Stage B socket
+runs, Stage G 64 MiB RDB/recovery measurements, Stage H fuzz/static/benchmark
+runs, the CI page capture, and the attempted public contribution record.
+
+The owner has deferred the license decision. No `LICENSE` or `COPYING` file has
+been created, and this repository must not be represented as having an approved
+open-source license.
+
+A real public contribution attempt was made against
+[eclipse-4diac/4diac-forte#1135](https://github.com/eclipse-4diac/4diac-forte/issues/1135):
+commit `ac80baaf7df26ff1f3ae50d28b19acece4db9ccf` was created and tested, but
+neither the upstream push nor a fork push was authorized and anonymous PR
+creation returned HTTP 401. No pull request was created.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)
@@ -130,15 +159,14 @@ only if the final snapshot and parent-directory durability steps succeed.
 - [Dependencies](docs/dependencies.md)
 - [Project retrospective](docs/project-retrospective.md)
 
-Acceptance evidence and known remaining external items are recorded in
-`docs/AI_018_EXECUTION_REPORT.md` and `docs/A_H_ACCEPTANCE_REPORT.md`. Local
-test success is not the same as a public CI run or an accepted upstream
-contribution.
-
 ## Repository status
 
-The implementation, tests, and most documentation currently exist as
-untracked files in the authoritative WSL worktree. The project intentionally
-has not committed or pushed them during this repair round. Treat the filesystem
-state and the acceptance reports as the source of truth until the owner reviews
-and commits the work.
+The implementation, tests, workflows, and acceptance reports are tracked and
+pushed on `main`. The only intentionally uncommitted local files in the
+authoritative worktree are `-configure.log` and
+`docs/AI_013_FINAL_SUMMARY.md`, which are retained as historical artifacts and
+must not be deleted or added blindly.
+
+The project remains an educational single-node database. Passing A-H does not
+make it production-ready, and the documented feature limits and environment
+constraints still apply.

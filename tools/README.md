@@ -1,5 +1,7 @@
 # Developer tools
 
+License: DEFERRED BY OWNER
+
 ## Six-configuration acceptance matrix
 
 `tools/run_acceptance_matrix.py` configures and builds Debug, Release, ASan,
@@ -12,25 +14,28 @@ The script:
 
 - refuses to reuse a non-empty build or evidence root;
 - records a SHA-256 digest over CMake, source, app, tests, fuzz, bench,
-  experiments, and tools files, excluding build products, backups, caches, and `bench/results`;
+  experiments, and tools files, excluding build products, backups, caches, and
+  `bench/results`;
 - records the toolchain, Git HEAD/status, exact commands, and every exit code;
 - requires 214 discovered CTest cases per configuration;
 - verifies that the combined sanitizer compile and link flags contain both
   AddressSanitizer and UndefinedBehaviorSanitizer, checking each flag
-  independently;
+  independently.
 
 Example:
 
 ~~~bash
 python3 tools/run_acceptance_matrix.py \
   --source /mnt/e/c++/miniDB \
-  --root /home/win11/minidb-final-matrix \
-  --evidence /home/win11/minidb-final-evidence \
+  --root /home/win11/minidb-ah-final-20261106-v3-matrix \
+  --evidence /home/win11/minidb-ah-final-20261106-v3-evidence \
   --gtest-source /home/win11/minidb-gtest-src
 ~~~
 
 Expected evidence includes `provenance.txt`, per-configuration
-`configure.log`/`build.log`/`ctest.log`, and `matrix-summary.json`.
+`configure.log`/`build.log`/`ctest.log`, and `matrix-summary.json`. The final
+accepted run produced 214/214 in all six configurations with all
+configure/build/CTest exit codes equal to zero.
 
 ## Stage G RDB footprint and barrier evidence
 
@@ -46,13 +51,14 @@ Use a non-sanitized Release build and a new evidence directory:
 ~~~bash
 python3 tools/run_stage_g_acceptance.py \
   --source /mnt/e/c++/miniDB \
-  --build-dir /home/win11/minidb-final-matrix/release \
-  --evidence /home/win11/minidb-final-evidence/stage-g
+  --build-dir /home/win11/minidb-ah-final-20261106-v3-matrix/release \
+  --evidence /home/win11/minidb-ah-final-20261106-v3-evidence/stage-g
 ~~~
 
 The JSON summary, VmRSS/VmHWM sample streams, server logs, full RDB SHA-256,
-and the exact command are retained under the evidence directory.
-
+and the exact command are retained under the evidence directory. The accepted
+run recorded a 67,108,864-byte RDB, 64/64 recovered keys, HTTP 200 online SAVE,
+1265.410 ms request latency, and no temporary-file leftovers.
 ## Static checks
 
 ~~~bash
@@ -66,12 +72,17 @@ find src app -type f -name '*.cpp' -print0 | \
   xargs -0 -n1 clang-tidy -p /tmp/minidb-tidy
 ~~~
 
-CI uses the system Clang tools; local evidence records the exact versions.
+CI uses the system Clang tools; local evidence records the exact versions. The
+accepted run checked 81 files with clang-format and 25 translation units with
+clang-tidy, with zero failures.
 
 ## Fuzz targets
 
 See [fuzz/README.md](../fuzz/README.md). The clean-smoke requirement includes a
-fixed seed and an empty artifact directory after both runs.
+fixed seed and an empty artifact directory after both runs. The accepted run
+executed 20,000 HTTP runs and 20,000 KV runs with seed 20261105, replayed 427
+HTTP inputs and 42 KV inputs, and ended with zero artifacts and unmodified source
+corpora.
 
 ## HTTP syscall trace
 
@@ -81,24 +92,27 @@ POST/GET and SIGTERM save. It stores timestamped syscall latency and an
 
 ~~~bash
 tools/trace_http_smoke.sh \
-  /home/win11/minidb-final-matrix/release/app/minidb_http_server \
-  /home/win11/minidb-final-evidence/strace
+  /home/win11/minidb-ah-final-20261106-v3-matrix/release/app/minidb_http_server \
+  /home/win11/minidb-ah-final-20261106-v3-evidence/stage-h/strace
 ~~~
 
 Use `MINIDB_TRACE_PORT` to override the default loopback port. The script uses
 a temporary RDB and removes it on exit.
-
 ## Benchmark
 
 `bench/benchmark.py` is documented in [bench/README.md](../bench/README.md).
-Record the raw JSON rather than transcribing only throughput numbers.
+Record the raw JSON rather than transcribing only throughput numbers. The
+accepted Stage H run used 200 warmup and 2,000 measured requests per protocol,
+with a single loopback connection under WSL2. It is not a saturated-throughput
+or multi-client scaling test.
 
 ## Performance counters
 
 WSL2 may reject hardware performance events. Record the attempted `perf` command
 and the exact denial, and use only counters the environment actually exposes
 (such as `task-clock` or `page-faults`). Never fabricate cycles, instructions,
-branches, cache misses, or flame graphs.
+branches, cache misses, or flame graphs. The current machine reports
+`No supported events found`; only software counters are claimed.
 
 ## Process and protocol smoke tests
 
@@ -107,3 +121,12 @@ HTTP/KV restart persistence, corrupt-RDB startup failure, and save-failure exit
 status. It is registered in CTest as six process integration cases. It uses
 ephemeral loopback ports and temporary directories, and it does not assume a
 single read returns a complete response.
+
+## Public contribution attempt
+
+The Stage H record includes a real attempt against
+`eclipse-4diac/4diac-forte#1135`. The patch commit is
+`ac80baaf7df26ff1f3ae50d28b19acece4db9ccf`, and its local targeted test and
+full CTest passed. Upstream push, fork push, and anonymous PR creation were
+blocked by permissions/authentication; no PR exists. Do not report this as an
+accepted or submitted upstream contribution.

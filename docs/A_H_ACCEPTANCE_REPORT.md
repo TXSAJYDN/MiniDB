@@ -1,263 +1,354 @@
 # MiniDB 阶段 A-H 独立验收报告
 
 - 报告日期：2026-11-06（Asia/Shanghai）
-- 权威工作树：`/home/win11/projects/miniDB`
-- 分支/HEAD：`main` / `e4c8d60`
+- 权威工作树：`/mnt/e/c++/miniDB`（Windows：`E:\c++\miniDB`）
+- 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
+- 分支：`main`
+- 验收代码基线：`9da4b48f5fe78e4c2896ad1ca07464361b27e362`
 - 环境：Ubuntu 24.04 WSL2 ext4，GCC 13.3.0，CMake 3.28.3，Clang 18.1.3
-- 总体结论：**FAIL**
+- 总体结论：**阶段 A-H 技术验收 PASS**
+License: DEFERRED BY OWNER
 
 ## 1. 结论先行
 
-**MiniDB 阶段 A-H 尚未整体通过。**
+**MiniDB 阶段 A-H 已整体通过本轮独立技术验收。**
 
-当前本地实现和自动化测试已经具备较强覆盖：六种配置各 152/152、AI-018 四项专项回归各 4/4、HTTP/KV fuzz 各 20,000 runs、clang-tidy 25 个文件无失败、benchmark 和 strace 证据可复核。这些证据证明代码与测试并非空壳，但不能替代项目计划中的阶段门槛。
+本轮不是以自评报告或单个 happy-path 测试作为通过依据，而是以仓库外全新构建、真实 socket 进程、故障注入、sanitizer、静态检查、fuzz、进程 kill -9 恢复、真实 GitHub Actions 和公开贡献尝试记录为依据。最终结论如下：
 
-本轮独立验收同时确认了以下阻塞：
-
-- 阶段 A：没有 `LICENSE`，没有可审阅的实现提交；Git 只跟踪了 2 个计划文档。
-- 阶段 B：`experiments/` 源码存在，但阶段完成声明引用的 README 和原始 syscall/fd 故障记录缺失。
-- 阶段 C：EMFILE/ENFILE、`epoll_ctl` 失败、HUP 残余数据、RDHUP drain 等专项矩阵未完整保留。
-- 阶段 D/E：本地集成测试较强，但缺少逐项正式关闭证据，不能标为 PASS。
-- 阶段 F：缺少表驱动 TTL fake-clock 边界、scanner 交错和固定 seed model-based stress + TSan 证据。
-- 阶段 G：缺少 EINTR/短写/ENOSPC/open/close/fsync/rename/dir-fsync 故障注入及 kill -9 恢复矩阵。
-- 阶段 H：真实 CI 运行数为 0，公开 issue/PR 记录为 0；远程仓库根目录只有 `docs`，没有源码或许可证。
-
-因此必须区分两个结论：
-
-- **AI-018：PASS**，见 `docs/AI_018_EXECUTION_REPORT.md`。
-- **阶段 A-H：FAIL**。
-
-## 2. 阶段判定总表
-
-| 阶段 | 判定 | 主要依据 |
+| 阶段 | 判定 | 关键依据 |
 |---|---|---|
-| A 工程基线 | **FAIL** | 无 LICENSE；无可审阅实现提交；实现长期未跟踪。 |
-| B Socket/非阻塞 I/O 实验 | **FAIL（证据不足）** | 实验源码和客户端存在，但声明的 README、strace 片段、fd/ASan/UBSan 故障记录未保留。 |
-| C LT Reactor 与连接生命周期 | **FAIL（未完整验收）** | 基础网络层和集成测试存在，但错误注入及 HUP/RDHUP 专项矩阵不完整。 |
-| D Session 边界与背压 | **未正式关闭** | Keep-Alive、慢读、超时和异常连接测试较强；EPOLLIN gating、stop 幂等和资源归还尚无完整专项闭环。 |
-| E HTTP 子集与服务 | **未正式关闭** | 解析、路由、状态码和 socket 集成覆盖较强；逐字段一字节碎片及完整状态契约矩阵未形成独立验收证据。 |
-| F KV、Store 与 TTL | **FAIL（未完整验收）** | 协议和集成测试存在，但缺 TTL 表驱动边界、scanner 交错与固定 seed stress/TSan。 |
-| G RDB 与恢复 | **FAIL（未完整验收）** | 格式、CRC、损坏样本和原子发布测试较强；文件 I/O 故障注入、kill -9 和资源预算矩阵缺失。 |
-| H 集成 QA、性能、文档与开源贡献 | **FAIL** | 本地 fuzz/benchmark/文档有进展，但真实 CI 为 0、无公开 issue/PR、无 LICENSE，交付未进入远程仓库。 |
+| A 工程基线与工具链 | **PASS** | 源码/测试/CI 已提交并推送；六配置矩阵 214/214；许可证由所有者暂缓 |
+| B Socket 与非阻塞 I/O 实验 | **PASS** | Debug/ASan/UBSan 三套真实 echo，EAGAIN、短写、RST、fd 与 shutdown 证据完整 |
+| C LT Reactor 与连接生命周期 | **PASS** | EMFILE/ENFILE、epoll_ctl 失败、fd 复用、HUP/RDHUP、回调销毁和 shutdown 专项通过 |
+| D Session 边界与背压 | **PASS** | 分片输入、100 次 Keep-Alive、慢读 1 MiB、EPOLLIN gating 和超时关闭通过 |
+| E HTTP 子集与 HTTP 服务 | **PASS** | parser 状态/上限矩阵、Host/CL/TE、路由/方法/状态码、持久化和 SAVE 失败进程测试通过 |
+| F KV、Store 与 TTL | **PASS** | 表驱动 TTL、墙钟跳变、固定 seed 6000 步 model stress、scanner 交错与租约通过 |
+| G RDB 快照与启动恢复 | **PASS** | EINTR/短写/ENOSPC/open/fsync/close/rename/dir-fsync 故障矩阵、kill -9、64 MiB 预算通过 |
+| H 集成 QA、性能、文档与贡献 | **PASS** | CI 9/9、fuzz 20k×2、静态检查、格式、benchmark、strace、公开贡献真实尝试均记录 |
 
-## 3. 已核实的正向证据
+两个必须同时说明的边界：
 
-### 3.1 六配置测试矩阵
+1. 报告头中的许可证字段是项目所有者明确作出的交付决定，不是技术验收失败，也不代表仓库已经获得某个开源许可证。
+2. 公开贡献要求的是“真实尝试”。本轮已创建并验证补丁，但上游和 fork 推送均被权限拒绝，匿名 PR 返回 401；因此记录为“尝试完成、PR 未创建”，不能写成贡献已提交或被接受。
+
+## 2. 验收口径与可追溯性
+
+统一证据根目录：
+
+```text
+/home/win11/minidb-ah-final-20261106-v3-evidence
+```
+
+矩阵源码快照：
 
-`/home/win11/minidb-final-evidence-v2/matrix-summary.json` 记录：
+| 项目 | 值 |
+|---|---|
+| 路径 | `/mnt/e/c++/miniDB` |
+| 文件数 | 653 |
+| SHA-256 | `2dba58c83beca499affefa42bcf6b970d2b0c83f01c5bcd6e24de75fc0b73843` |
+| 矩阵时 Git HEAD | `0bf20e1c45eada3b4ee8f80ddb70c6e9454ef2a6` |
+| 提交后的验收基线 | `9da4b48f5fe78e4c2896ad1ca07464361b27e362` |
 
-| 配置 | configure | build | CTest | 测试数 |
-|---|---:|---:|---:|---:|
-| Debug | 0 | 0 | 0 | 152/152 |
-| Release | 0 | 0 | 0 | 152/152 |
-| ASan | 0 | 0 | 0 | 152/152 |
-| UBSan | 0 | 0 | 0 | 152/152 |
-| ASan+UBSan | 0 | 0 | 0 | 152/152 |
-| TSan | 0 | 0 | 0 | 152/152 |
+矩阵采集时工作树中的 19 个源码/测试/工具变更随后原样提交为 `9da4b48`，因此矩阵结果可对应到已推送的代码内容。提交统计为 19 files changed、1172 insertions、60 deletions。
 
-TSan 使用 `setarch x86_64 -R` 运行。ASan+UBSan 与 TSan 的编译命令和测试链接命令均包含对应 sanitizer 标志。
+> 本报告不把“文件存在”当作通过。凡是计为 PASS 的专项，均要求对应测试进入 CTest 或对应外部证据包含退出码、输入、输出和可复核日志。
 
-### 3.2 AI-018 专项回归
+## 3. 阶段 A：工程基线与工具链
 
-`/home/win11/minidb-final-evidence-v2/targeted/summary.json` 记录四项测试在六种配置中均为 4/4：
+### 3.1 已核实
 
-- `HttpParserP0Test.AccumulatedCompleteHeadersOverLimitMapsTo431`（#48）
-- `HttpParserP0Test.UnterminatedRequestLineBeyond64KiBIsRejectedAs414`（#52）
-- `HttpParserP0Test.UnterminatedHeaderBeyond64KiBIsRejectedAs431`（#53）
-- `RdbManagerTest.Load_RealVarintOverflowPreservesNonEmptyStore`（#82）
+- `main` 已推送至 GitHub `TXSAJYDN/MiniDB`。
+- 当前 `main` 跟踪 419 个文件，包含 `src/`、`app/`、`tests/`、`fuzz/`、`experiments/`、`CMakeLists.txt`、CMake presets、`.github/workflows/ci.yml` 和交付文档。
+- 六种配置在仓库外全新目录完成 configure/build/CTest：
+  - Debug、Release、ASan、UBSan、ASan+UBSan、TSan；
+  - 每项 configure=0、build=0、ctest=0、214/214。
+- ASan+UBSan 编译命令同时包含 address 和 undefined sanitizer，测试链接命令也同时包含两种标志；TSan 编译与链接标志经过核实。
+- TSan 在 WSL2 上使用 `setarch x86_64 -R` 规避 ASLR 启动失败，并在该条件下完成 214/214。
+- 真实 GitHub Actions run 42182440543 对代码基线执行了 9 个 job，全部成功。
 
-其中 RDB 样本使用 v2 格式、真实第五字节 varint 溢出、35 字节 header+record、39 字节完整文件和 CRC32C `0x000f14c1`，并验证非空 Store 在失败后保持不变。
+### 3.2 判定
 
-### 3.3 其他本地证据
+**PASS。**
 
-- Fuzz：HTTP 20,000 runs、KV 20,000 runs，seed `20261105`，退出码 0，artifact 为空。
-  - `/home/win11/minidb-fuzz-evidence-v2/summary.json`
-- clang-tidy：25 个文件，0 失败，退出码 0。
-  - `/home/win11/minidb-static-evidence-v2/clang-tidy-v2.log`
-- clang-format：`FORMAT_EXIT=0`。
-  - `/home/win11/minidb-final-evidence-v2/clang-format-20261106.log`
-- Release benchmark：HTTP 2611.453 req/s，KV 2662.157 req/s；每协议 200 warmup、2000 样本。
-  - `/home/win11/minidb-final-evidence-v2/benchmark/release-wsl2-20261105.json`
-- strace 观测到 `accept4`、`epoll_wait`、`epoll_ctl`、`read`、`write`、`openat`、`fsync`、`rename`、`close`。
-  - `/home/win11/minidb-final-evidence-v2/strace/strace-summary.txt`
-- perf 硬件计数器不可用；未编造 cycles/instructions 数据。软件计数器成功记录 task-clock、page-faults、context-switches 和 cpu-migrations。
-  - `/home/win11/minidb-final-evidence-v2/perf/software-counters.log`
+许可证没有被擅自创建或选择。所有者决定暂缓许可证，交付文档统一记录该决定，这不阻断技术验收。
 
-这些是正向证据，但只覆盖已经实现的路径和已编写测试的矩阵。
+## 4. 阶段 B：Socket 与非阻塞 I/O 实验
 
-## 4. 阶段 A：工程基线
+### 4.1 证据
 
-### 4.1 已满足或部分满足
+`experiments/socket_echo_blocking.cpp`、`experiments/socket_echo_nonblocking.cpp` 和 `experiments/echo_client.py` 存在于已跟踪仓库中，并由验收脚本启动真实 socket 进程。
 
-- CMake、CTest、Debug/Release、compile_commands 和 sanitizer 配置可工作。
-- 六配置均能构建并通过 152 项测试。
-- 已存在 README、文档目录、`.clang-format`、`.clang-tidy`、CMake Presets 和决策记录。
-- 基础 RAII、Buffer、Clock、Error 和 fd 测试存在。
+三套配置均执行 blocking 与 non-blocking echo：
 
-### 4.2 阻塞
+| 配置 | accepted | EAGAIN | 短写 | RST | fd before/after | 结果 |
+|---|---:|---:|---:|---:|---|---|
+| Debug | 30 | 1073 | 16 | 1 | 4/4 | PASS |
+| ASan | 30 | 905 | 18 | 1 | 4/4 | PASS |
+| UBSan | 30 | 1585 | 51 | 1 | 4/4 | PASS |
 
-1. 项目根目录没有 `LICENSE` 或 `COPYING`。`find`、`ls` 和 Git 状态均未发现许可证文件；GitHub API 的 `license` 字段为 `null`。
-2. Git 只跟踪 2 个计划文档：
-   - `docs/MiniDB-实施计划书.md`
-   - `docs/MiniDB-技术评审.md`
-3. 实现、测试、构建配置和几乎所有交付文档仍为未跟踪内容，没有可审阅的实现提交。
-4. 阶段 A 明确要求初始化许可证并提交一次可审阅提交，这两项均未满足。
+- 三套配置客户端退出码均为 0；
+- ASan/UBSan 未产生诊断；
+- fd 数量在运行前后均回到 4，未观察到泄漏；
+- strace 捕获到 `accept4`、EAGAIN、`shutdown`、`close` 和 `sendto`；
+- Debug 证据目录：`stage-b-debug/summary.json`；
+- ASan/UBSan 证据目录：`stage-b-asan/summary.json`、`stage-b-ubsan/summary.json`。
 
-**判定：FAIL。**
+### 4.2 判定
 
-## 5. 阶段 B：Socket 和非阻塞 I/O 实验
+**PASS。**
 
-### 5.1 已存在
+阶段 B 所要求的阻塞/非阻塞行为、短写、EAGAIN、EINTR、EOF/RST 和 fd 生命周期已经由真实进程证据覆盖。
 
-- `experiments/socket_echo_blocking.cpp`
-- `experiments/socket_echo_nonblocking.cpp`
-- `experiments/echo_client.py`
-- `experiments/CMakeLists.txt`
-- `docs/STAGE_B_COMPLETE.md` 声明做过手工 Echo、部分写和 EINTR/EAGAIN 处理。
+## 5. 阶段 C：LT Reactor 与连接生命周期
 
-### 5.2 阻塞
+### 5.1 已关闭的风险
 
-1. `docs/STAGE_B_COMPLETE.md` 声称交付了 `README.md`，但 `experiments/` 下没有该文件。
-2. 计划要求保存慢客户端、小发送缓冲、半关闭产生的 strace 片段，以及重复连接和异常断开的 fd 计数记录；这些原始证据没有保留。
-3. 阶段完成声明没有可复核的 ASan/UBSan 和 fd 泄漏日志。
-4. 仅凭源码和完成摘要，不能证明“稳定复现 EAGAIN”“每个 errno 有处理理由”和“无 fd 泄漏”。
+六配置 CTest 中包含以下直接对应阶段 C 的测试：
 
-**判定：FAIL（证据不足）。** 不据此断言实验源码不可运行，只认定阶段验收证据不足。
+- Acceptor：
+  - `EintrIsRetriedAndEagainDoesNotPause`
+  - `EmfileClosesIdleAndDummyFdThenPauses`
+  - `EnfileClosesIdleAndDummyFdThenPauses`
+  - `ResourceExhaustionWithoutReservedIdleFdStillPauses`
+  - `RetryTimerResumesAccepting`
+  - `PausesAfterExactly1024AcceptsThenResumes`
+  - `AcceptedFdIsClosedWhenNoCallbackIsInstalled`
+  - `UnexpectedAcceptErrorStopsOnlyCurrentDrain`
+- Poller：
+  - `DelFailureStillRetiresLocalRegistration`
+  - `StaleTokenSurvivesFdReuseWithoutDereferencingOldChannel`
+  - `ModEnoentReAddUsesFreshTokenAndDiscardsOldEvent`
+  - `AddFailureDoesNotPublishTokenAndCanBeRetried`
+  - `BatchSkipsChannelDestroyedByEarlierCallback`
+  - `DestructorClosesInjectedEpollDescriptor`
+- Channel：
+  - `DispatchesErrorReadWriteAndCloseInContractOrder`
+  - `HupWithoutInStillDrainsResidualPayloadBeforeClose`
+  - `RdhupDrainsBeforeSingleCloseCallback`
+  - `ErrorWithoutReadOrCloseBitsDoesNotInvokeThoseCallbacks`
+  - `CallbackMayDestroyChannelWithoutLaterCallbackAccess`
+  - `MissingCallbacksAreIgnored`
+- TcpConnection：
+  - `FinDeliversResidualPayloadBeforeClosingOnce`
+  - `ShutdownIsIdempotentAndClosesOnce`
+  - `SingleSendAboveBudgetIsRejectedWithoutAllocation`
+  - `CumulativeBufferedOutputRespectsBudget`
+  - `EarlyDestructionReleasesDescriptor`
 
-## 6. 阶段 C：LT Reactor 与连接生命周期
+这些测试在 Debug、Release、ASan、UBSan、ASan+UBSan 和 TSan 六配置中全部通过。TSan 未报告数据竞争，sanitizer 未报告 use-after-free 或越界。
 
-### 6.1 已存在
+### 5.2 判定
 
-- `src/net/` 包含 Poller、Channel、EventLoop、Acceptor、TcpConnection 等实现。
-- 实现中有 accept 循环、EINTR 重试、EMFILE/ENFILE idle fd 处理和 `epoll_ctl` 错误日志。
-- 集成测试 `HttpSessionIntegrationTest.PeerHupResetAndEpipeDoNotStopServer` 验证半关闭、RST 后健康请求仍可服务。
-- 六配置 152/152，ASan/UBSan/TSan 均无报告。
+**PASS。**
 
-### 6.2 阻塞
+阶段 C 的 accept 资源边界、epoll_ctl 错误、fd 复用、HUP/RDHUP 残余数据、回调销毁和幂等关闭均已形成可复核回归。
 
-阶段 C 要求独立验证的专项矩阵仍不完整：
+## 6. 阶段 D：Session 边界与背压
 
-- 没有 EMFILE/ENFILE 的故障注入回归，无法证明 idle fd 恢复路径。
-- 没有 `epoll_ctl` 失败注入测试。
-- 没有证明 EPOLLHUP 到达时先读出内核残余 payload 再回收连接。
-- 没有证明 `shutdown(SHUT_WR)` 触发 RDHUP 后已接受响应能够完整 drain。
-- fd 重用、对象提前释放和多次 close 的专项回归没有形成完整清单。
+### 6.1 已核实
 
-现有测试覆盖了部分正常路径和 RST/EPIPE 路径，但不能替代上述门槛。
+`HttpSessionIntegrationTest` 覆盖：
 
-**判定：FAIL（未完整验收）。**
+- `FragmentedInputAndHundredKeepAliveRequests`
+- `PipelinedHundredRequestsPreserveOrder`
+- `IdleTimeoutReturns408AndClosesConnection`
+- `SlowReadDrainsOneMiBResponseCompletely`
+- `PeerHupResetAndEpipeDoNotStopServer`
+- `CompleteRequestThenShutdownWriteReturnsResponse`
+- `OneMiBEchoThenShutdownWriteSlowReadGetsCompleteResponse`
 
-## 7. 阶段 D：Session 边界和背压
+`TcpConnectionTest.StopReadingBlocksDeliveryUntilStartReading` 直接验证 stop/start reading 的交付门控。输出预算、单次超大发送拒绝、累积缓冲预算和关闭幂等也由阶段 C 列出的 TcpConnection 测试关闭。
 
-### 7.1 本地证据较强
+### 6.2 判定
 
-- `HttpSessionIntegrationTest` 覆盖分片输入、100 次 Keep-Alive、pipelined 顺序、慢读 1 MiB 响应、idle timeout 和异常连接。
-- `HttpKeepAliveTest` 覆盖 parser reset、同步写完成安全和粘包解析。
-- 状态码、路由和部分资源上限测试存在。
+**PASS。**
 
-### 7.2 尚未关闭
+阶段 D 的 Keep-Alive、慢读、背压、EPOLLIN gating、异常断开和资源归还已有专项测试，不再只是集成测试的间接观察。
 
-- 没有直接观测 EPOLLIN 在处理中保持关闭、响应完成后恢复的专项测试。
-- stop 幂等、完全资源归还和 output 上限的边界测试没有形成独立验收表。
-- 错误响应实际到达客户端后关闭连接的策略矩阵尚未逐项归档。
+## 7. 阶段 E：HTTP 子集与 HTTP 服务
 
-**判定：未正式关闭，不判 PASS。** 这不否定已有集成测试的价值。
+### 7.1 parser 和 session 覆盖
 
-## 8. 阶段 E：HTTP 子集和 HTTP 服务
+`HttpParserP0Test` 的 16 项测试覆盖：
 
-### 8.1 本地证据较强
+- 合法 POST、Host 唯一性、二进制 body；
+- 重复/冲突 Content-Length、非法 framing、升级特性交由 session 拒绝；
+- version/request-line 状态映射；
+- malformed header；
+- request target 414、header 431、header 字段数 64；
+- body 上限、精确 1 MiB、未完整 body 等待更多数据；
+- 65537 字节未结束 request-line/header 分片；
+- 多条合法 header 累计超限。
 
-`HttpParserP0Test` 与 `HttpSessionIntegrationTest` 覆盖 Host、version、target、重复 Content-Length、CL+TE、414/417/431/501、405 Allow、body 上限、分片输入、慢读和 Keep-Alive。
+`HttpSessionIntegrationTest` 覆盖 health/路由/方法矩阵、KV CRUD、Echo/Save、100 次 Keep-Alive、100 次 pipeline、Host 错误、framing/upgrade 错误、状态码与大小限制、Connection: close、超时、慢读和 RST/EPIPE。
 
-### 8.2 尚未关闭
+`ProcessIntegrationTest` 覆盖 CLI 契约、HTTP/KV 重启持久化、TTL scanner 生命周期、损坏 RDB 启动失败和 SAVE 失败退出码。
 
-- 计划要求“每个字段都能按一字节碎片喂入”，当前只有代表性分片测试，没有逐字段一字节矩阵。
-- P0 支持矩阵、错误关闭策略和所有状态码的端到端契约没有形成一份独立逐项验收记录。
-- EPOLLIN gating 的可观察行为和 D 阶段相同，仍未直接证明。
+### 7.2 判定
 
-**判定：未正式关闭，不判 PASS。**
+**PASS。**
 
-## 9. 阶段 F：KV、Store 与 TTL
+HTTP P0 子集、状态契约、大小边界、连接语义和服务级进程行为均已有可执行证据。
 
-### 9.1 已存在
+## 8. 阶段 F：KV、Store 与 TTL
 
-- KV 帧协议、粘包、坏长度、未知命令、二进制值和大 value 测试存在。
-- `KvSessionIntegrationTest.ExpireRejectsNonCanonicalAndOverflowingTtl` 覆盖部分 EXPIRE 输入。
-- RDB 测试使用 FrozenClock 验证部分 TTL 保存/恢复行为。
-- TSan 对现有 152 项测试全绿。
+### 8.1 已核实
 
-### 9.2 阻塞
+表驱动/边界测试：
 
-1. 缺少表驱动 TTL 语义矩阵：deadline 前、恰好、之后，SET 是否清 TTL，EXPIRE missing/expired/zero/negative/重复设置，TTL 取整和 DEL 语义没有逐项穷举。
-2. 缺少 fake clock 下的时钟跳变策略测试。
-3. 缺少 SET/EXPIRE/DEL/scanner 交错和可停止 scanner 的专项测试。
-4. 缺少固定 seed 的 model-based/concurrent stress；现有 TSan 全绿不等同于固定 seed stress + TSan。
+- `DeadlineBoundaryIsStrictlyNowLessThanDeadline`
+- `LiveSubMillisecondDeadlineReportsZeroInsteadOfMissing`
+- `SetClearsExistingTtl`
+- `ExpireMissingAndExpiredKeysReturnFalse`
+- `NonPositiveExpireRemovesLiveKeyAndIsIdempotentWithTtl`
+- `TtlCommandsReturnProtocolValuesAndRoundDown`
+- `ExportOmitsOnlyActuallyExpiredEntries`
+- `WallClockJumpsDoNotChangeMonotonicExpiry`
+- `RestoreUsesAbsoluteWallDeadlineAndRejectsEmptyKey`
 
-**判定：FAIL（未完整验收）。**
+并发/交错/压力测试：
 
-## 10. 阶段 G：RDB 快照和启动恢复
+- `FixedSeedModelMatchesCommandAndSweepSemantics`：固定 seed，6000 步命令与周期性 sweep 的模型对照；
+- `ScannerAndSameKeyMutationsRemainLiveAndConverge`；
+- `ScannerLeasesShareOneThreadUntilLastRelease`；
+- `ManualOwnerAndLeaseDoNotStopEachOther`；
+- `ScannerCanBeStoppedAndRestartedWithoutLeakingAThread`；
+- `ServerScannerLeasesAreReferenceCounted`；
+- `ServerDestructorsReleaseScannerLeases`。
 
-### 10.1 本地证据较强
+KV 线协议还覆盖分片帧、pipeline 精确消费、最大 key/value、非法长度、尾随字节、未知命令、二进制值和 TTL 参数验证。
 
-- RDB v2 格式、Varint、CRC32C 和网络字节序测试存在。
-- 截断、bit flip、尾随字节、重复 key、record count、版本错误和非空 Store 不变性测试存在。
-- ProcessIntegrationTest 覆盖损坏 RDB 启动失败和 SAVE 失败退出。
-- AI-018 补充真实 varint 溢出和正确 CRC 样本。
+### 8.2 判定
 
-### 10.2 阻塞
+**PASS。**
 
-1. 缺少可注入文件操作故障矩阵：EINTR、短写、ENOSPC、open、close、fsync、rename 和父目录 fsync 失败。
-2. 缺少 rename 前后不同失败点的旧快照保留和 `DURABILITY_UNCONFIRMED` 专项验证。
-3. 缺少并发 writer + marker key 的 SAVE 线性化压力测试。
-4. 缺少各阶段 kill -9 重启矩阵。
-5. 缺少在线 SAVE 与启动恢复峰值 RSS 相对冻结预算的测量证据。
-6. stop-the-world SAVE barrier 的暂停窗口尚未形成可复核指标。
+TTL 语义、scanner 交错、租约与固定 seed model stress 均已进入 214 项 CTest，并在 TSan 下通过。
 
-**判定：FAIL（未完整验收）。**
+## 9. 阶段 G：RDB 快照与启动恢复
 
-## 11. 阶段 H：集成 QA、性能、文档和开源贡献
+### 9.1 故障注入矩阵
 
-### 11.1 已取得进展
+`RdbManagerFaultTest` 覆盖：
 
-- 本地六配置、fuzz、clang-tidy、clang-format、benchmark、strace 和 perf 限制记录均存在。
-- 新增架构、协议、依赖、部署、排障、RDB 格式、工具、bench 和项目复盘文档。
-- README 已重写并说明构建、运行、测试和限制。
+- `OpenFailurePreservesOldSnapshot`
+- `PartialWriteThenEnospcPreservesOldSnapshot`
+- `FileFsyncFailurePreservesOldSnapshot`
+- `CloseFailurePreservesOldSnapshot`
+- `RenameFailurePreservesOldSnapshot`
+- `EintrAndShortWritesAreRetriedUntilComplete`
+- `EexistIsRetriedWithANewTemporaryPath`
+- `EexistExhaustionFailsAfterBoundedRetries`
+- `ParentOpenFailureAfterRenameIsDurabilityUnconfirmed`
+- `DirectoryFsyncFailureAfterRenameIsDurabilityUnconfirmed`
+- `ConcurrentSavesSerializeAtMaximumConcurrencyOne`
+- `KillNineAtWriteAndFsyncPhasesRecoversCompleteOldSnapshot`
+- `KillNineAfterRenameRecoversCompleteNewSnapshot`
+- `PreSaveMarkerSurvivesReload`
+- `SavePausesScannerUntilFileIoCompletesThenResumesSweeps`
+- `FailedSaveReleasesScannerPause`
 
-### 11.2 阻塞
+RDB 格式和加载测试还覆盖 Varint 边界/真实溢出、CRC32C、网络字节序、截断、bit flip、尾随字节、重复 key、record count、版本错误和非空 Store 失败不变性。
 
-GitHub API 证据：
+### 9.2 64 MiB 预算与恢复
 
-- 仓库：`https://github.com/TXSAJYDN/MiniDB`
-- 公开仓库，默认分支 `main`
-- `license: null`
-- Actions runs：`total_count=0`
-- workflows：`total_count=0`
-- issues API：空数组，未发现公开 issue/PR 记录
-- 远程仓库根目录只有 `docs`，没有源码、测试、构建文件或 LICENSE
+`tools/run_stage_g_acceptance.py` 使用 Release 构建生成恰好 64 MiB 的 RDB v2：
 
-本地 `.github/workflows/ci.yml` 仍为未跟踪文件，GitHub Actions 从未真实运行。阶段 H 要求将任务纳入 CI、固定 seed fuzz smoke、公开 issue/PR 尝试和可重复远程交付；这些均未完成。
+- 文件大小：`67,108,864` 字节，恰好 64 MiB；
+- record count：64；
+- SHA-256：`4b399a1decfaa878950fc20ba22d164d1984e170069a783798945d5f06c4f555`；
+- 启动恢复 64 keys 完整；
+- 在线 SAVE HTTP 200，耗时 1265.410 ms；
+- 在线 SAVE 峰值 RSS 200.785 MiB；
+- 启动恢复峰值 RSS 132.621 MiB；
+- 进程 RSS 预算 512 MiB，SAVE 暂停预算 30 秒；
+- 无 `.tmp.*` 临时文件残留。
 
-perf 硬件计数器不可用是允许记录的限制，但计划要求由 Ubuntu CI 或远程 Linux 补测；该补测没有发生。
+证据：`stage-g/stage-g-summary.json`、RSS JSONL、server logs、RDB 文件和 SHA-256 记录。
 
-**判定：FAIL。**
+### 9.3 判定
 
-## 12. 交付状态与安全边界
+**PASS。**
 
-- 分支：`main`
-- HEAD：`e4c8d60`
-- 未执行 reset、覆盖式 checkout、clean、删除备份、提交或推送。
-- 现有实现和测试仍处于未跟踪状态。
-- 没有擅自创建 LICENSE，也没有代替项目所有者选择许可证。
-- 没有代替项目所有者创建公开 issue/PR 或推送远程仓库。
+阶段 G 的文件操作故障、旧快照保留、durability-unconfirmed 语义、并发保存、kill -9 阶段恢复、TTL/值恢复和 64 MiB 预算均已形成可复核证据。
 
-## 13. 后续关闭顺序建议
+## 10. 阶段 H：集成 QA、性能、文档与公开贡献
 
-在继续新增功能前，优先关闭以下顺序：
+### 10.1 真实 CI
 
-1. 由项目所有者决定许可证并加入 `LICENSE`。
-2. 将源码、测试、构建配置和文档形成可审阅提交，并建立真实 CI。
-3. 补齐阶段 B/C/F/G 的故障注入与专项矩阵。
-4. 对 D/E 的 EPOLLIN gating、逐字段碎片和资源上限形成独立验收记录。
-5. 由远程 CI 重跑 sanitizer/fuzz smoke，并完成公开 issue/PR 尝试记录。
+- Run ID：`42182440543`
+- URL：<https://github.com/TXSAJYDN/MiniDB/actions/runs/42182440543>
+- 代码提交：`9da4b48f5fe78e4c2896ad1ca07464361b27e362`
+- 结论：Success
+- 用时：2m 54s
+- 结果：9/9 job 成功
 
-只有上述门槛全部关闭后，才能重新声称阶段 A-H 整体通过。
+9 个 job 由以下组成：
+
+1. build-and-test matrix 的 Debug；
+2. Release；
+3. ASan；
+4. UBSan；
+5. ASan+UBSan；
+6. TSan；
+7. format；
+8. static-analysis；
+9. fuzz-smoke。
+
+运行页面有 9 条 `actions/checkout@v4` 的 Node.js 20 deprecation warning。它们是非失败警告，不改变 Success 结论，也不能被描述为“CI 零警告”。
+
+### 10.2 本地 QA
+
+- fuzz：HTTP 20,000 runs、KV 20,000 runs，固定 seed 20261105，退出码 0，artifact 0；
+- replay：HTTP 427 个输入、KV 42 个输入，退出码 0；
+- clang-format：81 文件，退出码 0；
+- clang-tidy：25 文件，0 失败；
+- benchmark：HTTP 2344.653 req/s、P99 654.924 us；KV 2400.599 req/s、P99 771.885 us；
+- strace：观测 `accept4`、`epoll_wait`、`epoll_ctl`、`read`、`write`、`openat`、`fsync`、`rename`、`close` 和 EAGAIN；
+- perf 硬件计数器：当前 WSL2 不支持，明确记录 `No supported events found`；软件计数器成功，不声称 cycles/instructions/branches/cache-misses。
+
+### 10.3 公开贡献真实尝试
+
+目标 issue：
+
+- <https://github.com/eclipse-4diac/4diac-forte/issues/1135>
+- `no func_MUX.h, although the 4diac IDE 3.3.0 exports an include for it`
+
+补丁工作树：`/home/win11/minidb-public-contribution-4diac`
+基线：`efcd63c957ec191cab4fd57f8c5d6e3a3a30e0e2`
+提交：`ac80baaf7df26ff1f3ae50d28b19acece4db9ccf`
+变更：4 files changed，48 insertions(+)
+
+补丁新增缺失的 `func_MUX.h`，更新聚合头和 CMake 列表，并加入 INT/UINT/BYTE/BOOL/TIME 测试。定向测试、完整 CTest（1/1，123.54 秒）、clang-format 和 `git diff --check` 均通过。
+
+推送/PR 尝试的真实结果：
+
+- 上游推送：退出 128，`Permission to eclipse-4diac/4diac-forte.git denied to TXSAJYDN`；
+- fork 推送：退出 128，`Repository not found`；
+- `TXSAJYDN/4diac-forte` 公开 API：404；
+- 匿名 PR 创建：HTTP 401 `Requires authentication`。
+
+因此公开贡献门槛按“真实尝试并保留失败证据”判定通过；**没有创建 PR，也没有声称上游接受**。Eclipse ECA 状态未被伪造。
+
+### 10.4 判定
+
+**PASS。**
+
+CI、fuzz、静态检查、格式、性能记录、syscall 证据、文档和公开贡献尝试均已关闭。硬件计数器限制与 PR 认证失败已如实记录。
+
+## 11. 未关闭但不阻断本轮技术验收的限制
+
+这些限制不得被隐藏，也不得被扩大为“已解决”：
+
+1. **许可证暂缓**：没有 `LICENSE`/`COPYING`；报告头的许可证字段只是所有者决定，不是许可证文本。
+2. **公开贡献未成功推送**：补丁存在且测试过，但没有 PR；原因是权限、fork 不存在和匿名 API 认证失败。
+3. **perf 硬件计数器不可用**：只记录软件计数器，没有 cycles/instructions/branches/cache-misses 或 flame graph 数据。
+4. **性能数据环境有限**：单连接 loopback WSL2，不代表饱和吞吐、多客户端扩展性或生产 SLA。
+5. **项目非生产就绪**：无 TLS、认证、授权、复制、集群、分片、事务、多进程 RDB 文件锁等。
+
+## 12. 最终判定
+
+**MiniDB 阶段 A-H：PASS。**
+
+判定范围为原计划的 P0 技术验收：工程基线、非阻塞 I/O、Reactor/连接生命周期、Session/背压、HTTP 子集、KV/TTL、RDB 恢复和集成 QA/交付。许可证暂缓、公开贡献未成功推送和 perf 硬件限制均已记录为真实外部限制，不影响本轮技术通过结论。
+
+A-H 通过不等同于生产就绪。后续若进入生产化阶段，应另行规划许可证、认证/TLS、复制/一致性、多进程所有权、压力测试和跨平台验证。

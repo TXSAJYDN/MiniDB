@@ -1,93 +1,92 @@
-# MiniDB 阶段 G：RDB 快照和启动恢复 - 完成
+# MiniDB 阶段 G：RDB 快照与启动恢复验收完成
 
-## 时间戳
-- 开始: 2026-10-21 09:00
-- 完成: 2026-10-21 09:35
-- 总耗时: 35 分钟
+- 验收日期：2026-11-06
+- 代码基线：`9da4b48f5fe78e4c2896ad1ca07464361b27e362`
+- 阶段状态：**PASS**
+License: DEFERRED BY OWNER
 
-## 核心交付
+## 1. 实现范围
 
-### 1. RdbFormat 类（67 行代码）
-- Varint 编码/解码: 支持 LEB128 变长编码
-- CRC-32C 校验: 32 位循环冗余检查
-- 网络字节序转换: 32 位和 64 位整数转换
-- 二进制序列化工具集
+RDB v2 快照包含：
 
-### 2. RdbManager 类（177 行代码）
-- save(): 停止写入、序列化数据、fsync、原子 rename、恢复
-- load(): 验证文件、校验和检查、逐条恢复数据
-- 临时文件管理、错误恢复
+- `MRDB` magic 和网络字节序版本/记录数；
+- LEB128 varint 长度编码；
+- CRC32C（Castagnoli）校验；
+- 二进制安全的 key/value；
+- expiry 字段和 TTL 恢复；
+- 精确消费和尾随字节拒绝；
+- 临时文件写入、文件 fsync、原子 rename、父目录 fsync；
+- 失败时保留旧快照；
+- rename 后目录持久化失败时返回 `DURABILITY_UNCONFIRMED`。
 
-### 3. KvStore 扩展
-- export_all(): 导出所有键值对和 TTL 信息
-- 支持带过期时间的数据序列化
+## 2. 故障注入与恢复矩阵
 
-### 4. 完整的测试套件
-- RdbFormat 测试: 7 个测试全部通过
-- RdbManager 测试: 8 个测试全部通过
-- 总计: 15/15 通过（执行时间 35ms）
+`RdbManagerFaultTest` 已在六配置 CTest 中通过，覆盖：
 
-## 实现特性
+- open 失败；
+- 部分写后 ENOSPC；
+- 文件 fsync 失败；
+- close 失败；
+- rename 失败；
+- EINTR 和短写重试；
+- EEXIST 重试与重试耗尽；
+- rename 后父目录 open 失败；
+- rename 后目录 fsync 失败；
+- 并发 SAVE 最大并发度为 1；
+- 写作阶段 kill -9 后恢复完整旧快照；
+- rename 后 kill -9 恢复完整新快照；
+- SAVE 前 marker 在 reload 后仍存在；
+- SAVE 暂停 scanner，完成后恢复；
+- 失败 SAVE 释放 scanner pause。
 
-安全性：
-- 原子性: 临时文件 + rename
-- 持久化: fsync 数据和父目录
-- 完整性: CRC-32C 校验
+格式/加载测试还覆盖：
 
-功能：
-- TTL 保留和恢复
-- 版本控制
-- 文件损坏检测
+- Varint 单字节、多字节、最大值、第五字节 continuation 和 payload 溢出；
+- CRC32C 空输入、已知向量和确定性；
+- 网络字节序 32/64 位；
+- 截断记录、bit flip、尾随字节；
+- 重复 key、record count 不匹配、版本错误；
+- 非空 Store 加载失败后 key/value/TTL 全部不变。
 
-## 编译结果
+## 3. 64 MiB 验收
 
-全新 WSL2 构建目录编译结果：
-- Debug: ✓ 通过
-- Release: ✓ 通过
-- ASan: ✓ 通过
-- UBSan: ✓ 通过
-- ASan+UBSan: ✓ 通过
+`tools/run_stage_g_acceptance.py` 在 Release 构建上生成恰好达到格式上限的 RDB，并测量恢复和在线 SAVE：
 
-## 测试覆盖
+| 指标 | 结果 |
+|---|---|
+| 文件大小 | `67,108,864` 字节（恰好 64 MiB） |
+| record count | 64 |
+| SHA-256 | `4b399a1decfaa878950fc20ba22d164d1984e170069a783798945d5f06c4f555` |
+| 启动恢复 keys | 64/64 |
+| 在线 SAVE | HTTP 200 |
+| SAVE 请求耗时 | 1265.410 ms |
+| 在线 SAVE 峰值 RSS | 200.785 MiB |
+| 启动恢复峰值 RSS | 132.621 MiB |
+| RSS 预算 | 512 MiB |
+| SAVE 暂停预算 | 30 秒 |
+| 临时文件残留 | 0 |
 
-- 格式编码: Varint、CRC、字节序
-- 存储操作: 保存、加载、恢复
-- TTL 管理: 过期时间序列化和恢复
-- 错误处理: 损坏文件、版本不兼容、校验失败
-- 文件操作: 临时文件清理、删除
+所有断言均通过，`failed_assertions` 为空。
 
-## 阶段 G 验收标准满足
+## 4. 证据位置
 
-✓ 定义并文档化 RDB 格式
-✓ 实现 save 和 load 操作
-✓ CRC-32C 校验
-✓ 原子性和持久化
-✓ 错误处理（缺失、损坏、超限）
-✓ TTL 恢复
-✓ 完整测试覆盖
+```text
+/home/win11/minidb-ah-final-20261106-v3-evidence/stage-g/stage-g-summary.json
+/home/win11/minidb-ah-final-20261106-v3-evidence/stage-g/rss-online-save.jsonl
+/home/win11/minidb-ah-final-20261106-v3-evidence/stage-g/rss-startup-recovery.jsonl
+/home/win11/minidb-ah-final-20261106-v3-evidence/stage-g/logs/
+/home/win11/minidb-ah-final-20261106-v3-evidence/stage-g/work/stage-g-max.rdb
+```
 
-## 源文件清单
+对应 CTest 日志位于六配置证据目录的 `ctest.log`。
 
-新增文件：
-- src/storage/RdbFormat.h (24 行)
-- src/storage/RdbFormat.cpp (67 行)
-- src/storage/RdbManager.h (42 行)
-- src/storage/RdbManager.cpp (177 行)
-- tests/RdbFormatTest.cpp (43 行)
-- tests/RdbManagerTest.cpp (135 行)
+## 5. 限制
 
-修改文件：
-- src/storage/KvStore.h (添加 export_all)
-- src/storage/KvStore.cpp (添加 export_all 实现)
-- src/storage/CMakeLists.txt (添加 RDB 源文件)
-- tests/CMakeLists.txt (添加 storage_test)
+- 只支持 RDB v2，没有 v1 迁移。
+- 没有跨进程文件锁；同一 RDB 路径只允许一个 server 进程。
+- 64 MiB 和 512 MiB/30 秒是冻结的验收预算，不是对所有硬件/负载的生产保证。
+- kill -9 测试验证进程崩溃恢复，不等同于断电或文件系统级故障注入。
 
-总代码行数: 630 行
+## 6. 判定
 
-## 阶段完成确认
-
-✅ 阶段 G 实现完成
-✅ 所有测试通过
-✅ 编译无警告无错误
-✅ 支持所有 Sanitizer 配置
-✅ 准备进入阶段 H（集成 QA 和文档）
+**Stage G：PASS。**

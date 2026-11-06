@@ -1,136 +1,139 @@
-// Blocking TCP Echo Server Experiment
-#include <iostream>
-#include <cstring>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+// Blocking TCP echo server used to study Linux socket syscalls.
 #include <arpa/inet.h>
-#include <errno.h>
+#include <cerrno>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <netinet/in.h>
+#include <string>
+#include <sys/socket.h>
+#include <unistd.h>
 
-constexpr int BUFFER_SIZE = 4096;
+namespace {
 
-int main(int argc, char* argv[]) {
-    int port = (argc > 1) ? std::atoi(argv[1]) : 0;  // 0 = dynamic port
+constexpr size_t kBufferSize = 4096;
 
-    // Create socket
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        std::cerr << "socket() failed: " << strerror(errno) << std::endl;
-        return 1;
-    }
-
-    // SO_REUSEADDR for quick restart
-    int opt = 1;
-    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        std::cerr << "setsockopt(SO_REUSEADDR) failed: " << strerror(errno) << std::endl;
-        close(listen_fd);
-        return 1;
-    }
-
-    // Bind
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        std::cerr << "bind() failed: " << strerror(errno) << std::endl;
-        close(listen_fd);
-        return 1;
-    }
-
-    // Get actual port if dynamic
-    if (port == 0) {
-        socklen_t addr_len = sizeof(addr);
-        if (getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &addr_len) < 0) {
-            std::cerr << "getsockname() failed: " << strerror(errno) << std::endl;
-            close(listen_fd);
-            return 1;
-        }
-        port = ntohs(addr.sin_port);
-    }
-
-    // Listen
-    if (listen(listen_fd, SOMAXCONN) < 0) {
-        std::cerr << "listen() failed: " << strerror(errno) << std::endl;
-        close(listen_fd);
-        return 1;
-    }
-
-    std::cout << "Blocking Echo Server listening on port " << port << std::endl;
-
-    // Accept loop
-    while (true) {
-        sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-
-        int conn_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-        if (conn_fd < 0) {
+bool write_all(int fd, const char* data, size_t length) {
+    size_t written = 0;
+    while (written < length) {
+        const ssize_t result =
+            ::send(fd, data + written, length - written, MSG_NOSIGNAL);
+        if (result < 0) {
             if (errno == EINTR) {
-                std::cout << "accept() interrupted by signal, retrying..." << std::endl;
                 continue;
             }
-            std::cerr << "accept() failed: " << strerror(errno) << std::endl;
+            std::cerr << "write failed: " << std::strerror(errno) << '\n';
+            return false;
+        }
+        if (result == 0) {
+            std::cerr << "write returned zero\n";
+            return false;
+        }
+        const size_t chunk = static_cast<size_t>(result);
+        written += chunk;
+        if (chunk < length - (written - chunk)) {
+            std::cout << "partial write: " << chunk << " bytes\n";
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    std::signal(SIGPIPE, SIG_IGN);
+
+    int port = argc > 1 ? std::atoi(argv[1]) : 0;
+    const int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        std::cerr << "socket failed: " << std::strerror(errno) << '\n';
+        return 1;
+    }
+
+    int option = 1;
+    if (::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &option,
+                     sizeof(option)) < 0) {
+        std::cerr << "setsockopt(SO_REUSEADDR) failed: " << std::strerror(errno)
+                  << '\n';
+        ::close(listen_fd);
+        return 1;
+    }
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&address),
+               sizeof(address)) < 0) {
+        std::cerr << "bind failed: " << std::strerror(errno) << '\n';
+        ::close(listen_fd);
+        return 1;
+    }
+
+    socklen_t address_length = sizeof(address);
+    if (::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&address),
+                      &address_length) < 0) {
+        std::cerr << "getsockname failed: " << std::strerror(errno) << '\n';
+        ::close(listen_fd);
+        return 1;
+    }
+    port = ntohs(address.sin_port);
+    if (::listen(listen_fd, SOMAXCONN) < 0) {
+        std::cerr << "listen failed: " << std::strerror(errno) << '\n';
+        ::close(listen_fd);
+        return 1;
+    }
+
+    std::cout << "Blocking Echo Server listening on port " << port << '\n';
+    std::cout.flush();
+
+    while (true) {
+        sockaddr_in peer{};
+        socklen_t peer_length = sizeof(peer);
+        const int connection_fd = ::accept(
+            listen_fd, reinterpret_cast<sockaddr*>(&peer), &peer_length);
+        if (connection_fd < 0) {
+            if (errno == EINTR) {
+                std::cout << "accept interrupted, retrying\n";
+                continue;
+            }
+            std::cerr << "accept failed: " << std::strerror(errno) << '\n';
             break;
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-        std::cout << "Accepted connection from " << client_ip << ":"
-                  << ntohs(client_addr.sin_port) << std::endl;
+        char peer_ip[INET_ADDRSTRLEN] = {};
+        ::inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
+        std::cout << "accepted fd=" << connection_fd << " peer=" << peer_ip
+                  << ':' << ntohs(peer.sin_port) << '\n';
 
-        // Echo loop
-        char buffer[BUFFER_SIZE];
+        char buffer[kBufferSize];
         while (true) {
-            ssize_t n = read(conn_fd, buffer, sizeof(buffer));
-
-            if (n < 0) {
+            const ssize_t received =
+                ::read(connection_fd, buffer, sizeof(buffer));
+            if (received < 0) {
                 if (errno == EINTR) {
-                    std::cout << "read() interrupted by signal, retrying..." << std::endl;
                     continue;
                 }
-                std::cerr << "read() failed: " << strerror(errno) << std::endl;
+                std::cerr << "read failed on fd=" << connection_fd << ": "
+                          << std::strerror(errno) << '\n';
                 break;
             }
-
-            if (n == 0) {
-                std::cout << "Client closed connection (EOF)" << std::endl;
+            if (received == 0) {
+                std::cout << "EOF on fd=" << connection_fd << '\n';
                 break;
             }
-
-            std::cout << "Read " << n << " bytes" << std::endl;
-
-            // Echo back
-            ssize_t written = 0;
-            while (written < n) {
-                ssize_t w = write(conn_fd, buffer + written, n - written);
-                if (w < 0) {
-                    if (errno == EINTR) {
-                        std::cout << "write() interrupted by signal, retrying..." << std::endl;
-                        continue;
-                    }
-                    if (errno == EPIPE) {
-                        std::cerr << "write() failed: EPIPE (broken pipe)" << std::endl;
-                    } else {
-                        std::cerr << "write() failed: " << strerror(errno) << std::endl;
-                    }
-                    goto close_conn;
-                }
-                written += w;
-                if (w < n - written) {
-                    std::cout << "Partial write: " << w << " bytes" << std::endl;
-                }
+            if (!write_all(connection_fd, buffer,
+                           static_cast<size_t>(received))) {
+                break;
             }
         }
 
-    close_conn:
-        if (shutdown(conn_fd, SHUT_RDWR) < 0) {
-            std::cerr << "shutdown() failed: " << strerror(errno) << std::endl;
-        }
-        close(conn_fd);
-        std::cout << "Connection closed" << std::endl;
+        ::shutdown(connection_fd, SHUT_RDWR);
+        ::close(connection_fd);
+        std::cout << "closed fd=" << connection_fd << '\n';
     }
 
-    close(listen_fd);
-    return 0;
+    ::close(listen_fd);
+    return 1;
 }

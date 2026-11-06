@@ -100,11 +100,31 @@ Use `MINIDB_TRACE_PORT` to override the default loopback port. The script uses
 a temporary RDB and removes it on exit.
 ## Benchmark
 
-`bench/benchmark.py` is documented in [bench/README.md](../bench/README.md).
-Record the raw JSON rather than transcribing only throughput numbers. The
-accepted Stage H run used 200 warmup and 2,000 measured requests per protocol,
-with a single loopback connection under WSL2. It is not a saturated-throughput
-or multi-client scaling test.
+`bench/benchmark.py` provides the short deterministic sample-count regression,
+while `bench/run_acceptance_benchmark.py` provides the default Stage H timed,
+multi-round baseline. Both are documented in
+[bench/README.md](../bench/README.md).
+
+The accepted Stage H run used 5 rounds per protocol, with 10 seconds of warm-up,
+30 seconds of measurement, 5 seconds of cooldown, 250 ms resource sampling, and
+a closed-loop GET workload over one persistent loopback connection with one
+in-flight request per round. HTTP produced 267,270 successful requests at
+1781.792 req/s with P99 898.507 us; KV produced 295,147 successful requests at
+1967.630 req/s with P99 825.103 us. Both recorded zero errors and zero timeouts.
+
+The raw JSON is
+`stage-h/timed-multi-round.json` (11,780,123 bytes, SHA-256
+`8cfd8a89e6a73b70cc9abb6a4b180f01589bb1792b30c2a21f8c5393ba35afa8`).
+Its `VALIDATION_OK` record confirms five rounds, every raw latency sample,
+zero errors/timeouts, resource samples, binary hashes, 256-key RDB saves, and no
+temporary-file leftovers.
+
+The earlier 200-warmup/2,000-measured numbers are retained only as a historical
+short regression. They are not the default Stage H performance evidence. The
+timed result is a WSL2 closed-loop workstation baseline, not saturation,
+open-loop capacity, or a production SLA. An external `hey` cross-check is
+recorded in `stage-h/hey-crosscheck-20261106-b/`; its c32 case reaches the
+32-connection limit and is client-CPU-bound, so it does not prove scaling.
 
 ## Performance counters
 

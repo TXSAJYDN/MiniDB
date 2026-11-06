@@ -24,7 +24,7 @@ License: DEFERRED BY OWNER
 | E HTTP 子集与 HTTP 服务 | **PASS** | parser 状态/上限矩阵、Host/CL/TE、路由/方法/状态码、持久化和 SAVE 失败进程测试通过 |
 | F KV、Store 与 TTL | **PASS** | 表驱动 TTL、墙钟跳变、固定 seed 6000 步 model stress、scanner 交错与租约通过 |
 | G RDB 快照与启动恢复 | **PASS** | EINTR/短写/ENOSPC/open/fsync/close/rename/dir-fsync 故障矩阵、kill -9、64 MiB 预算通过 |
-| H 集成 QA、性能、文档与贡献 | **PASS** | CI 9/9、fuzz 20k×2、静态检查、格式、benchmark、strace、公开贡献真实尝试均记录 |
+| H 集成 QA、性能、文档与贡献 | **PASS** | CI 9/9、fuzz 20k×2、静态检查、格式、5×30 秒默认多轮 benchmark、hey 外部对照、strace、公开贡献真实尝试均记录 |
 
 两个必须同时说明的边界：
 
@@ -58,7 +58,7 @@ License: DEFERRED BY OWNER
 ### 3.1 已核实
 
 - `main` 已推送至 GitHub `TXSAJYDN/MiniDB`。
-- 当前 `main` 跟踪 419 个文件，包含 `src/`、`app/`、`tests/`、`fuzz/`、`experiments/`、`CMakeLists.txt`、CMake presets、`.github/workflows/ci.yml` 和交付文档。
+- 当前 `main` 跟踪 420 个文件，包含 `src/`、`app/`、`tests/`、`fuzz/`、`experiments/`、`CMakeLists.txt`、CMake presets、`.github/workflows/ci.yml`、基准工具和交付文档。
 - 六种配置在仓库外全新目录完成 configure/build/CTest：
   - Debug、Release、ASan、UBSan、ASan+UBSan、TSan；
   - 每项 configure=0、build=0、ctest=0、214/214。
@@ -299,15 +299,85 @@ RDB 格式和加载测试还覆盖 Varint 边界/真实溢出、CRC32C、网络�
 
 运行页面有 9 条 `actions/checkout@v4` 的 Node.js 20 deprecation warning。它们是非失败警告，不改变 Success 结论，也不能被描述为“CI 零警告”。
 
-### 10.2 本地 QA
+### 10.2 本地 QA 与 Stage H 默认性能证据
 
 - fuzz：HTTP 20,000 runs、KV 20,000 runs，固定 seed 20261105，退出码 0，artifact 0；
 - replay：HTTP 427 个输入、KV 42 个输入，退出码 0；
 - clang-format：81 文件，退出码 0；
 - clang-tidy：25 文件，0 失败；
-- benchmark：HTTP 2344.653 req/s、P99 654.924 us；KV 2400.599 req/s、P99 771.885 us；
 - strace：观测 `accept4`、`epoll_wait`、`epoll_ctl`、`read`、`write`、`openat`、`fsync`、`rename`、`close` 和 EAGAIN；
 - perf 硬件计数器：当前 WSL2 不支持，明确记录 `No supported events found`；软件计数器成功，不声称 cycles/instructions/branches/cache-misses。
+
+#### 10.2.1 默认 5×30 秒多轮 benchmark
+
+`bench/run_acceptance_benchmark.py` 在本轮实际完成 5 轮/协议：每轮 10 秒
+warm-up、30 秒测量、轮间 5 秒冷却、250 ms 资源采样；每轮一个持久 loopback
+连接、一个 in-flight GET，轮间重连。请求顺序为确定性轮询，延迟使用单调时钟，
+百分位按 `p*(n-1)` 对所有原始样本做线性插值。运行退出码 0，墙钟 8:08.75。
+
+原始 JSON：
+
+- `/home/win11/minidb-ah-final-20261106-v3-evidence/stage-h/timed-multi-round.json`
+- 字节数：`11,780,123`
+- SHA-256：`8cfd8a89e6a73b70cc9abb6a4b180f01589bb1792b30c2a21f8c5393ba35afa8`
+- 校验：`timed-multi-round-validation.txt` 为 `VALIDATION_OK`
+- 脚本 SHA-256：`96e4f3aa754c0e409165755aa75463dc0750fc8f1e6f5de8d5f7f273b5538cf5`
+
+采集时 HEAD 为 `8387714664a86a2e279de5f26f32f4ac75c3c284`，脚本当时仍未跟踪；
+原始 JSON 的 `git_status_porcelain` 如实记录这一状态，精确脚本快照、校验和与
+哈希清单均已保留。产品代码仍是已验收的 `9da4b48` 内容。
+
+| 协议 | 成功/尝试 | QPS | P50 us | P95 us | P99 us | Max us | 错误 | 超时 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| HTTP | 267270/267270 | 1781.792 | 546.273 | 752.920 | 898.507 | 2640.141 | 0 | 0 |
+| KV | 295147/295147 | 1967.630 | 492.960 | 691.400 | 825.103 | 2811.275 | 0 | 0 |
+
+每轮 QPS / P99：
+
+| 轮次 | HTTP QPS | HTTP P99 us | KV QPS | KV P99 us |
+|---:|---:|---:|---:|---:|
+| 1 | 1723.962 | 926.233 | 2008.313 | 818.153 |
+| 2 | 1699.289 | 915.857 | 1892.556 | 845.263 |
+| 3 | 2008.593 | 814.319 | 2047.580 | 813.065 |
+| 4 | 1744.462 | 908.298 | 1976.461 | 819.737 |
+| 5 | 1732.653 | 909.639 | 1913.241 | 828.959 |
+
+资源摘要（CPU 为单核百分比；RSS/VmHWM 取 5 轮最大值）：
+
+| 协议 | Client CPU 均值(范围) | Server CPU 均值(范围) | Client RSS/VmHWM | Server RSS/VmHWM | fd/线程 client, server | 上下文切换 client, server |
+|---|---:|---:|---:|---:|---:|---:|
+| HTTP | 16.000% (15.329-17.510) | 14.137% (13.614-15.359) | 30060/32128 KiB | 3760/4268 KiB | 9/3, 10/2 | 自愿 267073/264879；非自愿 12/12 |
+| KV | 14.729% (14.353-15.025) | 11.899% (11.462-12.336) | 41700/44072 KiB | 3804/4184 KiB | 9/3, 10/2 | 自愿 295168/292570；非自愿 8/6 |
+
+两个服务均保存 256 keys；RDB 均为 71,952 字节，SHA-256 均为
+`5328a91eb1cf8f9bf748a65ceaa8809d944104334ee891127d0301118d544c14`；
+服务日志确认优雅退出保存成功，`timed-work` 无 `.tmp.*` 残留。
+
+#### 10.2.2 外部 hey 对照
+
+`hey 0.1.4-2ubuntu0.24.04.3`（二进制 SHA-256
+`f0c2d541e7e87029a40ff272f420206e43d4b3f158ef32d2b3d616dcd9e1c45e`）执行
+3 秒 warm-up、30 秒测量、5 秒冷却：
+
+| 并发 | HTTP 200 响应 | req/s | P50 ms | P95 ms | P99 ms | hey CPU | Server CPU 单核 | VmHWM KiB | Payload MB/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 53,250 | 1774.774 | 0.5 | 0.7 | 0.9 | 41% | 11.968% | 4260 | 0.454 |
+| 10 | 439,221 | 14638.639 | 0.7 | 1.0 | 1.2 | 207% | 51.117% | 4320 | 3.748 |
+| 32 | 858,109 | 28598.660 | 0.9 | 2.4 | 3.8 | 480% | 86.180% | 4416 | 7.323 |
+
+所有场景退出码 0，只有 HTTP 200。`c32` 已达到
+`src/net/TcpServer.h` 的 32 连接上限，且 hey 客户端使用了约 4.8 个逻辑核；
+因此它不能证明服务端容量或 32 连接以上扩展性。`server-resources.tsv` 的
+fd=11 是运行后快照，不是峰值；Payload MB/s 只是应用响应载荷速率，不是完整
+网络带宽。
+
+#### 10.2.3 性能口径和限制
+
+- 该结果是 WSL2 同机、closed-loop、单连接、单 in-flight 的工作站基线；
+- Python 客户端解析和调度开销计入延迟；
+- 不提供 open-loop、饱和容量、多客户端扩展性、写负载 durability 成本或生产 SLA 结论；
+- 历史 200 warm-up/2000 measured 运行只保留为短回归工具验证，已由本节 5×30 秒默认证据取代；
+- perf 硬件计数器不可用，只记录软件计数器。
 
 ### 10.3 公开贡献真实尝试
 
@@ -336,7 +406,7 @@ RDB 格式和加载测试还覆盖 Varint 边界/真实溢出、CRC32C、网络�
 
 **PASS。**
 
-CI、fuzz、静态检查、格式、性能记录、syscall 证据、文档和公开贡献尝试均已关闭。硬件计数器限制与 PR 认证失败已如实记录。
+CI、fuzz、静态检查、格式、5×30 秒默认多轮 benchmark、hey 外部对照、syscall 证据、文档和公开贡献尝试均已关闭。硬件计数器限制、closed-loop 口径和 PR 认证失败已如实记录。
 
 ## 11. 未关闭但不阻断本轮技术验收的限制
 
@@ -345,7 +415,7 @@ CI、fuzz、静态检查、格式、性能记录、syscall 证据、文档和公
 1. **许可证暂缓**：没有 `LICENSE`/`COPYING`；报告头的许可证字段只是所有者决定，不是许可证文本。
 2. **公开贡献未成功推送**：补丁存在且测试过，但没有 PR；原因是权限、fork 不存在和匿名 API 认证失败。
 3. **perf 硬件计数器不可用**：只记录软件计数器，没有 cycles/instructions/branches/cache-misses 或 flame graph 数据。
-4. **性能数据环境有限**：单连接 loopback WSL2，不代表饱和吞吐、多客户端扩展性或生产 SLA。
+4. **性能数据环境有限**：5×30 秒、单连接、单 in-flight、closed-loop loopback WSL2；hey c32 又受客户端 CPU 与 32 连接上限影响，不代表 open-loop 容量、饱和吞吐、多客户端扩展性或生产 SLA。
 5. **项目非生产就绪**：无 TLS、认证、授权、复制、集群、分片、事务、多进程 RDB 文件锁等。
 
 ## 12. 最终判定

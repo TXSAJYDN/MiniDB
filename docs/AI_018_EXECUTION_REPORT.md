@@ -156,16 +156,79 @@ Stage H 证据 `/home/win11/minidb-ah-final-20261106-v3-evidence/stage-h/stage-h
 
 证据位于 Stage H 证据目录的 `clang-format-provenance.txt`、`clang-format.log` 和 `clang-tidy-summary.txt`。
 
-### 6.3 Release benchmark
+### 6.3 Stage H 默认多轮 benchmark
 
-每协议 200 次 warmup、2000 次测量：
+本轮新增并实际运行了 `bench/run_acceptance_benchmark.py`，它补充而非替换
+`bench/benchmark.py`。默认配置为每协议 5 轮，每轮 10 秒 warm-up、30 秒
+测量、轮间 5 秒冷却，每 250 ms 采样一次 client/server `/proc` 资源；数据集为
+256 keys × 256-byte 二进制安全值，请求顺序为确定性轮询。
 
-| 协议 | 吞吐 | P50 | P95 | P99 |
-|---|---:|---:|---:|---:|
-| HTTP | 2344.653 req/s | 422.208 us | 563.464 us | 654.924 us |
-| KV | 2400.599 req/s | 405.135 us | 627.115 us | 771.885 us |
+负载模型是 closed-loop：每轮一个持久连接，连接上最多一个 in-flight GET，
+轮间重新建连。延迟使用单调时钟 `time.perf_counter_ns()`，百分位按
+`p*(n-1)` 对所有原始样本做线性插值。整个过程退出码 0，墙钟耗时 8:08.75。
 
-这是单连接、loopback、WSL2 环境数据，不代表饱和吞吐或多客户端扩展性。原始 JSON 为 `stage-h/release-wsl2.json`。
+采集时 Git HEAD 为
+`8387714664a86a2e279de5f26f32f4ac75c3c284`，该脚本在采集时仍未跟踪，原始
+JSON 的 `git_status_porcelain` 如实保留了这一点；精确脚本快照和哈希随证据
+保存，随后才与文档一并提交。产品代码没有偏离已验收的 `9da4b48` 基线。
+
+原始证据：
+
+- `/home/win11/minidb-ah-final-20261106-v3-evidence/stage-h/timed-multi-round.json`
+- 字节数：`11,780,123`
+- SHA-256：`8cfd8a89e6a73b70cc9abb6a4b180f01589bb1792b30c2a21f8c5393ba35afa8`
+- 校验文件：`timed-multi-round-validation.txt`，首行为 `VALIDATION_OK`
+- 脚本 SHA-256：`96e4f3aa754c0e409165755aa75463dc0750fc8f1e6f5de8d5f7f273b5538cf5`
+- 汇总/控制台/metrics：`timed-multi-round-summary.txt`、`timed-multi-round-console.log`、`timed-multi-round-metrics.txt`
+
+聚合结果：
+
+| 协议 | 成功/尝试 | QPS | P50 us | P95 us | P99 us | Max us | 错误 | 超时 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| HTTP | 267270/267270 | 1781.792 | 546.273 | 752.920 | 898.507 | 2640.141 | 0 | 0 |
+| KV | 295147/295147 | 1967.630 | 492.960 | 691.400 | 825.103 | 2811.275 | 0 | 0 |
+
+每轮 QPS / P99：
+
+| 轮次 | HTTP QPS | HTTP P99 us | KV QPS | KV P99 us |
+|---:|---:|---:|---:|---:|
+| 1 | 1723.962 | 926.233 | 2008.313 | 818.153 |
+| 2 | 1699.289 | 915.857 | 1892.556 | 845.263 |
+| 3 | 2008.593 | 814.319 | 2047.580 | 813.065 |
+| 4 | 1744.462 | 908.298 | 1976.461 | 819.737 |
+| 5 | 1732.653 | 909.639 | 1913.241 | 828.959 |
+
+资源摘要（CPU 为单核百分比；RSS/VmHWM 取 5 轮最大值）：
+
+| 协议 | Client CPU 均值(范围) | Server CPU 均值(范围) | Client RSS/VmHWM | Server RSS/VmHWM | fd/线程 client, server | 上下文切换 client, server |
+|---|---:|---:|---:|---:|---:|---:|
+| HTTP | 16.000% (15.329-17.510) | 14.137% (13.614-15.359) | 30060/32128 KiB | 3760/4268 KiB | 9/3, 10/2 | 自愿 267073/264879；非自愿 12/12 |
+| KV | 14.729% (14.353-15.025) | 11.899% (11.462-12.336) | 41700/44072 KiB | 3804/4184 KiB | 9/3, 10/2 | 自愿 295168/292570；非自愿 8/6 |
+
+两个协议各保存 256 keys，RDB 均为 71,952 字节，SHA-256 均为
+`5328a91eb1cf8f9bf748a65ceaa8809d944104334ee891127d0301118d544c14`；
+优雅退出日志确认保存成功，`timed-work` 中无 `.tmp.*` 残留。
+
+外部对照使用 `hey 0.1.4-2ubuntu0.24.04.3`（二进制 SHA-256
+`f0c2d541e7e87029a40ff272f420206e43d4b3f158ef32d2b3d616dcd9e1c45e`），
+每场景 3 秒 warm-up、30 秒测量、5 秒冷却：
+
+| 并发 | HTTP 200 响应 | req/s | P50 ms | P95 ms | P99 ms | hey CPU | Server CPU 单核 | VmHWM KiB | Payload MB/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 53,250 | 1774.774 | 0.5 | 0.7 | 0.9 | 41% | 11.968% | 4260 | 0.454 |
+| 10 | 439,221 | 14638.639 | 0.7 | 1.0 | 1.2 | 207% | 51.117% | 4320 | 3.748 |
+| 32 | 858,109 | 28598.660 | 0.9 | 2.4 | 3.8 | 480% | 86.180% | 4416 | 7.323 |
+
+`c32` 已到达 `src/net/TcpServer.h` 的 32 连接上限，且 hey 客户端本身已使用
+约 4.8 个逻辑核，因此不能据此宣称服务端容量、32 连接以上扩展性，或完整网络
+带宽。`server-resources.tsv` 中的 fd=11 是运行后快照，不是峰值。
+
+历史 200 warm-up/2000 measured 运行仅保留为短回归工具验证，其
+HTTP 2344.653 req/s、KV 2400.599 req/s 等数值不能与本轮 5×30 秒结果混用。
+
+限制：WSL2 同机 CPU 竞争、Python 客户端开销、closed-loop 单连接单 in-flight、
+无 open-loop/饱和容量结论、无生产 SLA；perf 硬件计数器仍不可用，不声称
+cycles/instructions/branches/cache-misses。
 
 ### 6.4 syscall、strace 与 perf 限制
 
@@ -189,7 +252,7 @@ The cycles:u event is not supported.
 
 - `main` 已推送到 `origin/main`；
 - 验收代码基线为 `9da4b48`；
-- 仓库当前跟踪 419 个文件，包含源码、测试、构建配置、CI 和文档；
+- 仓库当前跟踪 420 个文件，包含源码、测试、构建配置、CI 和文档；
 - 工作树中只保留两个明确不提交历史文件：`-configure.log`、`docs/AI_013_FINAL_SUMMARY.md`。
 
 ### 7.2 GitHub Actions
@@ -243,7 +306,7 @@ The cycles:u event is not supported.
 - 六种配置的完整 CTest 均为 214/214；
 - HTTP 的 414/431 边界和累计 header 超限有真实输入断言；
 - RDB 使用正确 v2 格式、正确 CRC32C `0x000f14c1` 和真实第五字节 varint 溢出，并证明非空 Store 失败不变性；
-- fuzz、静态检查、格式检查、benchmark、strace、perf 限制和 CI 证据可复核。
+- fuzz、静态检查、格式检查、5×30 秒默认多轮 benchmark、hey 外部对照、strace、perf 限制和 CI 证据可复核。
 
 **MiniDB 阶段 A-H：PASS。**
 

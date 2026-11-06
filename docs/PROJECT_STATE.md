@@ -18,7 +18,7 @@ MiniDB 已完成原计划 P0 阶段的 A-H 技术验收。最终依据不是早�
 - RDB EINTR/短写/ENOSPC/open/fsync/close/rename/dir-fsync 故障注入；
 - RDB kill -9 分阶段恢复和 64 MiB 文件/RSS/暂停预算；
 - HTTP/KV fuzz 各 20,000 runs、固定 seed、artifact 为空；
-- clang-format、clang-tidy、benchmark、strace 和 perf 限制记录；
+- clang-format、clang-tidy、5×30 秒默认多轮 benchmark、hey 外部对照、strace 和 perf 限制记录；
 - 真实 GitHub Actions run 42182440543，9/9 job 成功；
 - 对 eclipse-4diac/4diac-forte#1135 的真实公开贡献尝试和失败证据。
 
@@ -44,7 +44,7 @@ MiniDB 已完成原计划 P0 阶段的 A-H 技术验收。最终依据不是早�
 | E HTTP 子集与服务 | PASS | parser/status/limit 矩阵、真实 socket session、进程持久化测试 |
 | F KV、Store 与 TTL | PASS | 表驱动 TTL、墙钟跳变、固定 seed model stress、scanner/lease |
 | G RDB 与启动恢复 | PASS | 文件故障注入、kill -9、64 MiB 预算和完整恢复 |
-| H 集成 QA、性能、文档与贡献 | PASS | CI、fuzz、静态检查、benchmark、strace、公开贡献真实尝试 |
+| H 集成 QA、性能、文档与贡献 | PASS | CI、fuzz、静态检查、5×30 秒默认多轮 benchmark、hey 外部对照、strace、公开贡献真实尝试 |
 
 ## 3. 代码与交付状态
 
@@ -56,7 +56,7 @@ fix: close AI-018 acceptance gaps
 19 files changed, 1172 insertions(+), 60 deletions(-)
 ```
 
-该提交已推送至 `origin/main`，仓库跟踪 419 个文件。
+该提交已推送至 `origin/main`，仓库跟踪 420 个文件。
 
 GitHub Actions：
 
@@ -120,7 +120,13 @@ Debug / ASan / UBSan 均完成真实 echo：
 - replay：HTTP 427 个输入、KV 42 个输入；
 - clang-format：81 文件，退出码 0；
 - clang-tidy：25 文件，0 失败；
-- benchmark：HTTP 2344.653 req/s、P99 654.924 us；KV 2400.599 req/s、P99 771.885 us；
+- 默认多轮 benchmark：5 轮/协议，每轮 10 秒 warm-up、30 秒测量、5 秒冷却，closed-loop 单连接单 in-flight；
+- HTTP：267,270 次成功请求，1781.792 req/s，P99 898.507 us，0 错误/0 超时；
+- KV：295,147 次成功请求，1967.630 req/s，P99 825.103 us，0 错误/0 超时；
+- 原始 JSON：`stage-h/timed-multi-round.json`，11,780,123 字节，SHA-256 `8cfd8a89e6a73b70cc9abb6a4b180f01589bb1792b30c2a21f8c5393ba35afa8`，校验 `VALIDATION_OK`；
+- hey 外部对照：c1/c10/c32 为 1774.774/14638.639/28598.660 req/s，全部 HTTP 200；c32 已达 32 连接上限且 hey 客户端 CPU 饱和，不作容量或扩展性结论；
+- RDB：两个协议各保存 256 keys，RDB 均为 71,952 字节，无 `.tmp.*` 残留；
+- 历史 2000 请求结果仅保留为短回归工具验证；
 - perf 硬件计数器不可用，仅记录软件计数器，不声称 cycles/instructions/flamegraph。
 
 ## 5. 公开贡献尝试
@@ -151,7 +157,7 @@ Debug / ASan / UBSan 均完成真实 echo：
 
 - 许可证：所有者暂缓，未创建 `LICENSE`/`COPYING`；报告头的许可证字段不是许可证文本。
 - 公开贡献：补丁已本地验证，但无 fork 权限且无认证，未创建 PR。
-- 性能：硬件计数器在 WSL2 不可用；benchmark 是单连接 loopback 数据，不代表饱和吞吐或生产 SLA。
+- 性能：5×30 秒 benchmark 是 WSL2 同机 closed-loop、单连接、单 in-flight 数据；硬件计数器不可用；hey c32 受客户端 CPU 和 32 连接上限影响，不代表 open-loop 容量、饱和吞吐或生产 SLA。
 - 环境：主要在 Ubuntu 24.04 WSL2 验证；其他 Linux 环境需重新验证 TSan 和性能。
 - 功能：无 TLS、认证、授权、复制、集群、分片、事务、多进程 RDB 文件锁。
 - 结论：A-H 技术验收通过不等于生产就绪。

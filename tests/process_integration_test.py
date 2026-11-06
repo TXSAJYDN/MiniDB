@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import traceback
+from pathlib import Path
 
 
 HTTP_BIN = ""
@@ -263,6 +264,29 @@ def start_kv(port, rdb_path, cwd):
     return server
 
 
+def process_thread_count(pid):
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    except FileNotFoundError as error:
+        raise TestError(f"process {pid} exited while reading thread count") from error
+    for line in status.splitlines():
+        if line.startswith("Threads:"):
+            return int(line.split(":", 1)[1].strip())
+    raise TestError(f"process {pid} status omitted Threads")
+
+
+def wait_for_thread_count(pid, minimum, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    observed = 0
+    while time.monotonic() < deadline:
+        observed = process_thread_count(pid)
+        if observed >= minimum:
+            return observed
+        time.sleep(0.02)
+    raise TestError(
+        f"process {pid} has {observed} threads, expected at least {minimum}")
+
+
 def assert_listener_absent(port):
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.3):
@@ -425,6 +449,88 @@ def test_kv_persistence_and_sigint():
             restarted.cleanup()
 
 
+def test_ttl_scanner_lifecycle_and_restart():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-ttl-") as temp_dir:
+        # Both production servers must own a live background TTL scanner.
+        http_rdb = os.path.join(temp_dir, "http-ttl.rdb")
+        http_port = free_loopback_port()
+        http_server = start_http(http_port, http_rdb, temp_dir)
+        try:
+            thread_count = wait_for_thread_count(http_server.proc.pid, 2)
+            check(thread_count >= 2,
+                  f"HTTP server has only {thread_count} thread(s)")
+            status, _, payload = read_http_response(
+                http_port, "POST", "/kv/http-ttl-key", b"http-value")
+            check(status == 200 and payload == b"OK\n",
+                  f"HTTP setup failed: status={status}, body={payload!r}")
+            check(http_server.terminate_group(signal.SIGTERM) == 0,
+                  f"HTTP scanner shutdown failed:\n{http_server.log}")
+        finally:
+            http_server.cleanup()
+
+        restarted_http = start_http(http_port, http_rdb, temp_dir)
+        try:
+            status, _, payload = read_http_response(
+                http_port, "GET", "/kv/http-ttl-key")
+            check(status == 200 and payload == b"http-value",
+                  f"HTTP restart after scanner shutdown failed: "
+                  f"status={status}, body={payload!r}")
+            check(restarted_http.terminate_group(signal.SIGTERM) == 0,
+                  f"restarted HTTP shutdown failed:\n{restarted_http.log}")
+        finally:
+            restarted_http.cleanup()
+
+        kv_rdb = os.path.join(temp_dir, "kv-ttl.rdb")
+        kv_port = free_loopback_port()
+        kv_server = start_kv(kv_port, kv_rdb, temp_dir)
+        try:
+            thread_count = wait_for_thread_count(kv_server.proc.pid, 2)
+            check(thread_count >= 2,
+                  f"KV server has only {thread_count} thread(s)")
+            for key, value in (("persistent", b"keep"), ("expiring", b"drop")):
+                command_type, _ = kv_request(kv_port, HTTP_SET, [key, value])
+                check(command_type == 101,
+                      f"KV SET {key} returned {command_type}")
+            command_type, _ = kv_request(
+                kv_port, HTTP_EXPIRE, ["expiring", "150"])
+            check(command_type == 101,
+                  f"KV EXPIRE returned {command_type}")
+
+            # Production uses a one-second scanner interval.  Waiting beyond
+            # two intervals proves the scanner had an opportunity to reap.
+            time.sleep(2.2)
+            command_type, args = kv_request(kv_port, HTTP_TTL, ["expiring"])
+            check(command_type == 104 and args == [b"-2"],
+                  f"expired TTL key still exists: type={command_type}, args={args!r}")
+            command_type, args = kv_request(kv_port, HTTP_GET, ["persistent"])
+            check(command_type == 102 and args == [b"keep"],
+                  f"persistent key disappeared: type={command_type}, args={args!r}")
+
+            started = time.monotonic()
+            check(kv_server.terminate_group(signal.SIGTERM) == 0,
+                  f"KV scanner shutdown failed:\n{kv_server.log}")
+            elapsed = time.monotonic() - started
+            check(elapsed < 5.0,
+                  f"KV shutdown took {elapsed:.2f}s; scanner may not be joined")
+        finally:
+            kv_server.cleanup()
+
+        restarted_kv = start_kv(kv_port, kv_rdb, temp_dir)
+        try:
+            command_type, args = kv_request(kv_port, HTTP_GET, ["persistent"])
+            check(command_type == 102 and args == [b"keep"],
+                  f"persistent KV key lost after restart: "
+                  f"type={command_type}, args={args!r}")
+            command_type, args = kv_request(kv_port, HTTP_TTL, ["expiring"])
+            check(command_type == 104 and args == [b"-2"],
+                  f"expired KV key reappeared after restart: "
+                  f"type={command_type}, args={args!r}")
+            check(restarted_kv.terminate_group(signal.SIGTERM) == 0,
+                  f"restarted KV shutdown failed:\n{restarted_kv.log}")
+        finally:
+            restarted_kv.cleanup()
+
+
 def test_corrupt_rdb_startup_fails_without_overwrite():
     with tempfile.TemporaryDirectory(prefix="minidb-process-corrupt-") as temp_dir:
         rdb_path = os.path.join(temp_dir, "corrupt.rdb")
@@ -483,6 +589,12 @@ def test_save_failure_exit_code():
             check(status == 200 and payload == b"OK\n",
                   "failed to populate the server before save-failure test")
             os.chmod(temp_dir, 0o500)
+            status, _, payload = read_http_response(port, "POST", "/save")
+            check(status == 500,
+                  f"online save failure returned {status}, expected 500: "
+                  f"body={payload!r}")
+            check(b"failed to save rdb" in payload.lower(),
+                  f"online save failure omitted its cause: body={payload!r}")
             return_code = server.terminate_group(signal.SIGTERM)
             check(return_code == 1,
                   f"save failure returned {return_code}, expected 1:\n{server.log}")
@@ -497,6 +609,7 @@ CASES = {
     "CliContract": test_cli_contract,
     "HttpPersistence": test_http_persistence_and_sigterm,
     "KvPersistence": test_kv_persistence_and_sigint,
+    "TtlScannerLifecycle": test_ttl_scanner_lifecycle_and_restart,
     "CorruptRdbStartup": test_corrupt_rdb_startup_fails_without_overwrite,
     "SaveFailureExit": test_save_failure_exit_code,
 }

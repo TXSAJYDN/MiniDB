@@ -11,30 +11,52 @@ ThreadSanitizer's "unexpected memory mapping" startup error.
 The script:
 
 - refuses to reuse a non-empty build or evidence root;
-- records a SHA-256 digest over CMake, source, app, tests, fuzz, bench, and tools
-  files, excluding build products, backups, caches, and `bench/results`;
+- records a SHA-256 digest over CMake, source, app, tests, fuzz, bench,
+  experiments, and tools files, excluding build products, backups, caches, and `bench/results`;
 - records the toolchain, Git HEAD/status, exact commands, and every exit code;
-- requires 152 discovered CTest cases per configuration;
+- requires 214 discovered CTest cases per configuration;
 - verifies that the combined sanitizer compile and link flags contain both
-  AddressSanitizer and UndefinedBehaviorSanitizer.
+  AddressSanitizer and UndefinedBehaviorSanitizer, checking each flag
+  independently;
 
 Example:
 
 ~~~bash
 python3 tools/run_acceptance_matrix.py \
-  --source /home/win11/projects/miniDB \
-  --root /home/win11/minidb-final-matrix-v2 \
-  --evidence /home/win11/minidb-final-evidence-v2 \
-  --gtest-source /home/win11/projects/miniDB/build/_deps/googletest-src
+  --source /mnt/e/c++/miniDB \
+  --root /home/win11/minidb-final-matrix \
+  --evidence /home/win11/minidb-final-evidence \
+  --gtest-source /home/win11/minidb-gtest-src
 ~~~
 
 Expected evidence includes `provenance.txt`, per-configuration
 `configure.log`/`build.log`/`ctest.log`, and `matrix-summary.json`.
 
+## Stage G RDB footprint and barrier evidence
+
+`tools/run_stage_g_acceptance.py` builds an RDB v2 image at the exact 64 MiB
+format limit, measures startup-recovery peak RSS from `/proc/<pid>/status`, and
+performs an online HTTP SAVE while recording peak RSS and end-to-end request
+latency. It freezes the process RSS budget at 512 MiB and the observable SAVE
+pause limit at 30 seconds, then fails unless both limits, the exact-on-limit
+file size, the 64-key recovery, and temporary-file cleanup all pass.
+
+Use a non-sanitized Release build and a new evidence directory:
+
+~~~bash
+python3 tools/run_stage_g_acceptance.py \
+  --source /mnt/e/c++/miniDB \
+  --build-dir /home/win11/minidb-final-matrix/release \
+  --evidence /home/win11/minidb-final-evidence/stage-g
+~~~
+
+The JSON summary, VmRSS/VmHWM sample streams, server logs, full RDB SHA-256,
+and the exact command are retained under the evidence directory.
+
 ## Static checks
 
 ~~~bash
-find src app tests fuzz -type f \( -name '*.h' -o -name '*.cpp' \) \
+find src app tests fuzz experiments -type f \( -name '*.h' -o -name '*.cpp' \) \
   -print0 | xargs -0 clang-format --dry-run --Werror
 
 cmake -S . -B /tmp/minidb-tidy \
@@ -59,8 +81,8 @@ POST/GET and SIGTERM save. It stores timestamped syscall latency and an
 
 ~~~bash
 tools/trace_http_smoke.sh \
-  /home/win11/minidb-final-matrix-v2/release/app/minidb_http_server \
-  /home/win11/minidb-final-evidence-v2/strace
+  /home/win11/minidb-final-matrix/release/app/minidb_http_server \
+  /home/win11/minidb-final-evidence/strace
 ~~~
 
 Use `MINIDB_TRACE_PORT` to override the default loopback port. The script uses
@@ -82,6 +104,6 @@ branches, cache misses, or flame graphs.
 
 `tests/process_integration_test.py` covers CLI validation, default RDB paths,
 HTTP/KV restart persistence, corrupt-RDB startup failure, and save-failure exit
-status. It is registered in CTest as five process integration cases. It uses
+status. It is registered in CTest as six process integration cases. It uses
 ephemeral loopback ports and temporary directories, and it does not assume a
 single read returns a complete response.

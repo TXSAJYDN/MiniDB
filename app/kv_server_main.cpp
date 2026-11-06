@@ -51,6 +51,10 @@ int main(int argc, char* argv[]) {
     server.start();
     loop.loop();
 
+    // Join the scanner before the final snapshot.  save_rdb() itself is
+    // linearizable, but explicit shutdown ordering keeps the exit path
+    // deterministic and avoids any background work during persistence.
+    server.stop();
     const RdbSaveResult save_result = server.save_rdb();
     if (save_result != RdbSaveResult::Ok) {
         std::cerr << "Fatal: failed to persist RDB during shutdown"

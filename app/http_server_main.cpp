@@ -70,6 +70,9 @@ int main(int argc, char* argv[]) {
     loop.loop();
 
     std::cout << "\nServer stopped; persisting RDB" << '\n';
+    // The scanner must be fully joined before the final snapshot so no
+    // background mutation can overlap the shutdown save.
+    server.stop();
     const RdbSaveResult save_result = server.save_rdb();
     if (save_result != RdbSaveResult::Ok) {
         std::cerr << "Fatal: failed to persist RDB during shutdown"

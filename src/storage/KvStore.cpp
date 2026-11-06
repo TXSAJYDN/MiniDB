@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <utility>
 
 namespace minidb {
 namespace {
@@ -74,7 +75,19 @@ KvStore::KvStore(std::shared_ptr<ClockInterface> clock)
     : clock_(std::move(clock)) {}
 
 KvStore::~KvStore() {
-    stop_scanner();
+    // Lease holders normally release before the store, but destruction must
+    // still join a live scanner rather than leaving a joinable std::thread.
+    std::thread thread;
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(scanner_lifecycle_mutex_);
+        std::lock_guard<std::mutex> state_lock(scanner_mutex_);
+        manual_scanner_owner_ = false;
+        scanner_lease_count_ = 0;
+        stop_scanner_locked(&thread);
+    }
+    if (thread.joinable()) {
+        thread.join();
+    }
 }
 
 std::chrono::steady_clock::time_point KvStore::now() const {
@@ -276,36 +289,123 @@ bool KvStore::restore_entry(const std::string& key, const std::string& value,
 }
 
 size_t KvStore::sweep_expired() {
+    ScannerPause pause = pause_scanner();
     std::lock_guard<std::mutex> lock(mutex_);
     return purge_expired_locked(now());
 }
 
-void KvStore::start_scanner(std::chrono::milliseconds interval) {
+KvStore::ScannerPause KvStore::pause_scanner() const {
+    return ScannerPause(scanner_pause_mutex_);
+}
+
+KvStore::ScannerLease::~ScannerLease() {
+    reset();
+}
+
+KvStore::ScannerLease::ScannerLease(ScannerLease&& other) noexcept
+    : store_(std::exchange(other.store_, nullptr)) {}
+
+KvStore::ScannerLease&
+KvStore::ScannerLease::operator=(ScannerLease&& other) noexcept {
+    if (this != &other) {
+        reset();
+        store_ = std::exchange(other.store_, nullptr);
+    }
+    return *this;
+}
+
+void KvStore::ScannerLease::reset() noexcept {
+    KvStore* store = std::exchange(store_, nullptr);
+    if (store != nullptr) {
+        store->release_scanner();
+    }
+}
+
+KvStore::ScannerLease
+KvStore::acquire_scanner(std::chrono::milliseconds interval) {
+    std::lock_guard<std::mutex> lifecycle_lock(scanner_lifecycle_mutex_);
+    {
+        std::lock_guard<std::mutex> state_lock(scanner_mutex_);
+        ++scanner_lease_count_;
+        try {
+            ensure_scanner_locked(interval);
+        } catch (...) {
+            --scanner_lease_count_;
+            throw;
+        }
+    }
+    return ScannerLease(this);
+}
+
+void KvStore::release_scanner() noexcept {
+    std::thread thread;
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(scanner_lifecycle_mutex_);
+        std::lock_guard<std::mutex> state_lock(scanner_mutex_);
+        if (scanner_lease_count_ > 0) {
+            --scanner_lease_count_;
+        }
+        if (scanner_lease_count_ == 0 && !manual_scanner_owner_) {
+            stop_scanner_locked(&thread);
+        }
+    }
+    if (thread.joinable()) {
+        thread.join();
+    }
+}
+
+void KvStore::ensure_scanner_locked(std::chrono::milliseconds interval) {
     if (interval.count() <= 0) {
         interval = std::chrono::milliseconds(1);
     }
-    std::lock_guard<std::mutex> lock(scanner_mutex_);
     if (scanner_thread_.joinable()) {
         return;
     }
     scanner_stop_ = false;
     scanner_interval_ = interval;
     scanner_running_ = true;
-    scanner_thread_ = std::thread([this]() { scanner_loop(); });
+    try {
+        scanner_thread_ = std::thread([this]() { scanner_loop(); });
+    } catch (...) {
+        scanner_running_ = false;
+        throw;
+    }
+}
+
+void KvStore::stop_scanner_locked(std::thread* thread) {
+    if (!scanner_thread_.joinable()) {
+        scanner_running_ = false;
+        scanner_stop_ = false;
+        return;
+    }
+    scanner_stop_ = true;
+    scanner_running_ = false;
+    scanner_cv_.notify_all();
+    *thread = std::move(scanner_thread_);
+}
+
+void KvStore::start_scanner(std::chrono::milliseconds interval) {
+    std::lock_guard<std::mutex> lifecycle_lock(scanner_lifecycle_mutex_);
+    std::lock_guard<std::mutex> state_lock(scanner_mutex_);
+    const bool was_manual_owner = manual_scanner_owner_;
+    manual_scanner_owner_ = true;
+    try {
+        ensure_scanner_locked(interval);
+    } catch (...) {
+        manual_scanner_owner_ = was_manual_owner;
+        throw;
+    }
 }
 
 void KvStore::stop_scanner() {
     std::thread thread;
     {
-        std::lock_guard<std::mutex> lock(scanner_mutex_);
-        if (!scanner_thread_.joinable()) {
-            scanner_running_ = false;
-            return;
+        std::lock_guard<std::mutex> lifecycle_lock(scanner_lifecycle_mutex_);
+        std::lock_guard<std::mutex> state_lock(scanner_mutex_);
+        manual_scanner_owner_ = false;
+        if (scanner_lease_count_ == 0) {
+            stop_scanner_locked(&thread);
         }
-        scanner_stop_ = true;
-        scanner_running_ = false;
-        scanner_cv_.notify_all();
-        thread = std::move(scanner_thread_);
     }
     if (thread.joinable()) {
         thread.join();
@@ -313,7 +413,8 @@ void KvStore::stop_scanner() {
 }
 
 bool KvStore::scanner_running() const {
-    std::lock_guard<std::mutex> lock(scanner_mutex_);
+    std::lock_guard<std::mutex> lifecycle_lock(scanner_lifecycle_mutex_);
+    std::lock_guard<std::mutex> state_lock(scanner_mutex_);
     return scanner_running_;
 }
 

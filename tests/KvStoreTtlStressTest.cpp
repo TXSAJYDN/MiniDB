@@ -250,6 +250,55 @@ TEST_F(KvStoreTtlStressTest, ScannerAndSameKeyMutationsRemainLiveAndConverge) {
     EXPECT_EQ(store.size(), 0u);
 }
 
+TEST_F(KvStoreTtlStressTest, ScannerLeasesShareOneThreadUntilLastRelease) {
+    auto clock = std::make_shared<minidb_test::FrozenClock>(0, 1700000000000);
+    KvStore store(clock);
+    EXPECT_FALSE(store.scanner_running());
+
+    auto first = store.acquire_scanner(std::chrono::milliseconds(1));
+    EXPECT_TRUE(first);
+    EXPECT_TRUE(store.scanner_running());
+    auto second = store.acquire_scanner(std::chrono::milliseconds(1));
+    EXPECT_TRUE(second);
+    EXPECT_TRUE(store.scanner_running());
+
+    first.reset();
+    EXPECT_FALSE(first);
+    EXPECT_TRUE(store.scanner_running());
+
+    auto moved = std::move(second);
+    EXPECT_FALSE(second);
+    EXPECT_TRUE(moved);
+    EXPECT_TRUE(store.scanner_running());
+
+    moved.reset();
+    EXPECT_FALSE(moved);
+    EXPECT_FALSE(store.scanner_running());
+}
+
+TEST_F(KvStoreTtlStressTest, ManualOwnerAndLeaseDoNotStopEachOther) {
+    auto clock = std::make_shared<minidb_test::FrozenClock>(0, 1700000000000);
+    KvStore store(clock);
+    store.start_scanner(std::chrono::milliseconds(1));
+    EXPECT_TRUE(store.scanner_running());
+
+    {
+        auto lease = store.acquire_scanner(std::chrono::milliseconds(1));
+        EXPECT_TRUE(lease);
+    }
+    // The manual owner still keeps the scanner alive.
+    EXPECT_TRUE(store.scanner_running());
+
+    {
+        auto lease = store.acquire_scanner(std::chrono::milliseconds(1));
+        store.stop_scanner();
+        // Removing the manual owner must not stop an active lease.
+        EXPECT_TRUE(store.scanner_running());
+        EXPECT_TRUE(lease);
+    }
+    EXPECT_FALSE(store.scanner_running());
+}
+
 TEST_F(KvStoreTtlStressTest,
        ScannerCanBeStoppedAndRestartedWithoutLeakingAThread) {
     auto clock = std::make_shared<minidb_test::FrozenClock>(0, 1700000000000);

@@ -140,6 +140,11 @@ bool RdbManager::save(const KvStore& store) {
 
 RdbSaveResult RdbManager::save_checked(const KvStore& store) {
     std::lock_guard<std::mutex> save_lock(save_mutex_);
+    // The caller is responsible for the command-dispatch barrier (the P0
+    // servers call SAVE synchronously on their owner EventLoop).  This guard
+    // extends the stop-the-world boundary to the independent TTL scanner and
+    // stays alive through every early return and the final directory fsync.
+    KvStore::ScannerPause scanner_pause = store.pause_scanner();
     RdbSaveResult result = RdbSaveResult::Failed;
 
     auto entries = store.export_all();

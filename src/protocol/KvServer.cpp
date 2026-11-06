@@ -2,6 +2,7 @@
 #include "../base/Log.h"
 
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace minidb {
@@ -19,10 +20,38 @@ KvServer::KvServer(EventLoop* loop, const InetAddress& listen_addr,
         });
 }
 
-KvServer::~KvServer() = default;
+KvServer::~KvServer() {
+    stop();
+}
 
 void KvServer::start() {
-    server_.start();
+    if (started_) {
+        return;
+    }
+    scanner_lease_ = kv_store_->acquire_scanner();
+    try {
+        server_.start();
+    } catch (...) {
+        scanner_lease_.reset();
+        throw;
+    }
+    started_ = true;
+}
+
+void KvServer::stop() {
+    scanner_lease_.reset();
+    started_ = false;
+}
+
+void KvServer::set_kv_store(std::shared_ptr<KvStore> store) {
+    if (!store) {
+        throw std::invalid_argument("KvServer requires a non-null KvStore");
+    }
+    if (started_ || scanner_lease_) {
+        throw std::logic_error(
+            "KvServer::set_kv_store must precede KvServer::start");
+    }
+    kv_store_ = std::move(store);
 }
 
 bool KvServer::load_rdb() {

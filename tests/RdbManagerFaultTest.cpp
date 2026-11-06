@@ -12,6 +12,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <poll.h>
@@ -68,6 +70,9 @@ class FaultRdbFileOperations final : public RdbFileOperations {
         if (open_delay_ms_ > 0) {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(open_delay_ms_));
+        }
+        if (open_hook_) {
+            open_hook_();
         }
         const int fd =
             ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode);
@@ -166,6 +171,9 @@ class FaultRdbFileOperations final : public RdbFileOperations {
     void set_open_delay_ms(int delay_ms) {
         open_delay_ms_ = delay_ms;
     }
+    void set_open_hook(std::function<void()> hook) {
+        open_hook_ = std::move(hook);
+    }
     void set_short_writes(bool enabled) {
         short_writes_ = enabled;
     }
@@ -213,6 +221,7 @@ class FaultRdbFileOperations final : public RdbFileOperations {
     bool short_writes_ = false;
     bool eintr_once_ = false;
     int notify_fd_ = -1;
+    std::function<void()> open_hook_;
 };
 
 class RdbManagerFaultTest : public ::testing::Test {
@@ -436,6 +445,82 @@ TEST_F(RdbManagerFaultTest, EexistExhaustionFailsAfterBoundedRetries) {
     KvStore store;
     EXPECT_EQ(manager.save_checked(store), RdbSaveResult::Failed);
     EXPECT_EQ(operations->write_calls(), 0);
+}
+
+TEST_F(RdbManagerFaultTest,
+       SavePausesScannerUntilFileIoCompletesThenResumesSweeps) {
+    auto clock = std::make_shared<minidb_test::FrozenClock>(0, 1700000000000);
+    KvStore store(clock);
+    store.set("expired-during-save", "value");
+    ASSERT_TRUE(store.expire("expired-during-save", 1));
+    clock->advance_monotonic(2);
+    clock->advance_wall(2);
+
+    auto operations = std::make_shared<FaultRdbFileOperations>();
+    std::promise<void> save_reached_file_io;
+    std::promise<void> release_save;
+    auto release_future = release_save.get_future().share();
+    operations->set_open_hook([&]() {
+        save_reached_file_io.set_value();
+        release_future.wait();
+    });
+    RdbManager manager(rdb_path_, operations);
+
+    RdbSaveResult save_result = RdbSaveResult::Failed;
+    std::thread save_thread(
+        [&]() { save_result = manager.save_checked(store); });
+    ASSERT_EQ(
+        save_reached_file_io.get_future().wait_for(std::chrono::seconds(5)),
+        std::future_status::ready);
+
+    std::promise<void> sweep_started;
+    std::promise<size_t> sweep_result;
+    auto sweep_future = sweep_result.get_future();
+    std::thread sweep_thread([&]() {
+        sweep_started.set_value();
+        sweep_result.set_value(store.sweep_expired());
+    });
+    ASSERT_EQ(sweep_started.get_future().wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    // The scanner sweep must not mutate the Store while the SAVE barrier is
+    // held, even though the save is already outside the Store lock doing I/O.
+    EXPECT_EQ(sweep_future.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+
+    release_save.set_value();
+    save_thread.join();
+    sweep_thread.join();
+    EXPECT_EQ(save_result, RdbSaveResult::Ok);
+    EXPECT_EQ(sweep_future.get(), 1u);
+}
+
+TEST_F(RdbManagerFaultTest, FailedSaveReleasesScannerPause) {
+    auto clock = std::make_shared<minidb_test::FrozenClock>(0, 1700000000000);
+    KvStore store(clock);
+    store.set("expired-after-failed-save", "value");
+    ASSERT_TRUE(store.expire("expired-after-failed-save", 1));
+
+    auto operations =
+        std::make_shared<FaultRdbFileOperations>(FaultStage::FsyncFailure);
+    RdbManager manager(rdb_path_, operations);
+    EXPECT_EQ(manager.save_checked(store), RdbSaveResult::Failed);
+
+    clock->advance_monotonic(2);
+    clock->advance_wall(2);
+    EXPECT_EQ(store.sweep_expired(), 1u);
+}
+
+TEST_F(RdbManagerFaultTest, PreSaveMarkerSurvivesReload) {
+    RdbManager manager(rdb_path_);
+    KvStore store;
+    store.set("confirmed-marker", "must-be-in-snapshot");
+    ASSERT_EQ(manager.save_checked(store), RdbSaveResult::Ok);
+
+    RdbManager loader(rdb_path_);
+    KvStore loaded;
+    ASSERT_EQ(loader.load(loaded), 1);
+    EXPECT_EQ(loaded.get("confirmed-marker"),
+              std::optional<std::string>("must-be-in-snapshot"));
 }
 
 TEST_F(RdbManagerFaultTest,

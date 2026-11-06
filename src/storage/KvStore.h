@@ -91,11 +91,62 @@ class KvStore {
         return clock_;
     }
 
-    // Optional periodic reaper.  The scanner shares mutex_ with all commands.
+    // Periodic TTL reaper.  A scanner thread is shared by all owners of the
+    // same KvStore.  ScannerLease is a move-only RAII handle: releases are
+    // reference counted, and the thread stops only after the last lease (and
+    // the legacy manual start_scanner() owner) is released.
+    class ScannerLease {
+      public:
+        ScannerLease() noexcept = default;
+        ~ScannerLease();
+        ScannerLease(const ScannerLease&) = delete;
+        ScannerLease& operator=(const ScannerLease&) = delete;
+        ScannerLease(ScannerLease&& other) noexcept;
+        ScannerLease& operator=(ScannerLease&& other) noexcept;
+
+        explicit operator bool() const noexcept {
+            return store_ != nullptr;
+        }
+        void reset() noexcept;
+
+      private:
+        friend class KvStore;
+        explicit ScannerLease(KvStore* store) noexcept : store_(store) {}
+
+        KvStore* store_ = nullptr;
+    };
+
+    ScannerLease acquire_scanner(
+        std::chrono::milliseconds interval = std::chrono::seconds(1));
+    // Compatibility/manual-owner API.  stop_scanner() does not force a stop
+    // while scanner leases are still active.
     void
     start_scanner(std::chrono::milliseconds interval = std::chrono::seconds(1));
     void stop_scanner();
     bool scanner_running() const;
+
+    // Blocks scanner sweeps and waits for an in-flight sweep to finish.  The
+    // returned move-only guard keeps the pause active until it is destroyed.
+    // RdbManager holds this guard from before the snapshot point through the
+    // final directory-fsync result, so expiry reaping cannot mutate the Store
+    // while a stop-the-world SAVE is in progress.
+    class ScannerPause {
+      public:
+        ScannerPause() noexcept = default;
+        ~ScannerPause() = default;
+        ScannerPause(const ScannerPause&) = delete;
+        ScannerPause& operator=(const ScannerPause&) = delete;
+        ScannerPause(ScannerPause&&) noexcept = default;
+        ScannerPause& operator=(ScannerPause&&) noexcept = default;
+
+      private:
+        friend class KvStore;
+        explicit ScannerPause(std::mutex& mutex) : lock_(mutex) {}
+
+        std::unique_lock<std::mutex> lock_;
+    };
+
+    ScannerPause pause_scanner() const;
     size_t sweep_expired();
 
   private:
@@ -119,11 +170,23 @@ class KvStore {
     mutable std::mutex mutex_;
     mutable InternalMap store_;
 
+    void ensure_scanner_locked(std::chrono::milliseconds interval);
+    void stop_scanner_locked(std::thread* thread);
+    void release_scanner() noexcept;
+
+    // Serializes complete scanner start/stop transitions.  scanner_mutex_ only
+    // guards the thread state observed by scanner_loop().
+    mutable std::mutex scanner_lifecycle_mutex_;
     mutable std::mutex scanner_mutex_;
+    // Serializes scanner sweeps with SAVE.  It is deliberately separate from
+    // scanner_mutex_ so the scanner can sleep without holding this barrier.
+    mutable std::mutex scanner_pause_mutex_;
     std::condition_variable scanner_cv_;
     std::thread scanner_thread_;
     bool scanner_stop_ = false;
     bool scanner_running_ = false;
+    bool manual_scanner_owner_ = false;
+    size_t scanner_lease_count_ = 0;
     std::chrono::milliseconds scanner_interval_{1000};
 };
 

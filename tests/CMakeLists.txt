@@ -160,6 +160,7 @@ set(MINIDB_PROCESS_CASES
     CliContract
     HttpPersistence
     KvPersistence
+    TtlScannerLifecycle
     CorruptRdbStartup
     SaveFailureExit
 )

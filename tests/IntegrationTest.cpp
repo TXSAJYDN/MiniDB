@@ -3,12 +3,14 @@
 #include "../src/net/EventLoop.h"
 #include "../src/net/InetAddress.h"
 #include "../src/protocol/HttpServer.h"
+#include "../src/protocol/KvServer.h"
 #include "../src/storage/KvStore.h"
 #include "../src/storage/RdbManager.h"
 
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 
@@ -145,4 +147,73 @@ TEST_F(IntegrationTest, SaveAndLoadWithTTLPreservesDeadline) {
         EXPECT_EQ(server.kv_store()->ttl_info("persistent").state,
                   KvStore::TtlState::kNoExpiry);
     }
+}
+
+TEST_F(IntegrationTest, ServerScannerLeasesAreReferenceCounted) {
+    EventLoop loop;
+    auto store = std::make_shared<KvStore>();
+    auto second_store = std::make_shared<KvStore>();
+    HttpServer first(&loop, InetAddress(0), rdb_path);
+    HttpServer second(&loop, InetAddress(0), rdb_path);
+    KvServer kv(&loop, InetAddress(0), rdb_path);
+    first.set_kv_store(store);
+    second.set_kv_store(store);
+    kv.set_kv_store(second_store);
+
+    EXPECT_FALSE(store->scanner_running());
+    EXPECT_FALSE(second_store->scanner_running());
+
+    first.start();
+    first.start();
+    EXPECT_TRUE(store->scanner_running());
+    second.start();
+    kv.start();
+    EXPECT_TRUE(store->scanner_running());
+    EXPECT_TRUE(second_store->scanner_running());
+
+    first.stop();
+    first.stop();
+    EXPECT_TRUE(store->scanner_running());
+    second.stop();
+    EXPECT_FALSE(store->scanner_running());
+    kv.stop();
+    EXPECT_FALSE(second_store->scanner_running());
+
+    // A stopped server can acquire a fresh lease.
+    first.start();
+    EXPECT_TRUE(store->scanner_running());
+    first.stop();
+    EXPECT_FALSE(store->scanner_running());
+}
+
+TEST_F(IntegrationTest, ServerDestructorsReleaseScannerLeases) {
+    auto http_store = std::make_shared<KvStore>();
+    auto kv_store = std::make_shared<KvStore>();
+    {
+        EventLoop loop;
+        {
+            HttpServer server(&loop, InetAddress(0), rdb_path);
+            server.set_kv_store(http_store);
+            server.start();
+            EXPECT_TRUE(http_store->scanner_running());
+        }
+        EXPECT_FALSE(http_store->scanner_running());
+
+        {
+            KvServer server(&loop, InetAddress(0), rdb_path);
+            server.set_kv_store(kv_store);
+            server.start();
+            EXPECT_TRUE(kv_store->scanner_running());
+        }
+        EXPECT_FALSE(kv_store->scanner_running());
+    }
+}
+
+TEST_F(IntegrationTest, ScannerLeaseCanReplaceStoreOnlyBeforeStart) {
+    EventLoop loop;
+    HttpServer server(&loop, InetAddress(0), rdb_path);
+    server.start();
+    EXPECT_THROW(server.set_kv_store(std::make_shared<KvStore>()),
+                 std::logic_error);
+    server.stop();
 }

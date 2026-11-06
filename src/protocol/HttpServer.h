@@ -22,9 +22,13 @@ class HttpServer {
                const std::string& rdb_path = "");
     ~HttpServer();
     void start();
-    void set_kv_store(std::shared_ptr<KvStore> store) {
-        kv_store_ = std::move(store);
-    }
+    // Stops this server's TTL scanner lease.  Idempotent, and safe to call
+    // from the destructor or after EventLoop::loop() returns before a final
+    // synchronous RDB save.
+    void stop();
+    // Must be called before start(); replacing the store while the scanner is
+    // running would invalidate this server's lease.
+    void set_kv_store(std::shared_ptr<KvStore> store);
     const std::shared_ptr<KvStore>& kv_store() const {
         return kv_store_;
     }
@@ -49,6 +53,8 @@ class HttpServer {
     std::shared_ptr<KvStore> kv_store_;
     std::unique_ptr<RdbManager> rdb_manager_;
     std::string rdb_path_;
+    KvStore::ScannerLease scanner_lease_;
+    bool started_ = false;
     std::chrono::milliseconds idle_timeout_{30000};
     std::map<std::string, std::shared_ptr<HttpSession>> sessions_;
     // Destroy the server (and invoke close callbacks) before callback

@@ -4,6 +4,7 @@
 #include "../net/EventLoop.h"
 
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace minidb {
@@ -50,10 +51,38 @@ HttpServer::HttpServer(EventLoop* loop, const InetAddress& listen_addr,
     }
 }
 
-HttpServer::~HttpServer() = default;
+HttpServer::~HttpServer() {
+    stop();
+}
 
 void HttpServer::start() {
-    server_.start();
+    if (started_) {
+        return;
+    }
+    scanner_lease_ = kv_store_->acquire_scanner();
+    try {
+        server_.start();
+    } catch (...) {
+        scanner_lease_.reset();
+        throw;
+    }
+    started_ = true;
+}
+
+void HttpServer::stop() {
+    scanner_lease_.reset();
+    started_ = false;
+}
+
+void HttpServer::set_kv_store(std::shared_ptr<KvStore> store) {
+    if (!store) {
+        throw std::invalid_argument("HttpServer requires a non-null KvStore");
+    }
+    if (started_ || scanner_lease_) {
+        throw std::logic_error(
+            "HttpServer::set_kv_store must precede HttpServer::start");
+    }
+    kv_store_ = std::move(store);
 }
 
 bool HttpServer::load_rdb() {

@@ -16,9 +16,11 @@ class KvServer {
     ~KvServer();
 
     void start();
-    void set_kv_store(std::shared_ptr<KvStore> store) {
-        kv_store_ = std::move(store);
-    }
+    // Stops this server's TTL scanner lease.  Idempotent; call after the
+    // EventLoop stops and before the final synchronous RDB save.
+    void stop();
+    // Must be called before start().
+    void set_kv_store(std::shared_ptr<KvStore> store);
     InetAddress listen_address() const {
         return server_.listen_address();
     }
@@ -35,6 +37,8 @@ class KvServer {
     std::shared_ptr<KvStore> kv_store_;
     std::unique_ptr<RdbManager> rdb_manager_;
     std::string rdb_path_;
+    KvStore::ScannerLease scanner_lease_;
+    bool started_ = false;
     std::map<std::string, std::shared_ptr<KvSession>> sessions_;
     // Destroy the server (and invoke close callbacks) before the session map
     // and storage dependencies it refers to.

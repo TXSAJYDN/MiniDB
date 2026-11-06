@@ -676,16 +676,35 @@ TEST_F(HttpSessionIntegrationTest, FragmentedInputAndHundredKeepAliveRequests) {
     StartServer();
     HttpClient client(port_);
 
-    const std::string request =
-        BuildRequest("POST", "/echo", "fragmented-body");
-    client.SendByteByByte(request);
-    HttpReply reply = client.ReadResponse();
-    ExpectStatus(reply, 200);
-    EXPECT_EQ(reply.body, "fragmented-body");
+    // Every request is delivered one byte at a time. The matrix spans the
+    // request line, Host, ordinary headers, Content-Length, and a binary-safe
+    // body so each parsed field crosses the incremental boundary.
+    struct FragmentedCase {
+        std::string request;
+        int status;
+        std::string body;
+    };
+    const std::vector<FragmentedCase> cases = {
+        {BuildRequest("GET", "/health"), 200, "OK\n"},
+        {"GET /health HTTP/1.1\r\nHost: localhost\r\n"
+         "X-Fragment: one-byte\r\n\r\n",
+         200, "OK\n"},
+        {BuildRequest("POST", "/echo", "fragmented-body"), 200,
+         "fragmented-body"},
+        {"POST /kv/fragmented-key HTTP/1.1\r\nHost: localhost\r\n"
+         "Content-Length: 5\r\n\r\nvalue",
+         200, "OK\n"},
+    };
+    for (const FragmentedCase& fragmented : cases) {
+        client.SendByteByByte(fragmented.request);
+        const HttpReply reply = client.ReadResponse();
+        ExpectStatus(reply, fragmented.status);
+        EXPECT_EQ(reply.body, fragmented.body);
+    }
 
     for (int i = 0; i < 100; ++i) {
-        reply = Exchange(client,
-                         BuildRequest("GET", "/kv/key" + std::to_string(i)));
+        const HttpReply reply = Exchange(
+            client, BuildRequest("GET", "/kv/key" + std::to_string(i)));
         ExpectStatus(reply, 200);
         EXPECT_EQ(reply.body, "value" + std::to_string(i))
             << "response index " << i;

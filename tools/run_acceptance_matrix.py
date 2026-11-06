@@ -21,7 +21,7 @@ import subprocess
 import sys
 
 
-EXPECTED_TEST_COUNT = 152
+EXPECTED_TEST_COUNT = 214
 
 CONFIGS = [
     {
@@ -99,7 +99,7 @@ def source_digest(source):
         source / ".clang-tidy",
     ]
     files = [path for path in required if path.is_file()]
-    for directory in ("app", "bench", "fuzz", "src", "tests", "tools"):
+    for directory in ("app", "bench", "experiments", "fuzz", "src", "tests", "tools"):
         base = source / directory
         if not base.exists():
             continue
@@ -158,30 +158,34 @@ def run_command(command, cwd, environment, log_path):
 
 def combined_sanitizer_evidence(build_dir):
     compile_log = build_dir / "compile_commands.json"
-    compile_ok = False
+    compile_has_address = False
+    compile_has_undefined = False
     if compile_log.is_file():
         entries = json.loads(compile_log.read_text(encoding="utf-8"))
         for entry in entries:
             command = entry.get("command") or " ".join(
                 entry.get("arguments", []))
-            if ("-fsanitize=address" in command and
-                    "-fsanitize=undefined" in command):
-                compile_ok = True
-                break
+            compile_has_address |= "-fsanitize=address" in command
+            compile_has_undefined |= "-fsanitize=undefined" in command
 
     link_file = None
-    link_ok = False
+    link_has_address = False
+    link_has_undefined = False
     for candidate in sorted((build_dir / "tests").glob(
             "CMakeFiles/*.dir/link.txt")):
         text = candidate.read_text(encoding="utf-8", errors="replace")
-        if ("-fsanitize=address" in text and
-                "-fsanitize=undefined" in text):
+        if "-fsanitize=address" in text:
+            link_has_address = True
+        if "-fsanitize=undefined" in text:
+            link_has_undefined = True
+        if link_has_address and link_has_undefined:
             link_file = str(candidate)
-            link_ok = True
             break
     return {
-        "compile_has_address": compile_ok,
-        "link_has_address": link_ok,
+        "compile_has_address": compile_has_address,
+        "compile_has_undefined": compile_has_undefined,
+        "link_has_address": link_has_address,
+        "link_has_undefined": link_has_undefined,
         "link_file": link_file,
     }
 
@@ -297,7 +301,8 @@ def main():
         item for item in results if item["config"] == "asan-ubsan")
     passed = passed and bool(asan_ubsan["combined_sanitizer"]) and all(
         asan_ubsan["combined_sanitizer"].get(key, False)
-        for key in ("compile_has_address", "link_has_address"))
+        for key in ("compile_has_address", "compile_has_undefined",
+                    "link_has_address", "link_has_undefined"))
     return 0 if passed else 1
 
 

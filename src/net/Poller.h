@@ -53,7 +53,6 @@ class Poller {
     using ChannelMap = std::map<int, Registration>;
     using TokenMap = std::unordered_map<std::uint64_t, Channel*>;
 
-    EventLoop* owner_loop_;
     std::shared_ptr<EpollOperations> operations_;
     int epollfd_;
     EventList events_;

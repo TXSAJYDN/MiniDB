@@ -25,6 +25,9 @@ target_link_libraries(base_test
 minidb_discover_tests(base_test)
 
 add_executable(storage_test
+    KvStoreTtlTest.cpp
+    KvStoreTtlStressTest.cpp
+    RdbManagerFaultTest.cpp
     RdbFormatTest.cpp
     RdbManagerTest.cpp
     RdbManagerP0Test.cpp
@@ -126,7 +129,9 @@ minidb_discover_tests(event_loop_timer_test)
 
 add_executable(net_unit_test
     AcceptorTest.cpp
+    ChannelTest.cpp
     PollerTest.cpp
+    TcpConnectionTest.cpp
 )
 
 target_link_libraries(net_unit_test

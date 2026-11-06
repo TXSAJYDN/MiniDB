@@ -43,3 +43,7 @@ tests/*_test
 *.bak
 *.orig
 *.before_fix
+
+# Python cache
+__pycache__/
+*.pyc

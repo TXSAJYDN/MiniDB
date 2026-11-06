@@ -55,7 +55,8 @@ class KvStore {
 
     // Compatibility helper: Missing/expired: nullopt.  Existing without TTL:
     // -1.  Otherwise the remaining monotonic duration rounded down to
-    // milliseconds.
+    // milliseconds.  A live TTL less than 1 ms before its deadline reports
+    // 0; only now >= deadline is treated as expired.
     std::optional<int64_t> ttl(const std::string& key);
 
     // Number of live (non-expired) entries.  Expired entries are reaped while

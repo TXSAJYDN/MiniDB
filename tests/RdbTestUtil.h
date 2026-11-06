@@ -4,6 +4,7 @@
 #include "../src/base/Clock.h"
 #include "../src/base/Int128.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -94,16 +95,44 @@ class FrozenClock final : public minidb::ClockInterface {
         : monotonic_ms_(monotonic_ms), wall_ms_(wall_ms) {}
 
     std::chrono::steady_clock::time_point now() const override {
-        return minidb::Clock::from_ms(monotonic_ms_);
+        return minidb::Clock::from_ms(
+            monotonic_ms_.load(std::memory_order_relaxed));
     }
 
     int64_t system_now_ms() const override {
-        return wall_ms_;
+        return wall_ms_.load(std::memory_order_relaxed);
     }
 
+    // Convenience for tests where both clocks should move together.
     void advance(int64_t milliseconds) {
-        monotonic_ms_ = saturating_add(monotonic_ms_, milliseconds);
-        wall_ms_ = saturating_add(wall_ms_, milliseconds);
+        advance_monotonic(milliseconds);
+        advance_wall(milliseconds);
+    }
+
+    // Independent setters make wall-clock jump behavior testable without
+    // perturbing the monotonic deadline clock (and vice versa).
+    void set_monotonic_ms(int64_t milliseconds) {
+        monotonic_ms_.store(milliseconds, std::memory_order_relaxed);
+    }
+
+    void set_wall_ms(int64_t milliseconds) {
+        wall_ms_.store(milliseconds, std::memory_order_relaxed);
+    }
+
+    void advance_monotonic(int64_t milliseconds) {
+        int64_t current = monotonic_ms_.load(std::memory_order_relaxed);
+        while (!monotonic_ms_.compare_exchange_weak(
+            current, saturating_add(current, milliseconds),
+            std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
+    void advance_wall(int64_t milliseconds) {
+        int64_t current = wall_ms_.load(std::memory_order_relaxed);
+        while (!wall_ms_.compare_exchange_weak(
+            current, saturating_add(current, milliseconds),
+            std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
     }
 
   private:
@@ -119,8 +148,8 @@ class FrozenClock final : public minidb::ClockInterface {
         return static_cast<int64_t>(result);
     }
 
-    int64_t monotonic_ms_;
-    int64_t wall_ms_;
+    std::atomic<int64_t> monotonic_ms_;
+    std::atomic<int64_t> wall_ms_;
 };
 
 } // namespace minidb_test

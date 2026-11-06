@@ -40,9 +40,9 @@ std::shared_ptr<EpollOperations> make_default_epoll_operations() {
 Poller::Poller(EventLoop* loop)
     : Poller(loop, make_default_epoll_operations()) {}
 
-Poller::Poller(EventLoop* loop, std::shared_ptr<EpollOperations> operations)
-    : owner_loop_(loop), operations_(std::move(operations)), epollfd_(-1),
-      events_(16), next_token_(1) {
+Poller::Poller(EventLoop*, std::shared_ptr<EpollOperations> operations)
+    : operations_(std::move(operations)), epollfd_(-1), events_(16),
+      next_token_(1) {
     if (!operations_) {
         operations_ = make_default_epoll_operations();
     }

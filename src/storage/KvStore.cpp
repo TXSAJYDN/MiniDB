@@ -154,12 +154,11 @@ KvStore::TtlResult KvStore::ttl_info(const std::string& key) {
     if (!it->second.has_ttl) {
         return {TtlState::kNoExpiry, -1};
     }
-    const int64_t remaining =
-        saturating_milliseconds_between(it->second.deadline, current);
-    if (remaining <= 0) {
-        store_.erase(it);
-        return {};
-    }
+    // Deadline comparison above is authoritative.  The conversion to
+    // whole milliseconds rounds down, so a live key less than 1 ms before
+    // its deadline legitimately reports zero remaining milliseconds.
+    const int64_t remaining = std::max<int64_t>(
+        0, saturating_milliseconds_between(it->second.deadline, current));
     return {TtlState::kExpiring, remaining};
 }
 
@@ -230,17 +229,18 @@ std::vector<KvStore::Entry> KvStore::export_all() const {
         exported.key = key;
         exported.value = entry.value;
         if (entry.has_ttl) {
-            const int64_t remaining =
-                saturating_milliseconds_between(entry.deadline, current);
-            if (remaining <= 0) {
-                continue;
-            }
-            // Absolute deadline use wall time, while expiry remains based on
-            // the monotonic clock.  A live TTL must never serialize as 0,
-            // which is reserved for no expiry, even with a negative wall
-            // clock.
+            // Millisecond conversion rounds down.  A live sub-millisecond
+            // TTL must persist with at least 1 ms rather than being omitted
+            // or encoded as 0 (the no-expiry sentinel).
+            const int64_t remaining = std::max<int64_t>(
+                0, saturating_milliseconds_between(entry.deadline, current));
+            // Preserve at least one serialized millisecond of liveness for a
+            // sub-millisecond remainder.  Using the rounded-down zero here
+            // would encode "expires at the previous wall-clock millisecond"
+            // and discard the key on an immediate restart.
+            const int64_t persisted_remaining = std::max<int64_t>(1, remaining);
             const int64_t absolute =
-                saturating_add_wall_clock(wall_now, remaining);
+                saturating_add_wall_clock(wall_now, persisted_remaining);
             exported.expiry_ms = absolute > 0 ? absolute : 1;
         }
         result.push_back(std::move(exported));

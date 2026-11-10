@@ -13,8 +13,9 @@ using namespace minidb;
 namespace {
 
 void print_usage(const char* program, std::ostream& out) {
-    out << "Usage: " << program << " [-p port] [-r rdb_path]\n"
-        << "Defaults: -p 6379, -r minidb.rdb\n";
+    out << "Usage: " << program
+        << " [-p port] [-r rdb_path] [-d sync|interval]\n"
+        << "Defaults: -p 6379, -r minidb.rdb, -d sync\n";
 }
 
 } // namespace
@@ -39,31 +40,35 @@ int main(int argc, char* argv[]) {
     InetAddress listen_addr(options.port);
     const std::string rdb_path =
         options.rdb_path.empty() ? "minidb.rdb" : options.rdb_path;
-    KvServer server(&loop, listen_addr, rdb_path);
+    KvServer server(&loop, listen_addr, rdb_path, options.durability_mode);
 
     if (!server.load_rdb()) {
-        std::cerr << "Fatal: failed to load RDB file; refusing to start\n";
+        std::cerr << "Fatal: failed to open the persistence image; check the "
+                     "RDB, manifest, WAL directory, and single-writer lock "
+                     "(see the recovery error above)\n";
         return 1;
     }
 
     std::cout << "MiniDB KV server listening on port " << options.port << "\n";
-    std::cout << "RDB path: " << rdb_path << "\n";
+    std::cout << "Persistence path: " << rdb_path << "\n";
+    std::cout << "Durability mode: "
+              << durability_mode_name(options.durability_mode) << "\n";
     server.start();
     loop.loop();
 
-    // Join the scanner before the final snapshot.  save_rdb() itself is
+    // Join the scanner before the final checkpoint.  save_rdb() itself is
     // linearizable, but explicit shutdown ordering keeps the exit path
     // deterministic and avoids any background work during persistence.
     server.stop();
     const RdbSaveResult save_result = server.save_rdb();
     if (save_result != RdbSaveResult::Ok) {
-        std::cerr << "Fatal: failed to persist RDB during shutdown"
+        std::cerr << "Fatal: failed to publish checkpoint during shutdown"
                   << (save_result == RdbSaveResult::DurabilityUnconfirmed
                           ? " (snapshot replaced, durability unconfirmed)"
                           : "")
                   << "\n";
         return 1;
     }
-    std::cout << "Server stopped; RDB saved\n";
+    std::cout << "Server stopped; checkpoint saved\n";
     return 0;
 }

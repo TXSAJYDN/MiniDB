@@ -5,6 +5,7 @@
 #include "HttpRequest.h"
 #include "HttpResponse.h"
 #include "../storage/KvStore.h"
+#include "../storage/PersistenceManager.h"
 #include "../storage/RdbManager.h"
 
 #include <chrono>
@@ -19,7 +20,8 @@ class EventLoop;
 class HttpServer {
   public:
     HttpServer(EventLoop* loop, const InetAddress& listen_addr,
-               const std::string& rdb_path = "");
+               const std::string& rdb_path = "",
+               DurabilityMode durability_mode = DurabilityMode::kSync);
     ~HttpServer();
     void start();
     // Stops this server's TTL scanner lease.  Idempotent, and safe to call
@@ -43,16 +45,25 @@ class HttpServer {
     bool load_rdb();
     RdbSaveResult save_rdb();
 
+    PersistenceManager* persistence_manager() const {
+        return persistence_manager_.get();
+    }
+
   private:
     void on_connection(const TcpConnectionPtr& conn);
     void on_message(const TcpConnectionPtr& conn, Buffer* buf);
     void on_request(const HttpRequest& req, HttpResponse* resp);
     void handle_kv(const HttpRequest& req, HttpResponse* resp);
     void method_not_allowed(const char* allow, HttpResponse* resp);
+    void flush_interval();
 
+    EventLoop* loop_;
     std::shared_ptr<KvStore> kv_store_;
     std::unique_ptr<RdbManager> rdb_manager_;
     std::string rdb_path_;
+    DurabilityMode durability_mode_;
+    std::unique_ptr<PersistenceManager> persistence_manager_;
+    std::uint64_t interval_timer_id_ = 0;
     KvStore::ScannerLease scanner_lease_;
     bool started_ = false;
     std::chrono::milliseconds idle_timeout_{30000};

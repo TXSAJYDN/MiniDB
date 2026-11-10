@@ -2,36 +2,58 @@
 
 ## Scope
 
-MiniDB is a single-node educational key/value database. It owns its event loop,
-non-blocking TCP layer, HTTP and binary protocol parsers, TTL store, and RDB
-snapshot format. It is not a general-purpose web server or a production
-database.
+MiniDB is a **crash-consistent single-node key/value store for bounded-resource
+environments**. It owns its event loop, non-blocking TCP layer, HTTP and binary
+protocol parsers, TTL store, WAL, RDB checkpoint format, checkpoint manifest,
+and startup recovery path.
 
-The project has two independent server processes:
+The project is a reliability engineering prototype, not a production database.
+It does not claim SQL or Redis compatibility, high concurrency, replication,
+transactions, or a production SLA.
 
-- **minidb_http_server** exposes health, echo, save, and key/value routes over a
-  deliberately strict HTTP/1.1 subset.
-- **minidb_kv_server** exposes CRUD, TTL, and save commands over a binary-safe
-  framed TCP protocol.
+Two independent server processes expose the same storage engine:
 
-Both processes use the same network and storage libraries. They do not share
-memory and should not be pointed at the same RDB file at the same time.
+- **minidb_http_server** exposes health, echo, save, stats, and key/value routes
+  over a deliberately strict HTTP/1.1 subset.
+- **minidb_kv_server** exposes CRUD, TTL, save, and stats commands over a
+  binary-safe framed TCP protocol.
+
+Both processes link the same network and storage libraries. They do not share
+memory and must use distinct persistence base paths. A second process is
+rejected by an advisory `flock` on `<rdb_path>.lock`.
+
+## Design invariants
+
+1. One owner EventLoop serializes command execution and persistence calls.
+2. A mutation is appended to the WAL before it is applied to the in-memory
+   store and before success is reported.
+3. `SYNC` reports success only after a successful WAL file `fsync`.
+4. `INTERVAL` reports success after append and relies on a 100 ms timer,
+   checkpoint, or graceful shutdown to flush.
+5. RDB is a checkpoint, not the per-write durability mechanism.
+6. A checkpoint publishes the snapshot, then the manifest, then removes old WAL
+   segments, in that order.
+7. Recovery builds a temporary store and publishes it only after the RDB,
+   manifest, and WAL chain all validate.
+8. Resource use is bounded by explicit connection, record, segment, recovery,
+   and snapshot limits.
 
 ## Process and thread model
 
 Each server process creates one EventLoop on the main thread. Socket readiness,
-timers, signal handling, protocol parsing, command execution, and snapshot
+timers, signal handling, protocol parsing, command execution, and checkpoint
 initiation all run on that owner thread. This removes data races inside the
 connection state machine and makes callback ordering deterministic.
 
-Each KvStore may run one background TTL scanner. The scanner holds the same
+Each `KvStore` may run one background TTL scanner. The scanner holds the same
 store mutex as commands, removes expired entries, and does not touch socket
-callbacks. A second process cannot safely share the same RDB path because there
-is no inter-process lock.
+callbacks. It is paused and joined during checkpoint and shutdown so snapshot
+publication cannot overlap a background mutation.
 
-The design intentionally has no worker pool. A slow filesystem operation such
-as SAVE blocks the owner loop, but the operation is synchronous and its
-completion is reported before the client receives a success response.
+The persistence manager owns one mutex that serializes mutations, interval
+flushes, checkpoints, and diagnostic snapshots. A slow filesystem operation
+such as a checkpoint blocks the owner loop; there is no worker pool and no
+background checkpoint. This is a deliberate R0-R3 boundary.
 
 ## Component map
 
@@ -40,7 +62,7 @@ completion is reported before the client receives a success response.
 | Base | src/base | RAII descriptors, Buffer, clocks, error values, logging |
 | Network | src/net | eventfd/timerfd/signalfd EventLoop, level-triggered epoll, Acceptor, TcpConnection, TcpServer |
 | Protocol | src/protocol | HTTP parser/session/routes and binary KV framing/session |
-| Storage | src/storage | thread-safe in-memory KvStore and RDB v2 save/recovery |
+| Storage | src/storage | thread-safe KvStore, RDB checkpoint, WAL, manifest, recovery, single-writer lock |
 | Applications | app | CLI parsing, startup validation, signal-driven graceful shutdown |
 
 The dependency direction is approximately:
@@ -78,6 +100,9 @@ Important invariants:
 - EventLoop teardown is explicit; the server's network object is destroyed
   before the session map and storage objects that its close callbacks reference.
 
+In `INTERVAL` mode the owner loop also runs a 100 ms repeating timer that calls
+`PersistenceManager::flush_interval()`.
+
 ## TCP layer
 
 Acceptor owns the listening socket and accepts at most a bounded batch per
@@ -111,24 +136,19 @@ level-triggered epoll because no new kernel edge exists for user-space bytes.
 3. HttpParser parses exactly one HTTP/1.1 request at the current buffer offset.
 4. Session validation checks Host, transfer framing, Expect, Upgrade, and the
    complete request-target length.
-5. HttpServer routes the request to health, echo, save, or /kv/<key> logic.
-6. HttpResponse serializes the status line, headers, and body.
-7. The session stops reading while a response is in flight. Write completion
+5. HttpServer routes the request to health, echo, stats, save, or /kv/<key>
+   logic.
+6. For mutations, the route calls `PersistenceManager`; the in-memory value is
+   visible only after the WAL append path succeeds.
+7. HttpResponse serializes the status line, headers, and body.
+8. The session stops reading while a response is in flight. Write completion
    resumes draining buffered pipelined requests or re-enables socket reads.
 
-The parser uses explicit CRLF framing and Content-Length. It rejects ambiguous
-or unsupported framing rather than guessing. Request-line, target, header,
-field-count, body, and pending-buffer limits are documented in
-[protocol-http.md](protocol-http.md).
+`GET /stats` returns the stable persistence statistics JSON. `POST /save`
+performs a stop-the-world checkpoint and reports failure or unconfirmed
+durability explicitly.
 
-### Keep-alive and pipelining
-
-HTTP/1.1 connections are persistent by default. The server permits pipelined
-requests but processes one at a time and preserves response order. A request
-with Connection: close, a final parse error, or an oversized input causes the
-session to stop reading and shut down after queued output is flushed.
-
-### Idle timeout
+## Idle timeout
 
 An incomplete or idle HTTP request gets a 30-second owner-loop timer. New bytes
 restart the incomplete-request interval. The timeout sends 408 and closes the
@@ -141,42 +161,114 @@ connection. The KV protocol has no idle timeout.
 3. KvProtocol::parse_command() consumes exactly one frame at a time and returns
    incomplete, malformed, or complete without resynchronizing.
 4. KvSession validates argument counts, key sizes, and TTL text, then calls
-   KvStore.
+   `PersistenceManager` for mutations and `KvStore` for reads.
 5. The response is encoded in the same frame layout and queued through
    TcpConnection.
 6. The connection remains usable for command-level errors; framing corruption
    or an unknown command returns ERROR where possible and closes the connection.
+
+`STATS` (command code 8) returns the same persistence statistics JSON as the
+HTTP endpoint. `SAVE` (command code 7) performs a checkpoint.
 
 One command is in flight per connection. Pipelined frames remain buffered and
 are resumed from write completion, not recursive callbacks.
 
 ## Storage and TTL semantics
 
-KvStore stores values in std::unordered_map under one mutex. TTL deadlines use
-std::chrono::steady_clock while the process is live. The RDB boundary converts
-those deadlines to absolute Unix epoch milliseconds.
+KvStore stores values in `std::unordered_map` under one mutex. TTL deadlines use
+`std::chrono::steady_clock` while the process is live. The WAL and RDB boundary
+converts those deadlines to absolute Unix epoch milliseconds, so restarting the
+process cannot extend a TTL.
 
 - SET replaces a value and clears any TTL.
 - A non-positive EXPIRE removes the key.
 - TTL reports -1 for an existing key with no expiry, -2 for a missing or expired
   key, and a non-negative remaining duration otherwise.
 - Expired entries are removed lazily and by the optional periodic scanner.
+- An EXPIRE mutation is logged as an absolute deadline before it is applied.
 
 The exact wire rules are in [protocol-kv.md](protocol-kv.md).
 
-## Persistence path
+## Persistence architecture
 
-RdbManager serializes a complete snapshot into memory, appends CRC32C, writes a
-temporary file with O_EXCL, fsyncs it, closes it, renames it over the target, and
-fsyncs the parent directory. Save operations are serialized with a mutex.
+Given `-r <rdb_path>`:
 
-Recovery reads and validates the whole file into a temporary KvStore. It checks
-size, checksum, magic, version, record count, every varint, every key/value
-length, duplicate keys, expiry validity, and total recovery bytes. Only after the
-entire image is valid does it swap the temporary store into the live store. A
-corrupt file returns -1 and leaves the live store untouched.
+~~~text
+<rdb_path>              RDB v2 checkpoint snapshot
+<rdb_path>.manifest     checkpoint manifest v1
+<rdb_path>.wal/         WAL segments
+<rdb_path>.lock         advisory single-writer lock
+~~~
 
-The exact layout and limits are in [rdb-format.md](rdb-format.md).
+WAL segment names use a 20-digit decimal start LSN:
+
+~~~text
+wal-00000000000000000001.log
+~~~
+
+### Write path
+
+`PersistenceManager::set`, `del`, and `expire` validate the operation, create a
+logical WAL record with the next LSN, and call `WalManager::append`.
+
+- `SYNC`: append and `fsync` the WAL file, then apply the mutation to KvStore,
+  then return success.
+- `INTERVAL`: append to the file, apply the mutation, and return success. The
+  owner-loop timer, checkpoint, or shutdown flushes and fsyncs the WAL.
+- If the WAL append or required fsync fails, the persistence layer enters
+  fail-stop: later mutations return an error until restart. LSN, byte counters,
+  and statistics are not rolled back.
+- A complete record that reached the page cache before an fsync failure may
+  reappear after recovery. Unacknowledged writes are therefore allowed; an
+  acknowledged `SYNC` write is not allowed to disappear.
+
+### Checkpoint ordering
+
+A checkpoint is stop-the-world:
+
+1. pause the TTL scanner;
+2. flush and fsync the WAL;
+3. rotate the active segment if it contains records, so the next segment starts
+   at `checkpoint_lsn + 1`;
+4. write the RDB snapshot to a temporary file, fsync it, rename it, and fsync
+   the parent directory;
+5. atomically write and fsync the manifest naming `checkpoint_lsn` and the
+   first retained segment;
+6. only then remove obsolete WAL segments and fsync the WAL directory.
+
+A snapshot-durability or manifest-durability failure marks persistence
+fail-stop. Old WAL is retained in every ambiguous case. Cleanup failure does not
+invalidate a checkpoint: obsolete segments become residue, recovery ignores
+segments before the first retained start, and a later checkpoint retries
+cleanup.
+
+### Recovery
+
+Startup runs before the listening socket is opened:
+
+1. acquire `<rdb_path>.lock` with `flock(LOCK_EX | LOCK_NB)`;
+2. if the manifest is missing:
+   - no RDB and no WAL: start empty and bootstrap on the first mutation or
+     checkpoint;
+   - RDB present and no WAL: import the legacy RDB, then bootstrap on the first
+     mutation;
+   - WAL present without a manifest: refuse the ambiguous migration;
+3. load and validate the RDB into a temporary KvStore;
+4. validate the manifest and each referenced segment;
+5. scan from the first retained start, including newer segments not yet listed
+   in the manifest;
+6. require a contiguous LSN history and replay only `LSN > checkpoint_lsn`;
+7. truncate only an incomplete record at the tail of the final segment, then
+   fsync the file and directory;
+8. swap the fully validated temporary store into the live store.
+
+A checksum failure, middle-of-file corruption, LSN gap, missing segment,
+invalid manifest, or resource-limit breach returns a nonzero startup exit. The
+process does not listen, does not publish a partial store, and does not modify
+the damaged image (except the one permitted tail truncation).
+
+The exact byte layouts are in [wal-format.md](wal-format.md) and
+[rdb-format.md](rdb-format.md).
 
 ## Startup and shutdown
 
@@ -185,16 +277,17 @@ Startup order is:
 1. parse command-line options;
 2. block SIGINT/SIGTERM through signalfd;
 3. bind the listening socket;
-4. load and validate the RDB;
+4. acquire the writer lock and run recovery;
 5. begin accepting connections.
 
-A missing RDB starts an empty database. Any other load failure aborts startup
-with a nonzero exit code and does not overwrite the damaged file.
+A missing persistence image starts an empty database and is bootstrapped on the
+first write or checkpoint. Any other recovery failure aborts startup with a
+nonzero exit code and does not overwrite the damaged image.
 
-On SIGINT/SIGTERM, the event loop stops, the server performs a final save, and
-the process exits 0 only if the snapshot write and parent-directory fsync are
-confirmed. A visibility-unconfirmed directory fsync maps to a distinct failure
-message and nonzero exit status.
+On SIGINT/SIGTERM, the event loop stops, the TTL scanner is joined, and the
+server performs a final checkpoint. Exit code 0 requires `RdbSaveResult::Ok`.
+A `DurabilityUnconfirmed` result returns nonzero and warns that the snapshot may
+already be visible.
 
 ## Failure and resource boundaries
 
@@ -206,8 +299,24 @@ message and nonzero exit status.
 - Peer reset and EPIPE are ordinary connection failures.
 - Connection close callbacks are idempotent.
 - The listener remains available after individual client failures.
-- RDB save failure does not claim durability; a changed-but-unconfirmed rename
-  is reported separately.
+- Persistence I/O failure after an append or fsync failure is fail-stop for the
+  process; recovery decides the last valid prefix on restart.
+- A second writer is rejected by the advisory lock with a nonzero exit.
+
+The exact default bounds are:
+
+| Resource | Limit |
+|---|---:|
+| Concurrent connections per process | 32 |
+| Per-connection input/output budget | 1.25 MiB each |
+| Key | 1 KiB |
+| Value / WAL record payload | 1 MiB |
+| WAL segment | 16 MiB |
+| Total WAL bytes | 256 MiB |
+| WAL segments | 128 |
+| Recovery scanned records | 1,000,000 |
+| Recovery scanned bytes | 512 MiB |
+| RDB snapshot | 64 MiB / 100,000 records |
 
 ## Testing strategy
 
@@ -217,27 +326,32 @@ The local evidence suite covers:
 - EventLoop timers and callback-exception containment;
 - HTTP parser framing, exact status mappings, and incremental 64 KiB+ rejection;
 - HTTP real-socket routes, fragmented input, keep-alive, pipelining, slow reads,
-  and peer reset;
-- KV framing, fragmentation, large binary payloads, TTL semantics, and malformed
-  frame closure;
-- RDB format vectors, CRC32C, varint overflow, corruption matrices, save/load,
-  TTL recovery, and non-empty-store preservation;
-- process-level CLI, default path, restart persistence, corrupt startup, and
-  shutdown-save failure behavior;
-- sanitizer, fuzz-smoke, syscall-trace, and benchmark evidence when the
-  corresponding tools are available.
+  peer reset, `/stats`, and checkpoint behavior;
+- KV framing, fragmentation, large binary payloads, TTL semantics, `STATS`, and
+  malformed frame closure;
+- WAL record and manifest codecs, CRC32C, LSN continuity, rotation, cleanup, and
+  resource limits;
+- checkpoint publication ordering, snapshot/manifest durability failures, and
+  legacy RDB import;
+- C01-C14 deterministic crash points, fixed-seed random `SIGKILL`, torn WAL
+  tails, middle corruption, missing segments, and TTL recovery;
+- process-level CLI, default path, restart persistence, corrupt startup,
+  writer-lock conflict, and shutdown-save failure behavior;
+- sanitizer, clang-format, clang-tidy, four fixed-seed fuzz targets, and the
+  reliability benchmark.
 
-The acceptance matrix is intentionally stricter than a single local build:
-Debug, Release, ASan, UBSan, ASan+UBSan, and TSan are configured and tested from
-fresh directories. Passing that matrix is local reproducibility evidence, not a
-substitute for a public CI run.
+The acceptance matrix runs Debug, Release, ASan, UBSan, ASan+UBSan, and TSan
+from separate build directories. Passing it is local reproducibility evidence,
+not a substitute for a public CI run or a production qualification.
 
 ## Deliberate non-goals
 
 - TLS, authentication, authorization, or multi-tenant isolation.
 - Replication, sharding, clustering, consensus, or transactions.
 - HTTP/2, WebSocket, chunked requests, or Expect/100-continue.
-- Multiple writers to one RDB path.
-- Production SLAs, crash-consistent WAL recovery, or arbitrary client scaling.
+- Multi-process sharing of one data directory.
+- Group commit, batched durability, or background/incremental checkpoint.
+- Power-loss, kernel-crash, firmware-cache, or media-failure proofs.
+- Production SLAs, capacity claims, or arbitrary client scaling.
 
 These exclusions are part of the contract, not hidden implementation gaps.

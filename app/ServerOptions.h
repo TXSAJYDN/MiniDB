@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../src/storage/DurabilityPolicy.h"
+
 #include <charconv>
 #include <cstdint>
 #include <string>
@@ -10,13 +12,15 @@ namespace minidb {
 struct ServerOptions {
     uint16_t port = 0;
     std::string rdb_path;
+    DurabilityMode durability_mode = DurabilityMode::kSync;
     bool help_requested = false;
 };
 
-// Parses the shared server command line.  Only '-p <port>', '-r <path>' and
-// the standalone '-h' are accepted.  Unknown options, missing values, extra
-// positional arguments, duplicate options and non-canonical decimal ports
-// (including '+1', whitespace and trailing characters) are rejected.
+// Parses the shared server command line. Only '-p <port>', '-r <path>',
+// '-d <sync|interval>' and the standalone '-h' are accepted. Unknown
+// options, missing values, extra positional arguments, duplicate options and
+// non-canonical decimal ports (including '+1', whitespace and trailing
+// characters) are rejected.
 inline bool parse_server_options(int argc, char* const argv[],
                                  uint16_t default_port, ServerOptions* options,
                                  std::string* error) {
@@ -28,6 +32,7 @@ inline bool parse_server_options(int argc, char* const argv[],
     parsed.port = default_port;
     bool have_p = false;
     bool have_r = false;
+    bool have_d = false;
     bool have_h = false;
 
     auto fail = [&](const std::string& message) {
@@ -38,14 +43,14 @@ inline bool parse_server_options(int argc, char* const argv[],
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i] == nullptr ? std::string() : argv[i];
         if (arg == "-h") {
-            if (have_h || have_p || have_r || argc != 2) {
+            if (have_h || have_p || have_r || have_d || argc != 2) {
                 return fail("'-h' must be used alone");
             }
             have_h = true;
             parsed.help_requested = true;
             continue;
         }
-        if (arg == "-p" || arg == "-r") {
+        if (arg == "-p" || arg == "-r" || arg == "-d") {
             if (i + 1 >= argc) {
                 return fail("missing value for " + arg);
             }
@@ -69,12 +74,25 @@ inline bool parse_server_options(int argc, char* const argv[],
                                 "' (expected decimal 1..65535)");
                 }
                 parsed.port = static_cast<uint16_t>(port);
-            } else {
+            } else if (arg == "-r") {
                 if (have_r) {
                     return fail("duplicate option '-r'");
                 }
                 have_r = true;
                 parsed.rdb_path = value;
+            } else {
+                if (have_d) {
+                    return fail("duplicate option '-d'");
+                }
+                have_d = true;
+                if (value == "sync") {
+                    parsed.durability_mode = DurabilityMode::kSync;
+                } else if (value == "interval") {
+                    parsed.durability_mode = DurabilityMode::kInterval;
+                } else {
+                    return fail("invalid durability mode '" + value +
+                                "' (expected sync or interval)");
+                }
             }
             continue;
         }

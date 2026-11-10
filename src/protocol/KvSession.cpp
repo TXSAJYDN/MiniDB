@@ -1,4 +1,5 @@
 #include "KvSession.h"
+#include "PersistenceStatsJson.h"
 #include "../base/Log.h"
 #include "../net/EventLoop.h"
 
@@ -135,6 +136,14 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
         send_response(KvProtocol::kError, {std::string(usage)});
         return false;
     };
+    const auto fail_mutation = [&](const MutationOutcome& outcome) {
+        const std::string message =
+            outcome.status == MutationStatus::kInvalidArgument
+                ? outcome.error
+                : std::string("Persistence write failed");
+        send_response(KvProtocol::kError, {message});
+        return true;
+    };
 
     switch (cmd.type) {
     case KvProtocol::kPing:
@@ -148,7 +157,15 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
             !validate_key(cmd.args[0], "SET")) {
             return true;
         }
-        store_->set(cmd.args[0], cmd.args[1]);
+        if (persistence_manager_) {
+            const MutationOutcome outcome =
+                persistence_manager_->set(cmd.args[0], cmd.args[1]);
+            if (!outcome.ok()) {
+                return fail_mutation(outcome);
+            }
+        } else {
+            store_->set(cmd.args[0], cmd.args[1]);
+        }
         return send_response(KvProtocol::kOk, {});
 
     case KvProtocol::kGet:
@@ -167,7 +184,17 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
             !validate_key(cmd.args[0], "DEL")) {
             return true;
         } else {
-            const bool deleted = store_->del(cmd.args[0]);
+            bool deleted = false;
+            if (persistence_manager_) {
+                const MutationOutcome outcome =
+                    persistence_manager_->del(cmd.args[0]);
+                if (!outcome.ok()) {
+                    return fail_mutation(outcome);
+                }
+                deleted = outcome.changed;
+            } else {
+                deleted = store_->del(cmd.args[0]);
+            }
             return send_response(KvProtocol::kInteger, {deleted ? "1" : "0"});
         }
 
@@ -185,7 +212,15 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
             send_response(KvProtocol::kError, {"Invalid TTL"});
             return true;
         }
-        store_->expire(cmd.args[0], ttl_ms);
+        if (persistence_manager_) {
+            const MutationOutcome outcome =
+                persistence_manager_->expire(cmd.args[0], ttl_ms);
+            if (!outcome.ok()) {
+                return fail_mutation(outcome);
+            }
+        } else {
+            store_->expire(cmd.args[0], ttl_ms);
+        }
         return send_response(KvProtocol::kOk, {});
     }
 
@@ -225,6 +260,18 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
                            : "Failed to save RDB"});
         return true;
     }
+
+    case KvProtocol::kStats:
+        if (!require_args(0, "STATS takes no arguments")) {
+            return true;
+        }
+        if (!persistence_manager_) {
+            send_response(KvProtocol::kError, {"STATS is unavailable"});
+            return true;
+        }
+        return send_response(
+            KvProtocol::kValue,
+            {persistence_stats_json(persistence_manager_->snapshot())});
 
     default:
         pending_buffer_.retrieve_all();

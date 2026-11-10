@@ -9,7 +9,10 @@ the Python standard library and is registered with CTest.
 
 import argparse
 import hashlib
+import json
 import os
+import random
+import shutil
 import signal
 import socket
 import struct
@@ -29,6 +32,9 @@ HTTP_SET = 2
 HTTP_GET = 3
 HTTP_EXPIRE = 5
 HTTP_TTL = 6
+KV_DEL = 4
+KV_SAVE = 7
+KV_STATS = 8
 
 
 class TestError(Exception):
@@ -38,6 +44,15 @@ class TestError(Exception):
 def check(condition, message):
     if not condition:
         raise TestError(message)
+
+
+def remove_persistence_files(rdb_path):
+    for suffix in ("", ".manifest", ".lock"):
+        try:
+            os.unlink(rdb_path + suffix)
+        except FileNotFoundError:
+            pass
+    shutil.rmtree(rdb_path + ".wal", ignore_errors=True)
 
 
 def free_loopback_port():
@@ -146,10 +161,13 @@ def kv_request(port, command_type, args=(), timeout=5.0):
 
 
 class ServerProcess:
-    def __init__(self, executable, port, rdb_path=None, cwd=None):
+    def __init__(self, executable, port, rdb_path=None, cwd=None,
+                 durability_mode=None):
         command = [executable, "-p", str(port)]
         if rdb_path is not None:
             command += ["-r", rdb_path]
+        if durability_mode is not None:
+            command += ["-d", durability_mode]
         self.proc = subprocess.Popen(
             command,
             cwd=cwd,
@@ -244,8 +262,8 @@ class ServerProcess:
         self.kill_group()
 
 
-def start_http(port, rdb_path, cwd):
-    server = ServerProcess(HTTP_BIN, port, rdb_path, cwd)
+def start_http(port, rdb_path, cwd, durability_mode=None):
+    server = ServerProcess(HTTP_BIN, port, rdb_path, cwd, durability_mode)
     try:
         server.wait_for_http(port)
     except Exception:
@@ -254,8 +272,8 @@ def start_http(port, rdb_path, cwd):
     return server
 
 
-def start_kv(port, rdb_path, cwd):
-    server = ServerProcess(KV_BIN, port, rdb_path, cwd)
+def start_kv(port, rdb_path, cwd, durability_mode=None):
+    server = ServerProcess(KV_BIN, port, rdb_path, cwd, durability_mode)
     try:
         server.wait_for_kv(port)
     except Exception:
@@ -309,6 +327,72 @@ def run_cli(binary, args, cwd):
     )
 
 
+def wait_until(predicate, timeout, message):
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            result = predicate()
+            if result:
+                return result
+        except (OSError, TestError, ValueError, json.JSONDecodeError) as error:
+            last_error = error
+        time.sleep(0.05)
+    raise TestError(f"{message}; last_error={last_error!r}")
+
+
+def read_http_stats(port):
+    status, headers, payload = read_http_response(port, "GET", "/stats")
+    check(status == 200,
+          f"GET /stats returned {status}: {payload!r}")
+    check(headers.get("content-type") == "application/json",
+          f"GET /stats content type is {headers.get('content-type')!r}")
+    return json.loads(payload.decode("utf-8"))
+
+
+def read_kv_stats(port):
+    command_type, args = kv_request(port, KV_STATS)
+    check(command_type == 102 and len(args) == 1,
+          f"KV STATS returned type={command_type}, args={args!r}")
+    return json.loads(args[0].decode("utf-8"))
+
+
+def stats_for(protocol, port):
+    return read_http_stats(port) if protocol == "http" else read_kv_stats(port)
+
+
+def expect_startup_failure(binary, label, port, rdb_path, cwd, expected):
+    result = subprocess.run(
+        [binary, "-p", str(port), "-r", rdb_path],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=15.0,
+        start_new_session=True,
+    )
+    check(result.returncode == 1,
+          f"{label} accepted an invalid persistence image with exit "
+          f"{result.returncode}:\n{result.stdout}")
+    output = result.stdout.lower()
+    check(expected in output,
+          f"{label} failure omitted {expected!r}:\n{result.stdout}")
+    assert_listener_absent(port)
+    return result.stdout
+
+
+def wal_segments(rdb_path):
+    wal_dir = Path(rdb_path + ".wal")
+    check(wal_dir.is_dir(), f"WAL directory is missing: {wal_dir}")
+    segments = sorted(wal_dir.glob("wal-*.log"))
+    check(bool(segments), f"no WAL segments in {wal_dir}")
+    return segments
+
+
+def sha256_path(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def test_cli_contract():
     with tempfile.TemporaryDirectory(prefix="minidb-process-cli-") as temp_dir:
         for binary, label in ((HTTP_BIN, "HTTP"), (KV_BIN, "KV")):
@@ -317,6 +401,8 @@ def test_cli_contract():
                   f"{label} -h returned {help_run.returncode}: {help_run.stdout}")
             check("Usage:" in help_run.stdout,
                   f"{label} -h omitted usage text: {help_run.stdout}")
+            check("-d" in help_run.stdout and "interval" in help_run.stdout,
+                  f"{label} -h omitted durability modes: {help_run.stdout}")
 
             invalid_cases = (
                 ["-p", "0"],
@@ -324,6 +410,10 @@ def test_cli_contract():
                 ["-p", "not-a-port"],
                 ["-p", "1", "-p", "2"],
                 ["-r"],
+                ["-d"],
+                ["-d", "batch"],
+                ["-d", "SYNC"],
+                ["-d", "sync", "-d", "interval"],
                 ["unexpected"],
             )
             for args in invalid_cases:
@@ -342,10 +432,7 @@ def test_cli_contract():
                 (KV_BIN, "KV", "kv")):
             port = free_loopback_port()
             default_rdb = os.path.join(temp_dir, "minidb.rdb")
-            try:
-                os.unlink(default_rdb)
-            except FileNotFoundError:
-                pass
+            remove_persistence_files(default_rdb)
             server = ServerProcess(binary, port, cwd=temp_dir)
             try:
                 if wait_name == "http":
@@ -360,10 +447,32 @@ def test_cli_contract():
                       f"{label} did not create a valid default RDB")
             finally:
                 server.cleanup()
+            remove_persistence_files(default_rdb)
+
+
+def test_cli_durability_contract():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-mode-") as temp_dir:
+        for binary, label, protocol in (
+                (HTTP_BIN, "HTTP", "http"),
+                (KV_BIN, "KV", "kv")):
+            rdb_path = os.path.join(temp_dir, f"{protocol}-interval.rdb")
+            port = free_loopback_port()
+            server = ServerProcess(
+                binary, port, rdb_path, temp_dir, durability_mode="interval")
             try:
-                os.unlink(default_rdb)
-            except FileNotFoundError:
-                pass
+                if protocol == "http":
+                    server.wait_for_http(port)
+                else:
+                    server.wait_for_kv(port)
+                stats = stats_for(protocol, port)
+                check(stats["durability_mode"] == "interval",
+                      f"{label} did not expose interval mode: {stats!r}")
+                check(stats["opened"] is True and stats["failed"] is False,
+                      f"{label} reported an unhealthy open state: {stats!r}")
+                check(server.terminate_group(signal.SIGTERM) == 0,
+                      f"{label} interval shutdown failed:\n{server.log}")
+            finally:
+                server.cleanup()
 
 
 def test_http_persistence_and_sigterm():
@@ -385,7 +494,7 @@ def test_http_persistence_and_sigterm():
             return_code = server.terminate_group(signal.SIGTERM)
             check(return_code == 0,
                   f"HTTP SIGTERM shutdown returned {return_code}:\n{server.log}")
-            check("RDB saved" in server.log,
+            check("checkpoint saved" in server.log,
                   f"HTTP shutdown did not report a saved RDB:\n{server.log}")
         finally:
             server.cleanup()
@@ -422,7 +531,7 @@ def test_kv_persistence_and_sigint():
             return_code = server.terminate_group(signal.SIGINT)
             check(return_code == 0,
                   f"KV SIGINT shutdown returned {return_code}:\n{server.log}")
-            check("RDB saved" in server.log,
+            check("checkpoint saved" in server.log,
                   f"KV shutdown did not report a saved RDB:\n{server.log}")
         finally:
             server.cleanup()
@@ -598,20 +707,525 @@ def test_save_failure_exit_code():
             return_code = server.terminate_group(signal.SIGTERM)
             check(return_code == 1,
                   f"save failure returned {return_code}, expected 1:\n{server.log}")
-            check("failed to persist" in server.log.lower(),
+            check("failed to publish checkpoint" in server.log.lower(),
                   f"save failure was not reported:\n{server.log}")
         finally:
             os.chmod(temp_dir, original_mode)
             server.cleanup()
 
 
+def test_http_sync_crash_recovery():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-http-crash-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "http-sync-crash.rdb")
+        port = free_loopback_port()
+        expected = {
+            "sync-a": b"alpha\x00value",
+            "sync-b": b"beta\xffvalue",
+            "sync-c": b"",
+        }
+        server = start_http(port, rdb_path, temp_dir, "sync")
+        try:
+            for key, value in expected.items():
+                status, _, payload = read_http_response(
+                    port, "POST", f"/kv/{key}", value)
+                check(status == 200 and payload == b"OK\n",
+                      f"HTTP SYNC setup failed for {key}: "
+                      f"status={status}, body={payload!r}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_http(port, rdb_path, temp_dir, "sync")
+        try:
+            for key, value in expected.items():
+                status, _, payload = read_http_response(
+                    port, "GET", f"/kv/{key}")
+                check(status == 200 and payload == value,
+                      f"HTTP SYNC acknowledged write {key} was lost: "
+                      f"status={status}, body={payload!r}")
+            stats = read_http_stats(port)
+            check(stats["recovery"]["wal_records_replayed"] >= len(expected),
+                  f"HTTP recovery did not replay all acknowledged writes: {stats!r}")
+            check(stats["last_lsn"] >= len(expected),
+                  f"HTTP recovery LSN moved backwards: {stats!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"HTTP recovery shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_kv_sync_crash_recovery():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-kv-crash-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "kv-sync-crash.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            for key, value in (("keep", b"value\x00one"), ("drop", b"old")):
+                command_type, _ = kv_request(port, HTTP_SET, [key, value])
+                check(command_type == 101,
+                      f"KV SET {key} returned {command_type}")
+            command_type, args = kv_request(port, KV_DEL, ["drop"])
+            check(command_type == 104 and args == [b"1"],
+                  f"KV DEL returned type={command_type}, args={args!r}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, args = kv_request(port, HTTP_GET, ["keep"])
+            check(command_type == 102 and args == [b"value\x00one"],
+                  f"KV acknowledged SET was lost: type={command_type}, args={args!r}")
+            command_type, args = kv_request(port, HTTP_GET, ["drop"])
+            check(command_type == 103,
+                  f"KV acknowledged DEL was resurrected: "
+                  f"type={command_type}, args={args!r}")
+            stats = read_kv_stats(port)
+            check(stats["recovery"]["wal_records_replayed"] >= 3,
+                  f"KV recovery did not replay the write chain: {stats!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"KV recovery shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_interval_flush_recovery():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-interval-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "interval.rdb")
+        port = free_loopback_port()
+        expected = {f"interval-{i}": f"value-{i}".encode() for i in range(4)}
+        server = start_kv(port, rdb_path, temp_dir, "interval")
+        try:
+            for key, value in expected.items():
+                command_type, _ = kv_request(port, HTTP_SET, [key, value])
+                check(command_type == 101,
+                      f"INTERVAL SET {key} returned {command_type}")
+            stats = wait_until(
+                lambda: (lambda current: current if
+                         current["persistence"]["interval_flushes"] >= 1
+                         and current["wal"]["data_fsyncs"] >= 1 else None)(
+                             read_kv_stats(port)),
+                timeout=5.0,
+                message="INTERVAL timer did not flush WAL",
+            )
+            check(stats["durability_mode"] == "interval",
+                  f"INTERVAL mode was not reported: {stats!r}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_kv(port, rdb_path, temp_dir, "interval")
+        try:
+            for key, value in expected.items():
+                command_type, args = kv_request(port, HTTP_GET, [key])
+                check(command_type == 102 and args == [value],
+                      f"INTERVAL flushed write {key} was lost: "
+                      f"type={command_type}, args={args!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"INTERVAL recovery shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_writer_lock_conflict():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-lock-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "locked.rdb")
+        first_port = free_loopback_port()
+        second_port = free_loopback_port()
+        first = start_http(first_port, rdb_path, temp_dir, "sync")
+        try:
+            result = run_cli(
+                HTTP_BIN, ["-p", str(second_port), "-r", rdb_path], temp_dir)
+            check(result.returncode == 1,
+                  f"second owner exited {result.returncode}, expected 1:\n"
+                  f"{result.stdout}")
+            output = result.stdout.lower()
+            check("already owned" in output or "lock" in output,
+                  f"second owner did not report the writer lock:\n{result.stdout}")
+            assert_listener_absent(second_port)
+            status, _, payload = read_http_response(
+                first_port, "GET", "/health")
+            check(status == 200 and payload == b"OK\n",
+                  "first owner stopped serving after lock conflict")
+            check(first.terminate_group(signal.SIGTERM) == 0,
+                  f"first owner shutdown failed:\n{first.log}")
+        finally:
+            first.cleanup()
+
+
+def test_wal_tail_truncation():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-tail-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "tail.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, _ = kv_request(
+                port, HTTP_SET, ["tail-key", b"tail-value"])
+            check(command_type == 101,
+                  f"WAL tail seed returned {command_type}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        segment = wal_segments(rdb_path)[-1]
+        record_prefix = segment.read_bytes()[:19]
+        check(len(record_prefix) == 19,
+              "WAL segment is too short to forge a torn header")
+        with open(segment, "ab") as wal_file:
+            wal_file.write(record_prefix)
+            wal_file.flush()
+            os.fsync(wal_file.fileno())
+
+        restarted = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, args = kv_request(port, HTTP_GET, ["tail-key"])
+            check(command_type == 102 and args == [b"tail-value"],
+                  f"torn-tail recovery lost the preceding record: "
+                  f"type={command_type}, args={args!r}")
+            stats = read_kv_stats(port)
+            check(stats["recovery"]["truncated_bytes"] >= 19,
+                  f"torn tail was not reported as truncated: {stats!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"torn-tail shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_manifest_corruption():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-manifest-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "manifest.rdb")
+        port = free_loopback_port()
+        seed = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, _ = kv_request(
+                port, HTTP_SET, ["manifest-seed", b"value"])
+            check(command_type == 101,
+                  f"manifest seed SET returned {command_type}")
+            check(seed.terminate_group(signal.SIGTERM) == 0,
+                  f"manifest seed shutdown failed:\n{seed.log}")
+        finally:
+            seed.cleanup()
+
+        manifest_path = rdb_path + ".manifest"
+        data = bytearray(Path(manifest_path).read_bytes())
+        check(len(data) >= 12, "manifest seed file is unexpectedly short")
+        data[-1] ^= 0xFF
+        Path(manifest_path).write_bytes(data)
+        before = sha256_path(manifest_path)
+
+        for binary, label in ((HTTP_BIN, "HTTP"), (KV_BIN, "KV")):
+            failure_port = free_loopback_port()
+            expect_startup_failure(
+                binary, label, failure_port, rdb_path, temp_dir, "manifest")
+            check(sha256_path(manifest_path) == before,
+                  f"{label} modified the corrupt manifest during failed startup")
+
+
+def test_missing_wal_segment():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-missing-wal-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "missing-wal.rdb")
+        port = free_loopback_port()
+        seed = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, _ = kv_request(
+                port, HTTP_SET, ["missing-seed", b"value"])
+            check(command_type == 101,
+                  f"missing-segment seed SET returned {command_type}")
+            check(seed.terminate_group(signal.SIGTERM) == 0,
+                  f"missing-segment seed shutdown failed:\n{seed.log}")
+        finally:
+            seed.cleanup()
+
+        segment = wal_segments(rdb_path)[-1]
+        segment.unlink()
+        manifest_path = rdb_path + ".manifest"
+        before = sha256_path(manifest_path)
+
+        for binary, label in ((HTTP_BIN, "HTTP"), (KV_BIN, "KV")):
+            failure_port = free_loopback_port()
+            expect_startup_failure(
+                binary, label, failure_port, rdb_path, temp_dir, "wal")
+            check(sha256_path(manifest_path) == before,
+                  f"{label} modified the manifest with a missing WAL segment")
+            check(not segment.exists(),
+                  f"{label} silently recreated the missing WAL segment")
+
+
+def test_wal_middle_corruption():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-mid-wal-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "middle.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, _ = kv_request(
+                port, HTTP_SET, ["middle-key-a", b"a" * 96])
+            check(command_type == 101,
+                  f"middle-corruption first SET returned {command_type}")
+            command_type, _ = kv_request(
+                port, HTTP_SET, ["middle-key-b", b"b" * 96])
+            check(command_type == 101,
+                  f"middle-corruption second SET returned {command_type}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        segment = wal_segments(rdb_path)[-1]
+        data = bytearray(segment.read_bytes())
+        check(len(data) > 64, "WAL segment is too short for corruption test")
+        data[40] ^= 0xFF
+        segment.write_bytes(data)
+        before = sha256_path(segment)
+
+        for binary, label in ((HTTP_BIN, "HTTP"), (KV_BIN, "KV")):
+            failure_port = free_loopback_port()
+            expect_startup_failure(
+                binary, label, failure_port, rdb_path, temp_dir, "corrupt")
+            check(sha256_path(segment) == before,
+                  f"{label} rewrote the middle-corrupt WAL segment")
+
+
+def test_legacy_import():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-legacy-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "legacy.rdb")
+        port = free_loopback_port()
+        seed = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, _ = kv_request(
+                port, HTTP_SET, ["legacy-key", b"legacy-value"])
+            check(command_type == 101,
+                  f"legacy seed SET returned {command_type}")
+            check(seed.terminate_group(signal.SIGTERM) == 0,
+                  f"legacy seed shutdown failed:\n{seed.log}")
+        finally:
+            seed.cleanup()
+
+        Path(rdb_path + ".manifest").unlink()
+        Path(rdb_path + ".lock").unlink(missing_ok=True)
+        shutil.rmtree(rdb_path + ".wal", ignore_errors=True)
+
+        imported = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, args = kv_request(port, HTTP_GET, ["legacy-key"])
+            check(command_type == 102 and args == [b"legacy-value"],
+                  f"legacy RDB was not loaded: type={command_type}, args={args!r}")
+            stats = read_kv_stats(port)
+            check(stats["recovery"]["legacy_import"] is True,
+                  f"legacy import was not reported: {stats!r}")
+            check(stats["recovery"]["needs_bootstrap"] is True,
+                  f"legacy import skipped bootstrap: {stats!r}")
+            check(stats["recovery"]["manifest_present"] is False,
+                  f"legacy import invented a manifest: {stats!r}")
+
+            command_type, _ = kv_request(
+                port, HTTP_SET, ["post-import", b"new-value"])
+            check(command_type == 101,
+                  f"first write after legacy import returned {command_type}")
+            stats = read_kv_stats(port)
+            check(stats["recovery"]["needs_bootstrap"] is False,
+                  f"bootstrap state was not cleared: {stats!r}")
+            check(stats["recovery"]["manifest_present"] is True,
+                  f"bootstrap did not publish a manifest: {stats!r}")
+            imported.kill_group()
+        finally:
+            imported.cleanup()
+
+        recovered = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            for key, value in (("legacy-key", b"legacy-value"),
+                               ("post-import", b"new-value")):
+                command_type, args = kv_request(port, HTTP_GET, [key])
+                check(command_type == 102 and args == [value],
+                      f"legacy bootstrap lost {key}: "
+                      f"type={command_type}, args={args!r}")
+            check(recovered.terminate_group(signal.SIGTERM) == 0,
+                  f"legacy recovery shutdown failed:\n{recovered.log}")
+        finally:
+            recovered.cleanup()
+
+
+def test_random_kill_seed():
+    seed = 20261111
+    rng = random.Random(seed)
+    target = rng.randint(24, 64)
+    with tempfile.TemporaryDirectory(prefix="minidb-process-random-kill-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "random.rdb")
+        port = free_loopback_port()
+        acknowledged = []
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            for index in range(target):
+                key = f"random-{index:03d}"
+                value = bytes(rng.randrange(0, 256)
+                              for _ in range(rng.randint(16, 96)))
+                command_type, _ = kv_request(port, HTTP_SET, [key, value])
+                check(command_type == 101,
+                      f"random SET {key} returned {command_type} (seed={seed})")
+                acknowledged.append((key, value))
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            for key, value in acknowledged:
+                command_type, args = kv_request(port, HTTP_GET, [key])
+                check(command_type == 102 and args == [value],
+                      f"seed={seed} lost acknowledged {key}: "
+                      f"type={command_type}, args={args!r}")
+            stats = read_kv_stats(port)
+            check(stats["last_lsn"] >= target,
+                  f"seed={seed} recovered an older LSN: {stats!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"seed={seed} shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_ttl_crash_recovery():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-ttl-crash-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "ttl-crash.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, _ = kv_request(
+                port, HTTP_SET, ["ttl-crash-key", b"alive"])
+            check(command_type == 101,
+                  f"TTL crash seed SET returned {command_type}")
+            command_type, _ = kv_request(
+                port, HTTP_EXPIRE, ["ttl-crash-key", "5000"])
+            check(command_type == 101,
+                  f"TTL crash EXPIRE returned {command_type}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, args = kv_request(
+                port, HTTP_GET, ["ttl-crash-key"])
+            check(command_type == 102 and args == [b"alive"],
+                  f"TTL key was lost across crash: "
+                  f"type={command_type}, args={args!r}")
+            command_type, args = kv_request(
+                port, HTTP_TTL, ["ttl-crash-key"])
+            check(command_type == 104 and len(args) == 1,
+                  f"TTL after crash returned type={command_type}, args={args!r}")
+            remaining = int(args[0])
+            check(0 < remaining <= 5000,
+                  f"TTL after crash is {remaining}, expected (0, 5000]")
+            wait_until(
+                lambda: kv_request(port, HTTP_GET, ["ttl-crash-key"])[0] == 103,
+                timeout=7.0,
+                message="restored TTL key did not expire",
+            )
+            command_type, _ = kv_request(
+                port, HTTP_TTL, ["ttl-crash-key"])
+            check(command_type == 104,
+                  f"expired TTL query returned {command_type}")
+            restarted.kill_group()
+        finally:
+            restarted.cleanup()
+
+        final = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, args = kv_request(port, HTTP_GET, ["ttl-crash-key"])
+            check(command_type == 103,
+                  f"expired TTL key reappeared after second crash: "
+                  f"type={command_type}, args={args!r}")
+            check(final.terminate_group(signal.SIGTERM) == 0,
+                  f"TTL final shutdown failed:\n{final.log}")
+        finally:
+            final.cleanup()
+
+
+def test_stats_contract():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-stats-") as temp_dir:
+        http_rdb = os.path.join(temp_dir, "stats-http.rdb")
+        http_port = free_loopback_port()
+        http_server = start_http(http_port, http_rdb, temp_dir, "sync")
+        try:
+            status, _, payload = read_http_response(
+                http_port, "POST", "/kv/stats-key", b"stats-value")
+            check(status == 200 and payload == b"OK\n",
+                  f"HTTP stats setup failed: status={status}, body={payload!r}")
+            stats = read_http_stats(http_port)
+            check(stats["durability_mode"] == "sync",
+                  f"HTTP stats omitted sync mode: {stats!r}")
+            check(stats["opened"] is True and stats["failed"] is False,
+                  f"HTTP stats reported an unhealthy state: {stats!r}")
+            check(stats["last_lsn"] == 1 and stats["next_lsn"] == 2,
+                  f"HTTP stats LSN is inconsistent: {stats!r}")
+            check(stats["wal_bytes"] > 0 and stats["wal_segment_count"] == 1,
+                  f"HTTP stats omitted WAL state: {stats!r}")
+            check(stats["persistence"]["mutations"] == 1
+                  and stats["persistence"]["sync_mutations"] == 1,
+                  f"HTTP mutation counters are inconsistent: {stats!r}")
+            check(stats["wal"]["appends"] == 1
+                  and stats["wal"]["data_fsyncs"] >= 1,
+                  f"HTTP WAL counters are inconsistent: {stats!r}")
+            check(stats["recovery"]["manifest_present"] is True,
+                  f"HTTP stats omitted manifest state: {stats!r}")
+
+            status, headers, payload = read_http_response(
+                http_port, "POST", "/stats")
+            check(status == 405 and headers.get("allow") == "GET",
+                  f"POST /stats returned {status}, headers={headers!r}, "
+                  f"body={payload!r}")
+            check(http_server.terminate_group(signal.SIGTERM) == 0,
+                  f"HTTP stats shutdown failed:\n{http_server.log}")
+        finally:
+            http_server.cleanup()
+
+        kv_rdb = os.path.join(temp_dir, "stats-kv.rdb")
+        kv_port = free_loopback_port()
+        kv_server = start_kv(kv_port, kv_rdb, temp_dir, "sync")
+        try:
+            command_type, _ = kv_request(
+                kv_port, HTTP_SET, ["stats-kv-key", b"stats-kv-value"])
+            check(command_type == 101,
+                  f"KV stats setup returned {command_type}")
+            stats = read_kv_stats(kv_port)
+            check(stats["durability_mode"] == "sync",
+                  f"KV stats omitted sync mode: {stats!r}")
+            check(stats["last_lsn"] == 1 and stats["next_lsn"] == 2,
+                  f"KV stats LSN is inconsistent: {stats!r}")
+            check(stats["persistence"]["mutations"] == 1
+                  and stats["wal"]["appends"] == 1,
+                  f"KV stats counters are inconsistent: {stats!r}")
+            check(stats["wal_bytes"] > 0,
+                  f"KV stats omitted WAL bytes: {stats!r}")
+
+            command_type, args = kv_request(
+                kv_port, KV_STATS, ["unexpected"])
+            check(command_type == 100 and args,
+                  f"KV STATS with an argument returned "
+                  f"type={command_type}, args={args!r}")
+            check(kv_server.terminate_group(signal.SIGTERM) == 0,
+                  f"KV stats shutdown failed:\n{kv_server.log}")
+        finally:
+            kv_server.cleanup()
+
+
 CASES = {
     "CliContract": test_cli_contract,
+    "CliDurabilityContract": test_cli_durability_contract,
     "HttpPersistence": test_http_persistence_and_sigterm,
     "KvPersistence": test_kv_persistence_and_sigint,
     "TtlScannerLifecycle": test_ttl_scanner_lifecycle_and_restart,
     "CorruptRdbStartup": test_corrupt_rdb_startup_fails_without_overwrite,
     "SaveFailureExit": test_save_failure_exit_code,
+    "HttpSyncCrashRecovery": test_http_sync_crash_recovery,
+    "KvSyncCrashRecovery": test_kv_sync_crash_recovery,
+    "IntervalFlushRecovery": test_interval_flush_recovery,
+    "WriterLockConflict": test_writer_lock_conflict,
+    "WalTailTruncation": test_wal_tail_truncation,
+    "ManifestCorruption": test_manifest_corruption,
+    "MissingWalSegment": test_missing_wal_segment,
+    "WalMiddleCorruption": test_wal_middle_corruption,
+    "LegacyImport": test_legacy_import,
+    "RandomKillSeed": test_random_kill_seed,
+    "TtlCrashRecovery": test_ttl_crash_recovery,
+    "StatsContract": test_stats_contract,
 }
 
 

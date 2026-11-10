@@ -17,6 +17,27 @@ The parser rejects HTTP/1.0 and other well-formed versions with 505, malformed
 versions with 400, and unsupported transfer framing rather than guessing at a
 message boundary.
 
+## Durability context
+
+The HTTP server wraps the same persistence engine as the binary KV server. The
+`-d sync|interval` command-line option selects the durability mode; the default
+is `sync`.
+
+Given `-r <rdb_path>`:
+
+~~~text
+<rdb_path>              RDB v2 checkpoint snapshot
+<rdb_path>.manifest     checkpoint manifest v1
+<rdb_path>.wal/         WAL segment directory
+<rdb_path>.lock         advisory single-writer lock
+~~~
+
+`SYNC` returns success for a mutation only after WAL append and file fsync
+succeed. `INTERVAL` acknowledges after append and flushes on a 100 ms timer,
+checkpoint, or graceful shutdown. A persistence I/O failure marks the process
+fail-stop; later mutations fail rather than reporting false success. A second
+process using the same base path is rejected by the writer lock.
+
 ## Wire limits
 
 | Item | Limit |
@@ -92,8 +113,9 @@ The query string is retained in the parsed request but is not used for routing.
 | Method | Path | Behavior |
 |---|---|---|
 | GET | `/health` | Returns `OK\n` with 200 |
+| GET | `/stats` | Returns persistence statistics JSON with 200 |
 | POST | `/echo` | Returns the exact request body as `application/octet-stream` |
-| POST | `/save` | Synchronously persists the current store and returns JSON status |
+| POST | `/save` | Synchronously publishes a durable checkpoint and returns JSON status |
 | GET | `/kv/<key>` | Returns the raw value or 404 |
 | POST | `/kv/<key>` | Stores the exact body as the value and returns 200 |
 | DELETE | `/kv/<key>` | Deletes a live key or returns 404 |
@@ -110,6 +132,82 @@ For `/kv/<key>`:
 
 A known path with the wrong method returns 405 with an `Allow` header. A known
 method on an unknown path returns 404. A valid extension method returns 501.
+
+## `/save` semantics
+
+`POST /save` performs a stop-the-world checkpoint:
+
+1. flush and fsync the WAL;
+2. rotate the active segment if it contains records;
+3. write, fsync, rename, and directory-fsync the RDB snapshot;
+4. atomically publish the checkpoint manifest;
+5. remove obsolete WAL segments and fsync the WAL directory.
+
+A 200 response means the checkpoint succeeded through manifest publication.
+A failure returns 500 and does not claim durability. A directory-fsync failure
+after rename may leave the new snapshot visible while durability is
+unconfirmed; the server reports that condition and enters fail-stop rather than
+publishing an unsafe manifest.
+
+`/save` is not a lightweight backup command. It can pause request handling for
+the duration of snapshot serialization, file I/O, fsyncs, and cleanup.
+
+## `/stats` response
+
+`GET /stats` returns `application/json` with a stable top-level shape:
+
+~~~json
+{
+  "durability_mode": "sync",
+  "opened": true,
+  "failed": false,
+  "last_lsn": 42,
+  "next_lsn": 43,
+  "wal_bytes": 4096,
+  "wal_segment_count": 1,
+  "persistence": {
+    "mutations": 42,
+    "sync_mutations": 42,
+    "interval_mutations": 0,
+    "checkpoints": 0,
+    "interval_flushes": 0,
+    "checkpoint_pause_us": 0
+  },
+  "wal": {
+    "appends": 42,
+    "bytes_written": 4096,
+    "data_fsyncs": 42,
+    "directory_fsyncs": 1,
+    "rotations": 0,
+    "segments_removed": 0
+  },
+  "recovery": {
+    "rdb_records": 0,
+    "checkpoint_lsn": 0,
+    "last_lsn": 42,
+    "next_lsn": 43,
+    "wal_records_scanned": 42,
+    "wal_records_replayed": 42,
+    "wal_bytes": 4096,
+    "truncated_bytes": 0,
+    "wal_segments": 1,
+    "ignored_residue_segments": 0,
+    "legacy_import": false,
+    "needs_bootstrap": false,
+    "manifest_present": true
+  }
+}
+~~~
+
+All fields come from one `PersistenceSnapshot` taken under the persistence
+mutex. Counters are cumulative for the current process unless their names
+explicitly describe recovery state. The endpoint is diagnostic, not a
+replacement for `/health` or a liveness probe.
+
+If the persistence manager was never opened, `/stats` returns 503 with the
+plain-text body `Persistence is not open\n`. Once a manager exists and has
+entered fail-stop, `/stats` still returns 200 JSON with `failed=true`; use that
+flag and the server logs for diagnosis.
 
 ## Responses
 
@@ -133,16 +231,18 @@ connection.
 | 414 | Request line/target exceeds limit |
 | 417 | Expect header present |
 | 431 | Header bytes/fields exceed limit |
-| 500 | Internal handler or save failure |
+| 500 | Internal handler, mutation, or checkpoint failure |
 | 501 | Valid extension method, Transfer-Encoding, or no handler |
+| 503 | Persistence manager was not opened; fail-stop is reported as 200 JSON with `failed=true` |
 | 505 | Well-formed HTTP version other than 1.1 |
 
 ## Examples
 
-Health:
+Health and diagnostics:
 
 ~~~bash
 curl -i http://127.0.0.1:8080/health
+curl -i http://127.0.0.1:8080/stats
 ~~~
 
 Store and fetch a binary-safe value:
@@ -158,11 +258,12 @@ Delete:
 curl -i -X DELETE http://127.0.0.1:8080/kv/key
 ~~~
 
-Explicit save:
+Explicit checkpoint:
 
 ~~~bash
 curl -i -X POST http://127.0.0.1:8080/save
 ~~~
 
-The process also saves on graceful SIGINT/SIGTERM shutdown. A successful
-`/save` response means the snapshot and parent-directory fsync completed.
+The process also checkpoints on graceful SIGINT/SIGTERM shutdown. A successful
+`/save` response means the checkpoint and manifest were published; it does not
+prove that a later power loss cannot lose data under a non-conforming device.

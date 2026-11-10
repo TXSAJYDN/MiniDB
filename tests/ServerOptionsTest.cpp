@@ -39,8 +39,21 @@ TEST(ServerOptionsTest, DefaultsArePreserved) {
     ASSERT_TRUE(parse(args, 8080, &options, &error));
     EXPECT_EQ(options.port, 8080u);
     EXPECT_TRUE(options.rdb_path.empty());
+    EXPECT_EQ(options.durability_mode, DurabilityMode::kSync);
     EXPECT_FALSE(options.help_requested);
     EXPECT_TRUE(error.empty());
+}
+
+TEST(ServerOptionsTest, ParsesDurabilityModes) {
+    for (const auto& [text, expected] :
+         {std::pair<std::string, DurabilityMode>{"sync", DurabilityMode::kSync},
+          {"interval", DurabilityMode::kInterval}}) {
+        ParsedArgs args({"server", "-d", text});
+        ServerOptions options;
+        std::string error;
+        ASSERT_TRUE(parse(args, 8080, &options, &error)) << text;
+        EXPECT_EQ(options.durability_mode, expected);
+    }
 }
 
 TEST(ServerOptionsTest, ParsesPortAndRdbInEitherOrder) {
@@ -68,6 +81,11 @@ TEST(ServerOptionsTest, HelpMustBeStandalone) {
     EXPECT_TRUE(options.help_requested);
     EXPECT_EQ(options.port, 8080u);
 
+    ParsedArgs with_mode({"server", "-h", "-d", "sync"});
+    ServerOptions mode_options;
+    std::string mode_error;
+    EXPECT_FALSE(parse(with_mode, 8080, &mode_options, &mode_error));
+
     ParsedArgs with_port({"server", "-h", "-p", "8080"});
     ServerOptions bad_options;
     std::string bad_error;
@@ -79,13 +97,26 @@ TEST(ServerOptionsTest, RejectsMissingEmptyAndDuplicateOptions) {
              std::vector<std::string>{"server", "-p"},
              std::vector<std::string>{"server", "-r"},
              std::vector<std::string>{"server", "-r", ""},
+             std::vector<std::string>{"server", "-d"},
+             std::vector<std::string>{"server", "-d", ""},
              std::vector<std::string>{"server", "-p", "1", "-p", "2"},
              std::vector<std::string>{"server", "-r", "a", "-r", "b"},
+             std::vector<std::string>{"server", "-d", "sync", "-d", "interval"},
          }) {
         ParsedArgs args(test_args);
         ServerOptions options;
         std::string error;
         EXPECT_FALSE(parse(args, 8080, &options, &error)) << test_args.size();
+        EXPECT_FALSE(error.empty());
+    }
+}
+
+TEST(ServerOptionsTest, RejectsInvalidDurabilityModes) {
+    for (const char* value : {"", "SYNC", "batch", "sync ", "0"}) {
+        ParsedArgs args({"server", "-d", value});
+        ServerOptions options;
+        std::string error;
+        EXPECT_FALSE(parse(args, 8080, &options, &error)) << value;
         EXPECT_FALSE(error.empty());
     }
 }

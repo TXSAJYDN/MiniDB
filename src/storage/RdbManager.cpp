@@ -145,6 +145,20 @@ RdbSaveResult RdbManager::save_checked(const KvStore& store) {
     // extends the stop-the-world boundary to the independent TTL scanner and
     // stays alive through every early return and the final directory fsync.
     KvStore::ScannerPause scanner_pause = store.pause_scanner();
+    return save_checked_under_lock(store);
+}
+
+RdbSaveResult RdbManager::save_checked(const KvStore& store,
+                                       KvStore::ScannerPause& scanner_pause) {
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
+    // The lifetime of the caller's pause is the checkpoint publication
+    // boundary.  Referencing it here prevents accidental dead-code treatment
+    // and documents that this overload must not acquire a second pause.
+    (void)scanner_pause;
+    return save_checked_under_lock(store);
+}
+
+RdbSaveResult RdbManager::save_checked_under_lock(const KvStore& store) {
     RdbSaveResult result = RdbSaveResult::Failed;
 
     auto entries = store.export_all();

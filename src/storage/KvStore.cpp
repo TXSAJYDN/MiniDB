@@ -153,6 +153,63 @@ bool KvStore::expire(const std::string& key, int64_t ttl_ms) {
     return true;
 }
 
+bool KvStore::expire_absolute(const std::string& key,
+                              int64_t absolute_deadline_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = store_.find(key);
+    if (it == store_.end()) {
+        return false;
+    }
+    const auto current = now();
+    if (is_expired(it->second, current)) {
+        store_.erase(it);
+        return false;
+    }
+    const int64_t wall_now = system_now_ms();
+    if (absolute_deadline_ms <= wall_now) {
+        store_.erase(it);
+        return true;
+    }
+    const int128_t difference =
+        static_cast<int128_t>(absolute_deadline_ms) - wall_now;
+    const int64_t remaining = difference >= std::numeric_limits<int64_t>::max()
+                                  ? std::numeric_limits<int64_t>::max()
+                                  : static_cast<int64_t>(difference);
+    it->second.has_ttl = true;
+    it->second.deadline = saturating_add_milliseconds(current, remaining);
+    return true;
+}
+
+bool KvStore::set_with_expiry(const std::string& key, const std::string& value,
+                              int64_t absolute_expiry_ms) {
+    if (key.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (absolute_expiry_ms > 0) {
+        const int64_t wall_now = system_now_ms();
+        if (absolute_expiry_ms <= wall_now) {
+            store_.erase(key);
+            return true;
+        }
+    }
+    InternalEntry entry;
+    entry.value = value;
+    if (absolute_expiry_ms > 0) {
+        const int64_t wall_now = system_now_ms();
+        const int128_t difference =
+            static_cast<int128_t>(absolute_expiry_ms) - wall_now;
+        const int64_t remaining =
+            difference >= std::numeric_limits<int64_t>::max()
+                ? std::numeric_limits<int64_t>::max()
+                : static_cast<int64_t>(difference);
+        entry.has_ttl = true;
+        entry.deadline = saturating_add_milliseconds(now(), remaining);
+    }
+    store_[key] = std::move(entry);
+    return true;
+}
+
 KvStore::TtlResult KvStore::ttl_info(const std::string& key) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = store_.find(key);

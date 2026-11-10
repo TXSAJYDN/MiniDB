@@ -22,6 +22,7 @@ class HttpResponse {
         k431RequestHeaderFieldsTooLarge = 431,
         k500InternalServerError = 500,
         k501NotImplemented = 501,
+        k503ServiceUnavailable = 503,
         k505HttpVersionNotSupported = 505,
     };
 

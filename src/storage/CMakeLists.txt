@@ -2,6 +2,14 @@ add_library(minidb_storage
     KvStore.cpp
     RdbFormat.cpp
     RdbManager.cpp
+    WalFormat.cpp
+    WalFileOperations.cpp
+    CheckpointManifest.cpp
+    SingleWriterLock.cpp
+    WalManager.cpp
+    WalReplay.cpp
+    RecoveryManager.cpp
+    PersistenceManager.cpp
 )
 
 target_include_directories(minidb_storage PUBLIC)

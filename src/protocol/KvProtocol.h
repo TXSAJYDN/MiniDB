@@ -21,6 +21,7 @@ class KvProtocol {
         kExpire = 5,
         kTtl = 6,
         kSave = 7,
+        kStats = 8,
         kError = 100,
         kOk = 101,
         kValue = 102,

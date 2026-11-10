@@ -1,4 +1,5 @@
 #include "HttpServer.h"
+#include "PersistenceStatsJson.h"
 
 #include "../base/Log.h"
 #include "../net/EventLoop.h"
@@ -9,6 +10,8 @@
 
 namespace minidb {
 namespace {
+
+constexpr std::int64_t kIntervalFlushMs = 100;
 
 bool has_kv_prefix(const std::string& path) {
     return path.rfind("/kv/", 0) == 0;
@@ -32,23 +35,33 @@ void set_bad_request(HttpResponse* resp, const std::string& message) {
     resp->set_body(message + "\n");
 }
 
+void set_internal_error(HttpResponse* resp, const std::string& message) {
+    resp->set_status_code(HttpResponse::k500InternalServerError);
+    resp->set_status_message("Internal Server Error");
+    resp->set_content_type("application/json");
+    resp->set_body("{\"status\":\"error\",\"message\":\"" + message + "\"}\n");
+}
+
 } // namespace
 
 HttpServer::HttpServer(EventLoop* loop, const InetAddress& listen_addr,
-                       const std::string& rdb_path)
-    : kv_store_(std::make_shared<KvStore>()),
+                       const std::string& rdb_path,
+                       DurabilityMode durability_mode)
+    : loop_(loop), kv_store_(std::make_shared<KvStore>()),
+      rdb_manager_(std::make_unique<RdbManager>(rdb_path.empty() ? "minidb.rdb"
+                                                                 : rdb_path)),
       rdb_path_(rdb_path.empty() ? "minidb.rdb" : rdb_path),
+      durability_mode_(durability_mode),
       server_(loop, listen_addr, "HttpServer") {
+    if (loop_ == nullptr) {
+        throw std::invalid_argument("HttpServer requires a non-null EventLoop");
+    }
     server_.set_connection_callback(
         [this](const TcpConnectionPtr& conn) { on_connection(conn); });
     server_.set_message_callback(
         [this](const TcpConnectionPtr& conn, Buffer* buf) {
             on_message(conn, buf);
         });
-
-    if (!rdb_path_.empty()) {
-        rdb_manager_ = std::make_unique<RdbManager>(rdb_path_);
-    }
 }
 
 HttpServer::~HttpServer() {
@@ -62,7 +75,16 @@ void HttpServer::start() {
     scanner_lease_ = kv_store_->acquire_scanner();
     try {
         server_.start();
+        if (persistence_manager_ && persistence_manager_->opened() &&
+            durability_mode_ == DurabilityMode::kInterval) {
+            interval_timer_id_ = loop_->run_every(
+                kIntervalFlushMs, [this]() { flush_interval(); });
+        }
     } catch (...) {
+        if (interval_timer_id_ != 0) {
+            loop_->cancel_timer(interval_timer_id_);
+            interval_timer_id_ = 0;
+        }
         scanner_lease_.reset();
         throw;
     }
@@ -70,6 +92,10 @@ void HttpServer::start() {
 }
 
 void HttpServer::stop() {
+    if (interval_timer_id_ != 0) {
+        loop_->cancel_timer(interval_timer_id_);
+        interval_timer_id_ = 0;
+    }
     scanner_lease_.reset();
     started_ = false;
 }
@@ -82,6 +108,10 @@ void HttpServer::set_kv_store(std::shared_ptr<KvStore> store) {
         throw std::logic_error(
             "HttpServer::set_kv_store must precede HttpServer::start");
     }
+    if (persistence_manager_) {
+        throw std::logic_error(
+            "HttpServer::set_kv_store must precede load_rdb");
+    }
     kv_store_ = std::move(store);
 }
 
@@ -90,35 +120,75 @@ bool HttpServer::load_rdb() {
         Log::Warning("RdbManager not initialized");
         return false;
     }
-    const int count = rdb_manager_->load(*kv_store_);
-    if (count < 0) {
-        Log::Error("Failed to load RDB file");
+    if (persistence_manager_) {
+        return persistence_manager_->opened();
+    }
+    if (started_) {
+        Log::Error("Cannot load persistence state after HttpServer::start");
         return false;
     }
 
-    std::ostringstream oss;
-    oss << "Loaded " << count << " keys from RDB file";
-    Log::Info(oss.str());
+    auto manager = std::make_unique<PersistenceManager>(kv_store_, rdb_path_,
+                                                        durability_mode_);
+    std::string error;
+    if (!manager->open(&error)) {
+        Log::Error("Failed to open persistence image: " + error);
+        return false;
+    }
+    const RecoveryStats& stats = manager->recovery_stats();
+    persistence_manager_ = std::move(manager);
+
+    std::ostringstream message;
+    message << "Recovered " << stats.rdb_records << " RDB records and replayed "
+            << stats.wal_records_replayed << " WAL records"
+            << " (checkpoint_lsn=" << stats.checkpoint_lsn
+            << ", last_lsn=" << stats.last_lsn
+            << ", truncated_bytes=" << stats.truncated_bytes << ")";
+    if (stats.legacy_import) {
+        message << "; legacy RDB will be imported on first persistence write";
+    }
+    Log::Info(message.str());
     return true;
 }
 
 RdbSaveResult HttpServer::save_rdb() {
-    if (!rdb_manager_) {
+    RdbSaveResult result = RdbSaveResult::Failed;
+    if (persistence_manager_) {
+        std::string error;
+        result = persistence_manager_->checkpoint(&error);
+        if (result != RdbSaveResult::Ok && !error.empty()) {
+            Log::Error("Checkpoint failed: " + error);
+        }
+    } else if (rdb_manager_) {
+        result = rdb_manager_->save_checked(*kv_store_);
+    } else {
         Log::Error("RdbManager not initialized");
-        return RdbSaveResult::Failed;
+        return result;
     }
-    const RdbSaveResult result = rdb_manager_->save_checked(*kv_store_);
+
     if (result == RdbSaveResult::Ok) {
-        std::ostringstream oss;
-        oss << "Saved " << kv_store_->size() << " keys to RDB file";
-        Log::Info(oss.str());
+        std::ostringstream message;
+        message << "Saved " << kv_store_->size()
+                << " keys to the durable checkpoint";
+        Log::Info(message.str());
     } else if (result == RdbSaveResult::DurabilityUnconfirmed) {
-        Log::Error("RDB snapshot was replaced but directory fsync failed; "
+        Log::Error("Checkpoint was replaced but directory fsync failed; "
                    "durability is unconfirmed");
     } else {
-        Log::Error("Failed to save RDB file");
+        Log::Error("Failed to save the durable checkpoint");
     }
     return result;
+}
+
+void HttpServer::flush_interval() {
+    if (!persistence_manager_) {
+        return;
+    }
+    std::string error;
+    if (!persistence_manager_->flush_interval(&error)) {
+        Log::Error("INTERVAL WAL flush failed; stopping fail-closed: " + error);
+        loop_->quit();
+    }
 }
 
 void HttpServer::on_connection(const TcpConnectionPtr& conn) {
@@ -191,6 +261,26 @@ void HttpServer::on_request(const HttpRequest& req, HttpResponse* resp) {
         return;
     }
 
+    if (path == "/stats") {
+        if (req.method() != HttpRequest::kGet) {
+            method_not_allowed("GET", resp);
+            return;
+        }
+        if (!persistence_manager_) {
+            resp->set_status_code(HttpResponse::k503ServiceUnavailable);
+            resp->set_status_message("Service Unavailable");
+            set_plain_text(resp);
+            resp->set_body("Persistence is not open\n");
+            return;
+        }
+        resp->set_status_code(HttpResponse::k200Ok);
+        resp->set_status_message("OK");
+        resp->set_content_type("application/json");
+        resp->set_body(
+            persistence_stats_json(persistence_manager_->snapshot()) + "\n");
+        return;
+    }
+
     if (path == "/save") {
         if (req.method() != HttpRequest::kPost) {
             method_not_allowed("POST", resp);
@@ -205,11 +295,7 @@ void HttpServer::on_request(const HttpRequest& req, HttpResponse* resp) {
                  << "}\n";
             resp->set_body(body.str());
         } else {
-            resp->set_status_code(HttpResponse::k500InternalServerError);
-            resp->set_status_message("Internal Server Error");
-            resp->set_content_type("application/json");
-            resp->set_body(
-                "{\"status\":\"error\",\"message\":\"Failed to save RDB\"}\n");
+            set_internal_error(resp, "Failed to save RDB checkpoint");
         }
         return;
     }
@@ -249,7 +335,20 @@ void HttpServer::handle_kv(const HttpRequest& req, HttpResponse* resp) {
     }
 
     if (req.method() == HttpRequest::kPost) {
-        kv_store_->set(key, req.body());
+        if (persistence_manager_) {
+            const MutationOutcome outcome =
+                persistence_manager_->set(key, req.body());
+            if (!outcome.ok()) {
+                if (outcome.status == MutationStatus::kInvalidArgument) {
+                    set_bad_request(resp, outcome.error);
+                } else {
+                    set_internal_error(resp, "Persistence write failed");
+                }
+                return;
+            }
+        } else {
+            kv_store_->set(key, req.body());
+        }
         resp->set_status_code(HttpResponse::k200Ok);
         resp->set_status_message("OK");
         set_plain_text(resp);
@@ -258,7 +357,22 @@ void HttpServer::handle_kv(const HttpRequest& req, HttpResponse* resp) {
     }
 
     if (req.method() == HttpRequest::kDelete) {
-        if (!kv_store_->del(key)) {
+        bool deleted = false;
+        if (persistence_manager_) {
+            const MutationOutcome outcome = persistence_manager_->del(key);
+            if (!outcome.ok()) {
+                if (outcome.status == MutationStatus::kInvalidArgument) {
+                    set_bad_request(resp, outcome.error);
+                } else {
+                    set_internal_error(resp, "Persistence delete failed");
+                }
+                return;
+            }
+            deleted = outcome.changed;
+        } else {
+            deleted = kv_store_->del(key);
+        }
+        if (!deleted) {
             set_not_found(resp);
             return;
         }

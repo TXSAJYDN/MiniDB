@@ -1,15 +1,74 @@
 # Benchmark methodology
 
-MiniDB keeps two complementary benchmark harnesses:
+MiniDB keeps three complementary benchmark harnesses:
 
 - `bench/benchmark.py` is the short, deterministic sample-count regression used
   to validate the measurement plumbing;
-- `bench/run_acceptance_benchmark.py` is the default Stage H timed,
-  multi-round, resource-instrumented baseline.
+- `bench/run_reliability_benchmark.py` is the current R0-R3 durability,
+  concurrency, SIGKILL recovery, and checkpoint-pause harness;
+- `bench/run_acceptance_benchmark.py` is the historical Stage H timed harness,
+  retained only for reproducibility of the pre-WAL baseline.
 
-Neither harness is a saturation, capacity, open-loop, or production-SLA test.
+None of these harnesses is a saturation, capacity, open-loop, or
+production-SLA test. Only the R3 reliability benchmark supports current
+durability claims; Stage H numbers are historical background.
 
-## Closed-loop workload
+## Current R3 reliability benchmark
+
+The current evidence artifact is
+`bench/results/reliability-20261111.json`:
+
+- 133,299 bytes;
+- SHA-256
+  `a5c3099789be938654771f830acbd25ecedc1da5520f7c4aa1567493c0e74254`;
+- 18 configurations: `SYNC`/`INTERVAL` × clients 1/8/32 ×
+  write/mixed/TTL;
+- 5 rounds per configuration, 2 seconds per measured round;
+- dataset: 128 keys, 64-byte values;
+- seed: `20261111`;
+- closed-loop persistent KV connections, one in-flight command per client;
+- after each measured round: `SIGKILL`, fresh-process recovery to `PING`;
+- after recovery: KV `SAVE`, with checkpoint pause measured both client-side
+  and through `STATS checkpoint_pause_us`;
+- 340,240 successful requests, 0 errors, 238.703 seconds wall-clock collection
+  time.
+
+Reproduce it with a fresh output path so the retained evidence is not
+overwritten:
+
+~~~bash
+python3 bench/run_reliability_benchmark.py \
+  --kv build/release/app/minidb_kv_server \
+  --rounds 5 --duration-seconds 2 \
+  --dataset-keys 128 --value-size 64 \
+  --seed 20261111 \
+  --modes sync interval \
+  --clients 1 8 32 \
+  --workloads write mixed ttl \
+  --out /tmp/reliability-reproduction.json
+~~~
+
+Aggregate results:
+
+| Metric | SYNC | INTERVAL |
+|---|---:|---:|
+| Median QPS range | 408.815 - 2,219.464 | 2,020.629 - 3,367.577 |
+| Recovery median range | 0.022716 - 0.023829 s | 0.043730 - 0.086119 s |
+| Checkpoint pause median range | 11,571 - 20,852 us | 12,387 - 19,323 us |
+| Server RSS peak max | 4,608 KiB | 4,608 KiB |
+
+The JSON records `git_head=34dcc79` and
+`working_tree_dirty_at_collection=true` because it was collected from the
+uncommitted reliability implementation. The artifact is retained honestly; its
+metadata was not rewritten after commit. Full per-configuration data and
+interpretation limits are in
+[`docs/reliability-evidence.md`](../docs/reliability-evidence.md).
+
+The benchmark reaches the repository's 32-connection cap on its largest
+configurations. That is a boundary observation, not evidence of scaling beyond
+32 clients or of open-loop capacity.
+
+## Historical Stage H harness
 
 For HTTP and KV the timed harness:
 
@@ -29,7 +88,7 @@ The request order is deterministic round-robin over the fixed dataset. Latency
 uses the monotonic `time.perf_counter_ns()` clock. Percentiles use linear
 interpolation at rank `p*(n-1)` over all raw samples.
 
-## Run
+## Run the historical Stage H harness
 
 Use Release binaries:
 
@@ -60,7 +119,7 @@ The JSON result contains:
 
 Do not publish only rounded percentiles. Preserve the raw JSON and its digest.
 
-## Stage H default evidence
+### Historical Stage H evidence
 
 The accepted run was collected on 2026-11-06 at Git HEAD
 `8387714664a86a2e279de5f26f32f4ac75c3c284`. At that moment
@@ -111,6 +170,9 @@ not evidence of scaling beyond 32 connections or of a server-side capacity
 ceiling.
 
 ## Interpretation limits
+
+These limits apply to both the historical Stage H harness and the current R3
+reliability benchmark. The R3 artifact additionally states its own limits.
 
 - WSL2 virtualizes networking and shares host scheduling with other workloads.
 - Client and server compete for the same CPU, and Python client parsing is

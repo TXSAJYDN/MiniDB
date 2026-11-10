@@ -1,5 +1,9 @@
 # MiniDB 阶段 A-H 独立验收报告
 
+> **历史文档：** 本报告记录 2026-11-06 的 A-H 功能基线，报告中“当前”“CI 9/9”和“214/214”均指当时状态，不代表 R0-R3 升级后的当前实现。
+>
+> 当前测试清单、可靠性边界和证据请见[项目状态](PROJECT_STATE.md)、[可靠性证据](reliability-evidence.md)和[可靠性与持久化升级计划书](MiniDB-可靠性与持久化升级计划书.md)。
+
 - 报告日期：2026-11-06（Asia/Shanghai）
 - 权威工作树：`/mnt/e/c++/miniDB`（Windows：`E:\c++\miniDB`）
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`

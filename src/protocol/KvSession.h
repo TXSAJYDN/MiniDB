@@ -3,6 +3,7 @@
 #include "../net/TcpConnection.h"
 #include "../base/Buffer.h"
 #include "../storage/KvStore.h"
+#include "../storage/PersistenceManager.h"
 #include "../storage/RdbManager.h"
 
 #include <cstddef>
@@ -28,6 +29,11 @@ class KvSession : public std::enable_shared_from_this<KvSession> {
     void set_save_callback(std::function<RdbSaveResult()> callback) {
         save_callback_ = std::move(callback);
     }
+    // Non-owning. KvServer keeps the persistence manager alive longer than
+    // any session. Null preserves the in-memory-only behavior used by tests.
+    void set_persistence_manager(PersistenceManager* manager) {
+        persistence_manager_ = manager;
+    }
 
     bool is_processing() const {
         return processing_;
@@ -48,6 +54,7 @@ class KvSession : public std::enable_shared_from_this<KvSession> {
 
     TcpConnectionPtr conn_;
     std::shared_ptr<KvStore> store_;
+    PersistenceManager* persistence_manager_ = nullptr;
     std::function<RdbSaveResult()> save_callback_;
     Buffer pending_buffer_;
     bool started_;

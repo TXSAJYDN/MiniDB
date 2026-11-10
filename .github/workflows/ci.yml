@@ -108,18 +108,34 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DENABLE_FUZZERS=ON
       - name: Build fuzz targets
-        run: cmake --build build/fuzz-ci -j2 --target minidb_http_parser_fuzz minidb_kv_protocol_fuzz
+        run: |
+          cmake --build build/fuzz-ci -j2 --target \
+            minidb_http_parser_fuzz \
+            minidb_kv_protocol_fuzz \
+            minidb_wal_record_fuzz \
+            minidb_checkpoint_manifest_fuzz
       - name: Run fixed-seed corpus smoke
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
-          mkdir -p /tmp/minidb-fuzz-http /tmp/minidb-fuzz-kv /tmp/minidb-fuzz-artifacts
+          mkdir -p /tmp/minidb-fuzz-http /tmp/minidb-fuzz-kv \
+            /tmp/minidb-fuzz-wal /tmp/minidb-fuzz-manifest \
+            /tmp/minidb-fuzz-artifacts
           cp fuzz/corpus/http/* /tmp/minidb-fuzz-http/
           cp fuzz/corpus/kv/* /tmp/minidb-fuzz-kv/
+          cp fuzz/corpus/wal/* /tmp/minidb-fuzz-wal/
+          cp fuzz/corpus/manifest/* /tmp/minidb-fuzz-manifest/
           build/fuzz-ci/fuzz/minidb_http_parser_fuzz \
-            -seed=20261105 -runs=20000 -max_len=2097152 \
+            -seed=20261111 -runs=20000 -max_len=2097152 \
             -artifact_prefix=/tmp/minidb-fuzz-artifacts/ /tmp/minidb-fuzz-http
           build/fuzz-ci/fuzz/minidb_kv_protocol_fuzz \
-            -seed=20261105 -runs=20000 -max_len=1179648 \
+            -seed=20261111 -runs=20000 -max_len=1179648 \
             -artifact_prefix=/tmp/minidb-fuzz-artifacts/ /tmp/minidb-fuzz-kv
+          build/fuzz-ci/fuzz/minidb_wal_record_fuzz \
+            -seed=20261111 -runs=20000 -max_len=1050000 \
+            -artifact_prefix=/tmp/minidb-fuzz-artifacts/ /tmp/minidb-fuzz-wal
+          build/fuzz-ci/fuzz/minidb_checkpoint_manifest_fuzz \
+            -seed=20261111 -runs=20000 -max_len=2048 \
+            -artifact_prefix=/tmp/minidb-fuzz-artifacts/ /tmp/minidb-fuzz-manifest
+          test -z "$(find /tmp/minidb-fuzz-artifacts -type f -print -quit)"

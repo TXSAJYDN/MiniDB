@@ -43,6 +43,24 @@ class KvStore {
     // the key existed and the operation was applied.
     bool expire(const std::string& key, int64_t ttl_ms);
 
+    // Recovery/WAL helpers.  The deadline is an absolute Unix epoch
+    // millisecond value and is converted to the monotonic deadline clock at
+    // application time.  A non-positive or already-expired deadline removes
+    // the key.  The return value reports whether a live key was changed.
+    bool expire_absolute(const std::string& key, int64_t absolute_deadline_ms);
+
+    // SET with an absolute expiry.  This is used by WAL replay so a restart
+    // cannot extend or shorten a persisted TTL.  An expired record is valid
+    // input but leaves the key absent.
+    bool set_with_expiry(const std::string& key, const std::string& value,
+                         int64_t absolute_expiry_ms);
+
+    // Exposed for the persistence layer, which must record the same absolute
+    // deadline that the in-memory store will use.
+    int64_t wall_clock_now_ms() const {
+        return system_now_ms();
+    }
+
     enum class TtlState : std::uint8_t { kMissing, kNoExpiry, kExpiring };
 
     struct TtlResult {

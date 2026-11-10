@@ -31,6 +31,11 @@ add_executable(storage_test
     RdbFormatTest.cpp
     RdbManagerTest.cpp
     RdbManagerP0Test.cpp
+    WalFormatTest.cpp
+    WalManagerTest.cpp
+    CheckpointManifestTest.cpp
+    RecoveryManagerTest.cpp
+    PersistenceManagerTest.cpp
 )
 
 target_link_libraries(storage_test
@@ -40,6 +45,18 @@ target_link_libraries(storage_test
 )
 
 minidb_discover_tests(storage_test)
+
+add_executable(crash_consistency_test
+    CrashConsistencyTest.cpp
+)
+
+target_link_libraries(crash_consistency_test
+    minidb_storage
+    GTest::gtest
+    GTest::gtest_main
+)
+
+minidb_discover_tests(crash_consistency_test RESOURCE_LOCK minidb_crash)
 
 add_executable(integration_test
     IntegrationTest.cpp
@@ -158,11 +175,24 @@ minidb_discover_tests(server_options_test)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(MINIDB_PROCESS_CASES
     CliContract
+    CliDurabilityContract
     HttpPersistence
     KvPersistence
     TtlScannerLifecycle
     CorruptRdbStartup
     SaveFailureExit
+    HttpSyncCrashRecovery
+    KvSyncCrashRecovery
+    IntervalFlushRecovery
+    WriterLockConflict
+    WalTailTruncation
+    ManifestCorruption
+    MissingWalSegment
+    WalMiddleCorruption
+    LegacyImport
+    RandomKillSeed
+    TtlCrashRecovery
+    StatsContract
 )
 foreach(process_case IN LISTS MINIDB_PROCESS_CASES)
     add_test(
@@ -178,3 +208,7 @@ foreach(process_case IN LISTS MINIDB_PROCESS_CASES)
         RESOURCE_LOCK minidb_network
     )
 endforeach()
+
+set_tests_properties(ProcessIntegrationTest.RandomKillSeed PROPERTIES
+    TIMEOUT 180
+)

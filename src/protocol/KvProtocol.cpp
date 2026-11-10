@@ -115,6 +115,8 @@ std::string KvProtocol::command_type_to_string(uint8_t type) {
         return "TTL";
     case kSave:
         return "SAVE";
+    case kStats:
+        return "STATS";
     case kOk:
         return "OK";
     case kError:

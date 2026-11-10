@@ -1,166 +1,199 @@
 # MiniDB 项目状态
 
-- 更新时间：2026-11-06（Asia/Shanghai）
-- 权威工作树：`/mnt/e/c++/miniDB`（Windows：`E:\c++\miniDB`）
+- 更新时间：2026-11-11（Asia/Shanghai）
+- 当前定位：**面向有界资源的单机 crash-consistent KV 存储服务**
+- 权威开发工作树：`/home/win11/projects/miniDB`（WSL2 Ubuntu 24.04）
+- Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
-- 分支：`main`
-- 验收代码基线：`9da4b48f5fe78e4c2896ad1ca07464361b27e362`
-- 当前状态：**阶段 A-H 技术验收 PASS**
-License: DEFERRED BY OWNER
+- 当前阶段：**R0-R3 已完成实现与本地验收；R4 未启动**
+- 当前测试清单：**305 项 CTest**（以最终本地验证矩阵为准）
 
 ## 1. 当前结论
 
-MiniDB 已完成原计划 P0 阶段的 A-H 技术验收。最终依据不是早期自评，而是：
+MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪的持久化闭环：
 
-- 六种配置的全新仓库外构建，每配置 214/214 CTest；
-- Debug、ASan、UBSan 三套真实 socket 进程证据；
-- Reactor、连接生命周期、Session/背压、HTTP、KV/TTL 和 RDB 专项测试；
-- RDB EINTR/短写/ENOSPC/open/fsync/close/rename/dir-fsync 故障注入；
-- RDB kill -9 分阶段恢复和 64 MiB 文件/RSS/暂停预算；
-- HTTP/KV fuzz 各 20,000 runs、固定 seed、artifact 为空；
-- clang-format、clang-tidy、5×30 秒默认多轮 benchmark、hey 外部对照、strace 和 perf 限制记录；
-- 真实 GitHub Actions run 42182440543，9/9 job 成功；
-- 对 eclipse-4diac/4diac-forte#1135 的真实公开贡献尝试和失败证据。
+> 客户端收到写成功响应后，进程在任意点崩溃，已确认写是否还能恢复？
 
-统一证据目录：
+当前实现提供：
 
-```text
-/home/win11/minidb-ah-final-20261106-v3-evidence
-```
+- 逻辑 WAL、CRC32C、严格递增 LSN 和 segment 轮转；
+- `SYNC` 与 `INTERVAL` 两种 durability 模式，默认 `SYNC`；
+- RDB v2 作为全量 checkpoint，不再承担每一笔写入的持久化承诺；
+- checkpoint manifest 原子记录 `checkpoint_lsn` 与保留的 WAL segment；
+- 启动时 RDB + manifest + WAL 全量校验后一次性发布临时 Store；
+- 仅允许最后一个 WAL segment 的尾部半写截断，中间损坏拒绝启动；
+- `<rdb_path>.lock` 上的非阻塞 `flock` 单写者锁；
+- HTTP `/stats` 与 KV `STATS` 共享的持久化诊断快照；
+- C01-C14 崩溃点、固定 seed 随机 `kill -9`、尾部/中间损坏和故障注入测试；
+- HTTP、KV、WAL record、checkpoint manifest 四个 fuzz target；
+- 18 种配置的 durability/客户端/负载可靠性 benchmark。
 
-详细报告：
-
-- `docs/A_H_ACCEPTANCE_REPORT.md`
+当前不宣称生产级、高并发、Redis/SQL 兼容或生产 SLA。这里的
+“crash-consistent”只覆盖已测试的进程崩溃与重启语义，不证明掉电、内核崩溃、
+设备缓存撒谎或介质损坏下的持久性。
 
 ## 2. 阶段状态
 
 | 阶段 | 状态 | 当前依据 |
 |---|---|---|
-| A 工程基线与工具链 | PASS | 已提交/推送；六配置 214/214；CI 9/9；许可证由所有者暂缓 |
-| B Socket 与非阻塞 I/O | PASS | Debug/ASan/UBSan echo，EAGAIN/短写/RST/fd/shutdown 证据 |
-| C LT Reactor 与连接生命周期 | PASS | Acceptor/Poller/Channel/TcpConnection 专项矩阵 |
-| D Session 边界与背压 | PASS | Keep-Alive、pipeline、慢读、EPOLLIN gating、超时和关闭 |
-| E HTTP 子集与服务 | PASS | parser/status/limit 矩阵、真实 socket session、进程持久化测试 |
-| F KV、Store 与 TTL | PASS | 表驱动 TTL、墙钟跳变、固定 seed model stress、scanner/lease |
-| G RDB 与启动恢复 | PASS | 文件故障注入、kill -9、64 MiB 预算和完整恢复 |
-| H 集成 QA、性能、文档与贡献 | PASS | CI、fuzz、静态检查、5×30 秒默认多轮 benchmark、hey 外部对照、strace、公开贡献真实尝试 |
+| A-H 功能基线 | DONE（历史） | 214 项测试、六配置、旧 CI 9/9；作为历史基线保留 |
+| R0 重新定位与文档基线 | DONE | README、架构、部署、ADR、证据规范和“声明-证据-限制”口径 |
+| R1 WAL + RDB checkpoint 正确性基线 | DONE | WAL/manifest 编解码、轮转、恢复、checkpoint、legacy import、单写者锁 |
+| R2 崩溃一致性与恢复模型闭环 | DONE | C01-C14、随机 kill、故障注入、四个 fuzz target、19 个进程用例 |
+| R3 性能、恢复与公开证据 | DONE | 18 配置 × 5 轮 benchmark、恢复/暂停/RSS/写放大数据 |
+| R4 组提交、后台 checkpoint、MVCC/事务 | NOT STARTED | 仅作为证据驱动选项保留，当前未实现 |
 
-## 3. 代码与交付状态
+## 3. 新定位与范围
 
-验收代码提交：
+> **MiniDB is a crash-consistent single-node KV store for bounded-resource
+> environments.**
 
-```text
-9da4b48f5fe78e4c2896ad1ca07464361b27e362
-fix: close AI-018 acceptance gaps
-19 files changed, 1172 insertions(+), 60 deletions(-)
-```
+核心问题：
 
-该提交已推送至 `origin/main`，仓库跟踪 403 个文件。
+1. `SYNC` 下，客户端收到成功响应后进程崩溃，数据是否一定还能恢复？
+2. `INTERVAL` 允许什么丢失窗口，代价是什么？
+3. 恢复如何区分 WAL 尾部半写、中间损坏、manifest 损坏和快照缺失？
+4. 在连接数、记录大小、WAL 大小和恢复时间都有硬上限时，失败行为是否可解释？
 
-GitHub Actions：
+明确非目标：
 
-- Run ID：`42182440543`
-- URL：<https://github.com/TXSAJYDN/MiniDB/actions/runs/42182440543>
-- 代码提交：`9da4b48f5fe78e4c2896ad1ca07464361b27e362`
-- 结果：Success，9/9 job，2m 54s
-- 组成：5 个 build/test matrix、TSan、format、static-analysis、fuzz-smoke
-- 备注：存在 `actions/checkout@v4` 的 Node.js 20 deprecation warning，非失败项
+- SQL 解析器/执行器；
+- 完整 Redis 命令和协议兼容；
+- 复制、Raft、集群、分片；
+- 事务、MVCC、隔离级别；
+- TLS、认证、授权、多租户；
+- 多进程共享一个数据目录；
+- 生产 SLA、容量规划或高并发宣传；
+- `BATCHED`、组提交、后台/增量 checkpoint。
 
-本地构建、验收和 benchmark 产物均存放在仓库外；当前工作树不保留开发过程日志或其他未跟踪文件。
+## 4. 持久化语义
 
-## 4. 关键验收数据
+### 4.1 布局
 
-### 4.1 六配置矩阵
+给定 `-r <rdb_path>`：
 
-| 配置 | CTest |
+~~~text
+<rdb_path>              RDB v2 checkpoint snapshot
+<rdb_path>.manifest     checkpoint manifest v1
+<rdb_path>.wal/         WAL segment 目录
+<rdb_path>.lock         flock 单写者锁
+~~~
+
+### 4.2 写路径
+
+- `SYNC`：WAL append + 文件 fsync 成功后才应用内存并返回成功；
+- `INTERVAL`：WAL append 后即可应用并返回；100 ms timer、checkpoint 和正常关闭前强制 flush；
+- WAL fsync/append 失败后持久化层 fail-stop；LSN、字节计数和统计不回滚；
+- fsync 失败时完整记录可能已落盘，恢复允许出现未确认写；
+- 不允许已确认的 `SYNC` 写在恢复后消失。
+
+### 4.3 checkpoint 顺序
+
+1. 暂停 TTL scanner；
+2. flush 并 fsync WAL；
+3. 必要时轮转 active segment；
+4. 发布 RDB 快照；
+5. 原子发布 manifest；
+6. 清理旧 WAL 并 fsync WAL 目录。
+
+任何快照或 manifest 的持久性不确定都会 fail-stop，并保留旧 WAL。
+
+### 4.4 恢复
+
+1. 获取单写者锁；
+2. 读取并校验 manifest；
+3. 加载 RDB 到临时 Store；
+4. 按 LSN 扫描 manifest 引用的 segment 及其后所有 segment；
+5. 只重放 `LSN > checkpoint_lsn` 的记录；
+6. 仅截断最后一个 segment 的尾部半写并 fsync；
+7. 全部成功后发布 Store 并开始监听。
+
+恢复失败：非零退出、不监听、不修改损坏现场、不发布部分 Store。
+
+## 5. 资源上限
+
+| 项目 | 上限 |
 |---|---:|
-| Debug | 214/214 |
-| Release | 214/214 |
-| ASan | 214/214 |
-| UBSan | 214/214 |
-| ASan+UBSan | 214/214 |
-| TSan（`setarch x86_64 -R`） | 214/214 |
+| 服务进程并发连接 | 32 |
+| 每连接输入/输出预算 | 各 1.25 MiB |
+| 单个 key | 1 KiB |
+| 单个 value / WAL 记录 | 1 MiB |
+| WAL segment | 16 MiB |
+| WAL 总字节 | 256 MiB |
+| WAL segment 数 | 128 |
+| 恢复扫描记录 | 1,000,000 |
+| 恢复字节 | 512 MiB |
+| RDB 快照 | 64 MiB / 100,000 records |
 
-六个配置的 configure、build、CTest 退出码均为 0。源码摘要为 `2dba58c83beca499affefa42bcf6b970d2b0c83f01c5bcd6e24de75fc0b73843`，对应随后提交为 `9da4b48` 的工作树内容。
+## 6. 当前验证状态
 
-### 4.2 Stage B
+R0-R3 的最终本地验证包括：
 
-Debug / ASan / UBSan 均完成真实 echo：
+- Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种配置；
+- 每个配置 305 项 CTest；
+- 19 个 `ProcessIntegrationTest.*` 进程级用例；
+- HTTP、KV、WAL record、checkpoint manifest 四个 fuzz target，各 20,000 runs，seed `20261111`；
+- clang-format dry-run、clang-tidy、`git diff --check`；
+- 18 配置 × 5 轮可靠性 benchmark，seed `20261111`；
+- 本地证据不替代远程 GitHub Actions；本次提交未 push，因此不声称远程 CI 已运行。
 
-- accepted：30 / 30 / 30；
-- EAGAIN：1073 / 905 / 1585；
-- 短写：16 / 18 / 51；
-- RST：1 / 1 / 1；
-- fd before/after：4/4；
-- strace 观测 `accept4`、EAGAIN、`shutdown`、`close`、`sendto`。
+正式 benchmark 原始数据：
 
-### 4.3 Stage G
+~~~text
+bench/results/reliability-20261111.json
+bytes: 133,299
+sha256: a5c3099789be938654771f830acbd25ecedc1da5520f7c4aa1567493c0e74254
+~~~
 
-- RDB 大小：`67,108,864` 字节，恰好 64 MiB；
-- 在线 SAVE 后、恢复启动前 SHA-256：`4b399a1decfaa878950fc20ba22d164d1984e170069a783798945d5f06c4f555`；
-- 64 keys 完整恢复；
-- 在线 SAVE HTTP 200，1265.410 ms；
-- 在线 SAVE 峰值 RSS 200.785 MiB；
-- 启动恢复峰值 RSS 132.621 MiB；
-- 恢复服务优雅退出再次 SAVE 后独立审计 SHA-256：`e8966c16b6f98db63e650a4cb4468f3bb908ff59eef421fc4ede0b38678dab21`，文件仍为精确 64 MiB；
-- 512 MiB RSS 预算、30 秒 SAVE 暂停预算通过；
-- 首次在线 SAVE 后无 `.tmp.*` 残留。
+数据采集自未提交工作树，环境为 WSL2 同机 loopback closed-loop，不是容量或生产
+SLA 证据。汇总：
 
-### 4.4 Stage H
+| 指标 | SYNC | INTERVAL |
+|---|---:|---:|
+| median QPS 范围 | 408.815 - 2,219.464 | 2,020.629 - 3,367.577 |
+| recovery median | 0.022716 - 0.023829 s | 0.043730 - 0.086119 s |
+| checkpoint pause median | 11,571 - 20,852 us | 12,387 - 19,323 us |
+| server RSS peak max | 4,608 KiB | 4,608 KiB |
 
-- fuzz：HTTP 20,000、KV 20,000，seed 20261105，artifact 0；
-- replay：HTTP 427 个输入、KV 42 个输入；
-- clang-format：81 文件，退出码 0；
-- clang-tidy：25 文件，0 失败；
-- 默认多轮 benchmark：5 轮/协议，每轮 10 秒 warm-up、30 秒测量、5 秒冷却，closed-loop 单连接单 in-flight；
-- HTTP：267,270 次成功请求，1781.792 req/s，P99 898.507 us，0 错误/0 超时；
-- KV：295,147 次成功请求，1967.630 req/s，P99 825.103 us，0 错误/0 超时；
-- 原始 JSON：`stage-h/timed-multi-round.json`，11,780,123 字节，SHA-256 `8cfd8a89e6a73b70cc9abb6a4b180f01589bb1792b30c2a21f8c5393ba35afa8`，校验 `VALIDATION_OK`；
-- hey 外部对照：c1/c10/c32 为 1774.774/14638.639/28598.660 req/s，全部 HTTP 200；c32 已达 32 连接上限且 hey 客户端 CPU 饱和，不作容量或扩展性结论；
-- RDB：两个协议各保存 256 keys，RDB 均为 71,952 字节，无 `.tmp.*` 残留；
-- 历史 2000 请求结果仅保留为短回归工具验证；
-- perf 硬件计数器不可用，仅记录软件计数器，不声称 cycles/instructions/flamegraph。
+全部 18 个配置共 340,240 次成功请求、0 错误，采集总耗时 238.703 秒。
 
-## 5. 公开贡献尝试
+## 7. 已知限制
 
-目标 issue：
+- durability 结论只覆盖进程崩溃；未证明掉电、内核崩溃、设备缓存或介质故障。
+- checkpoint 是 stop-the-world，会暂停 owner loop；未实现后台/增量 checkpoint。
+- `INTERVAL` 最近一个 flush 窗口内的已确认写可能丢失。
+- 只有单机单写者；`flock` 是 advisory lock，不能阻止第三方直接修改文件。
+- 32 连接上限保持不变；benchmark 的 32-client 配置是边界，不是扩展性结论。
+- 无 TLS、认证、授权、复制、集群、事务或 MVCC。
+- WSL2 结果与硬件计数器限制必须随数据一起说明。
+- 许可证仍由所有者决定；仓库未创建 `LICENSE`/`COPYING`。
 
-- <https://github.com/eclipse-4diac/4diac-forte/issues/1135>
+## 8. 文档入口
 
-补丁：
+- [README](../README.md)
+- [可靠性与持久化升级计划书](MiniDB-可靠性与持久化升级计划书.md)
+- [系统架构](architecture.md)
+- [WAL 与 manifest 格式](wal-format.md)
+- [恢复模型](recovery.md)
+- [崩溃一致性](crash-consistency.md)
+- [可靠性证据](reliability-evidence.md)
+- [部署与运维](deployment.md)
+- [HTTP 协议](protocol-http.md)
+- [KV 协议](protocol-kv.md)
+- [RDB v2 格式](rdb-format.md)
+- [故障排查](troubleshooting.md)
+- [Benchmark](../bench/README.md)
+- [Fuzz targets](../fuzz/README.md)
+- [阶段 A-H 历史验收报告](A_H_ACCEPTANCE_REPORT.md)
 
-- 工作树：`/home/win11/minidb-public-contribution-4diac`
-- 基线：`efcd63c957ec191cab4fd57f8c5d6e3a3a30e0e2`
-- 提交：`ac80baaf7df26ff1f3ae50d28b19acece4db9ccf`
-- 变更：4 files changed，48 insertions(+)
-- 内容：新增 `func_MUX.h`、CMake/聚合头更新、五种类型测试、DCO sign-off
-- 定向测试通过；完整 CTest 1/1 通过，123.54 秒；clang-format 和 `git diff --check` 通过
+## 9. 后续工作
 
-推送/PR 结果：
+R4 只有在证据表明当前瓶颈值得额外复杂度时才启动：
 
-- 上游推送退出 128：`Permission to eclipse-4diac/4diac-forte.git denied to TXSAJYDN`；
-- fork 推送退出 128：`Repository not found`；
-- fork 公开 API 404；
-- 匿名 PR HTTP 401 `Requires authentication`。
+1. 组提交：专用 WAL writer、bounded queue、一次 fsync 服务多个写；
+2. 后台/增量 checkpoint：先比较 snapshot、COW 和增量方案的复杂度；
+3. MVCC/事务：独立阶段，不与 WAL 基线混合；
+4. 若面向 AI Agent 状态后端，可在 WAL 之上增加幂等键、lease、版本/CAS。
 
-结论：**真实尝试完成，但 PR 未创建**。不得写成贡献已提交、已合并或被上游接受，也不得声称 Eclipse ECA 已完成。
-
-## 6. 当前限制
-
-- 许可证：所有者暂缓，未创建 `LICENSE`/`COPYING`；报告头的许可证字段不是许可证文本。
-- 公开贡献：补丁已本地验证，但无 fork 权限且无认证，未创建 PR。
-- 性能：5×30 秒 benchmark 是 WSL2 同机 closed-loop、单连接、单 in-flight 数据；硬件计数器不可用；hey c32 受客户端 CPU 和 32 连接上限影响，不代表 open-loop 容量、饱和吞吐或生产 SLA。
-- 环境：主要在 Ubuntu 24.04 WSL2 验证；其他 Linux 环境需重新验证 TSan 和性能。
-- 功能：无 TLS、认证、授权、复制、集群、分片、事务、多进程 RDB 文件锁。
-- 结论：A-H 技术验收通过不等于生产就绪。
-
-## 7. 后续工作
-
-原计划 P0/A-H 已完成，没有剩余技术验收阻塞。若项目继续推进，建议按以下顺序：
-
-1. 项目所有者确定许可证后再补 `LICENSE`，不要在未授权时自行选择。
-2. 配置可写的 GitHub fork 和认证，重新尝试 4diac PR，并完成 Eclipse ECA。
-3. 若追求生产化，另行规划 TLS/认证、复制与一致性、多进程所有权、长稳/压力/多客户端基准和跨平台验证。
-4. 保持现有六配置、fuzz、故障注入和 CI 门禁，不要用单次 happy-path 测试替代验收。
-
-早期审查和逐轮修复记录已从当前文档树移除；如需追溯，可从 Git 历史中查看相应旧版本。本文件只记录当前权威状态。
+任何 R4 工作都必须重新通过 TSan、崩溃矩阵和资源上限验证，不能牺牲当前
+“确认写不丢、恢复失败不发布部分 Store”的语义。

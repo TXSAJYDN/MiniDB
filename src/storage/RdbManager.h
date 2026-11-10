@@ -47,6 +47,11 @@ class RdbManager {
     // atomically replaced and the parent directory was durably synced.
     bool save(const KvStore& store);
     RdbSaveResult save_checked(const KvStore& store);
+    // Checkpoint callers hold one scanner pause across WAL rotation, snapshot
+    // publication and WAL cleanup.  This overload reuses that pause instead
+    // of recursively acquiring another scanner pause.
+    RdbSaveResult save_checked(const KvStore& store,
+                               KvStore::ScannerPause& scanner_pause);
 
     // Fully validates and builds a temporary store, then atomically swaps it
     // into the destination.  On failure the destination is unchanged.
@@ -60,6 +65,7 @@ class RdbManager {
 
   private:
     std::string make_temp_path() const;
+    RdbSaveResult save_checked_under_lock(const KvStore& store);
 
     std::string rdb_path_;
     std::shared_ptr<RdbFileOperations> file_operations_;

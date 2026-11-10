@@ -1,5 +1,9 @@
 # MiniDB 项目实施计划书技术评审
 
+> **Archived / Historical：** 本文是针对早期设计草案的评审记录，其中提出的问题部分已修复，部分已被后续实现取代。
+>
+> 它不代表当前架构或当前验收状态；请以[项目状态](PROJECT_STATE.md)、[系统架构](architecture.md)和[可靠性证据](reliability-evidence.md)为准。
+
 评审对象：[MiniDB-实施计划书.md](./MiniDB-实施计划书.md)
 
 评审范围：网络架构、资源生命周期、HTTP/KV 边界、并发存储、RDB、测试性能、工程化、阶段依赖和求职证据。

@@ -2,9 +2,13 @@
 
 ## Purpose
 
-RDB is MiniDB's explicit, whole-database snapshot format. It is written by HTTP
-POST /save, the KV SAVE command, and graceful process shutdown. It is a
-single-writer file format; MiniDB has no inter-process RDB lock.
+RDB is MiniDB's full-database checkpoint format. It is written by HTTP
+`POST /save`, the KV `SAVE` command, automatic checkpointing before WAL resource
+limits are exhausted, and graceful process shutdown. It is not the per-write
+durability mechanism; the WAL carries mutations after the checkpoint.
+
+MiniDB enforces single-process ownership with `<rdb_path>.lock`. Do not treat
+RDB as an independently writable format and do not bypass the lock.
 
 Version 2 is the only accepted version. Version 1 files are not migrated.
 
@@ -117,7 +121,10 @@ that result as failure.
 
 ## Load algorithm
 
-1. Treat a missing destination as an empty database and return 0.
+1. At the RdbManager component level, treat a missing destination as an empty
+   database and return 0. Full startup recovery may still reject a missing RDB
+   when a manifest or WAL proves that checkpoint state should exist; see
+   [Recovery model](recovery.md).
 2. Require a regular file and a size of 16..64 MiB.
 3. Read the complete file and verify that no trailing unconsumed bytes remain.
 4. Verify CRC32C and the four-byte magic.
@@ -181,8 +188,10 @@ Typical causes of -1:
 - Use a filesystem that supports atomic rename and directory fsync.
 - Ensure the process can create and fsync both the RDB file and its parent
   directory.
-- Do not run two MiniDB processes against one RDB path.
-- Back up the file only after a successful SAVE or graceful exit, or use an
-  external snapshot mechanism that observes the rename boundary.
-- A checksum failure is not repaired automatically. Preserve the damaged file
-  for diagnosis and restore a known-good snapshot.
+- Do not run two MiniDB processes against one RDB path. The process takes an
+  advisory exclusive `flock` on `<rdb_path>.lock` for its lifetime.
+- A current-state backup requires the RDB, `<rdb_path>.manifest`, and the
+  `<rdb_path>.wal/` directory, or a stopped process and a consistent copy of the
+  whole set. Copying only the RDB can omit mutations after the checkpoint.
+- A checksum failure is not repaired automatically. Preserve the complete RDB,
+  manifest, and WAL set for diagnosis and restore a known-good backup.

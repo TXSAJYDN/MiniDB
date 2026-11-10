@@ -54,15 +54,21 @@ def latency_summary(samples_us):
         "p50_us": round(percentile(ordered, 0.50), 3),
         "p95_us": round(percentile(ordered, 0.95), 3),
         "p99_us": round(percentile(ordered, 0.99), 3),
+        "p999_us": round(percentile(ordered, 0.999), 3),
         "max_us": round(ordered[-1], 3),
     }
 
 
 class ServerProcess:
-    def __init__(self, executable, port, rdb_path, log_path):
+    def __init__(self, executable, port, rdb_path, log_path,
+                 durability_mode=None):
+        self.port = port
         self.log_file = open(log_path, "wb")
+        command = [executable, "-p", str(port), "-r", rdb_path]
+        if durability_mode is not None:
+            command += ["-d", durability_mode]
         self.proc = subprocess.Popen(
-            [executable, "-p", str(port), "-r", rdb_path],
+            command,
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
             start_new_session=True,

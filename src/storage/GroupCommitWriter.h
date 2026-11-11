@@ -103,6 +103,9 @@ struct GroupCommitWalBarrierInfo {
     std::uint64_t next_lsn = 0;
     std::uint64_t active_segment_start_lsn = 0;
     std::uint64_t active_segment_bytes = 0;
+    // Complete live set at the barrier.  A checkpoint manifest must retain all
+    // of these segments, not merely the active one.
+    std::vector<std::uint64_t> live_segment_starts;
 };
 
 // One lock-protected view of the writer and its WAL.  Diagnostics must never
@@ -115,6 +118,7 @@ struct GroupCommitWalSnapshot {
     std::uint64_t wal_segment_count = 0;
     std::uint64_t active_segment_start_lsn = 0;
     std::uint64_t active_segment_bytes = 0;
+    std::vector<std::uint64_t> live_segment_starts;
 };
 
 struct GroupCommitCompletion {
@@ -168,7 +172,11 @@ class GroupCommitWriter
     // the writer thread so rotate/cleanup never race the WAL owner.
     bool request_rotate(WalBarrierCompletion completion,
                         std::string* error = nullptr);
-    bool request_cleanup(BarrierCompletion completion,
+    // Removes only WAL segments before first_retained_start_lsn.  The caller
+    // must already have durably published a manifest retaining that boundary
+    // and all later live segments.
+    bool request_cleanup(std::uint64_t first_retained_start_lsn,
+                         BarrierCompletion completion,
                          std::string* error = nullptr);
     bool resume(std::string* error = nullptr);
     void stop();
@@ -200,6 +208,7 @@ class GroupCommitWriter
         GroupCommitEntry entry;
         BarrierCompletion barrier_completion;
         WalBarrierCompletion wal_barrier_completion;
+        std::uint64_t cleanup_boundary_lsn = 0;
         std::uint64_t bytes = 0;
     };
 

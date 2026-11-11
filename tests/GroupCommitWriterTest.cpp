@@ -775,7 +775,7 @@ TEST_F(GroupCommitWriterTest, WalControlsRequirePauseAndRotatePreservesLsn) {
                                         &error));
     EXPECT_NE(error.find("paused"), std::string::npos);
     EXPECT_FALSE(
-        writer->request_cleanup([](bool, const std::string&) {}, &error));
+        writer->request_cleanup(1, [](bool, const std::string&) {}, &error));
     EXPECT_NE(error.find("paused"), std::string::npos);
 
     ASSERT_TRUE(writer->request_pause(
@@ -803,10 +803,14 @@ TEST_F(GroupCommitWriterTest, WalControlsRequirePauseAndRotatePreservesLsn) {
     EXPECT_EQ(rotate_info.next_lsn, 2u);
     EXPECT_EQ(rotate_info.active_segment_start_lsn, 2u);
     EXPECT_EQ(rotate_info.active_segment_bytes, 0u);
+    ASSERT_EQ(rotate_info.live_segment_starts.size(), 2u);
+    EXPECT_EQ(rotate_info.live_segment_starts[0], 1u);
+    EXPECT_EQ(rotate_info.live_segment_starts[1], 2u);
     EXPECT_EQ(writer->next_lsn(), 2u);
     EXPECT_EQ(writer->state(), GroupCommitWriterState::kPaused);
 
     ASSERT_TRUE(writer->request_cleanup(
+        2,
         [&cleaned, &cleanup_info](bool success, const std::string& err) {
             cleanup_info.success = success;
             cleanup_info.error = err;
@@ -820,6 +824,8 @@ TEST_F(GroupCommitWriterTest, WalControlsRequirePauseAndRotatePreservesLsn) {
     EXPECT_EQ(after.wal_segment_count, 1u);
     EXPECT_EQ(after.active_segment_start_lsn, 2u);
     EXPECT_EQ(after.wal_total_bytes, after.active_segment_bytes);
+    ASSERT_EQ(after.live_segment_starts.size(), 1u);
+    EXPECT_EQ(after.live_segment_starts[0], 2u);
     EXPECT_TRUE(writer->resume(&error)) << error;
     writer->stop();
 }
@@ -934,6 +940,7 @@ TEST_F(GroupCommitWriterTest, CleanupFailureKeepsPausedAndReportsBarrier) {
 
     operations->set_fail_unlink(EIO);
     ASSERT_TRUE(writer->request_cleanup(
+        2,
         [&cleanup_done, &cleanup_success,
          &cleanup_error](bool success, const std::string& err) {
             cleanup_success = success;

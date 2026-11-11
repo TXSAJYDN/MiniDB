@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <sys/types.h>
 #include <unistd.h>
@@ -91,6 +92,9 @@ class FaultWalFileOperations : public minidb::WalFileOperations,
     ssize_t write(int fd, const void* data, std::size_t len) override {
         ++write_calls_;
         const FileKind kind = kind_for(fd);
+        if (before_write_hook_ && before_write_hook_kind_ == kind) {
+            before_write_hook_();
+        }
         if (block_before_write_kind_ == kind) {
             notify_and_block();
         }
@@ -264,9 +268,16 @@ class FaultWalFileOperations : public minidb::WalFileOperations,
         fail_dir_fsync_after_ = 0;
         dir_fsync_errno_ = error;
     }
+    void set_fail_dir_fsync_after(int completed_calls, int error) {
+        fail_dir_fsync_after_ = completed_calls;
+        dir_fsync_errno_ = error;
+    }
     void set_fail_rename(int error) {
         fail_rename_ = true;
         rename_errno_ = error;
+    }
+    void clear_fail_rename() {
+        fail_rename_ = false;
     }
     void set_fail_unlink(int error) {
         fail_unlink_ = true;
@@ -300,6 +311,10 @@ class FaultWalFileOperations : public minidb::WalFileOperations,
         open_read_write_errno_ = error;
     }
 
+    void set_before_write_hook(FileKind kind, std::function<void()> hook) {
+        before_write_hook_kind_ = kind;
+        before_write_hook_ = std::move(hook);
+    }
     void block_before_write(FileKind kind) {
         block_before_write_kind_ = kind;
     }
@@ -460,6 +475,8 @@ class FaultWalFileOperations : public minidb::WalFileOperations,
     int rename_errno_ = EXDEV;
     bool fail_unlink_ = false;
     int unlink_errno_ = EIO;
+    FileKind before_write_hook_kind_ = FileKind::kUnknown;
+    std::function<void()> before_write_hook_;
     FileKind block_before_write_kind_ = FileKind::kUnknown;
     FileKind block_partial_write_kind_ = FileKind::kUnknown;
     FileKind block_after_write_kind_ = FileKind::kUnknown;

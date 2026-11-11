@@ -2,6 +2,7 @@
 #include "../base/Log.h"
 
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -139,79 +140,188 @@ bool RdbManager::save(const KvStore& store) {
 }
 
 RdbSaveResult RdbManager::save_checked(const KvStore& store) {
-    std::lock_guard<std::mutex> save_lock(save_mutex_);
-    // The caller is responsible for the command-dispatch barrier (the P0
-    // servers call SAVE synchronously on their owner EventLoop).  This guard
-    // extends the stop-the-world boundary to the independent TTL scanner and
-    // stays alive through every early return and the final directory fsync.
+    // Lock order across RdbManager and KvStore is always
+    // scanner_pause_mutex_ -> save_mutex_.  Checkpoint callers already hold a
+    // ScannerPause before entering the overload below; acquiring the locks in
+    // the opposite order here would permit a cross-thread deadlock.
     KvStore::ScannerPause scanner_pause = store.pause_scanner();
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
     return save_checked_under_lock(store);
 }
 
 RdbSaveResult RdbManager::save_checked(const KvStore& store,
                                        KvStore::ScannerPause& scanner_pause) {
     std::lock_guard<std::mutex> save_lock(save_mutex_);
-    // The lifetime of the caller's pause is the checkpoint publication
+    // The lifetime of the caller pause is the checkpoint publication
     // boundary.  Referencing it here prevents accidental dead-code treatment
     // and documents that this overload must not acquire a second pause.
     (void)scanner_pause;
     return save_checked_under_lock(store);
 }
 
-RdbSaveResult RdbManager::save_checked_under_lock(const KvStore& store) {
-    RdbSaveResult result = RdbSaveResult::Failed;
+bool RdbManager::capture(const KvStore& store, RdbSnapshot* snapshot,
+                         std::string* error) {
+    // Preserve the same scanner_pause_mutex_ -> save_mutex_ lock order as
+    // save_checked().
+    KvStore::ScannerPause scanner_pause = store.pause_scanner();
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
+    return capture_entries(store, snapshot, error);
+}
 
-    auto entries = store.export_all();
-    if (entries.size() > RdbFormat::MAX_RECORDS) {
-        Log::Error("RDB save rejected: record count exceeds limit");
-        std::lock_guard<std::mutex> lock(result_mutex_);
-        last_save_result_ = result;
-        return result;
+bool RdbManager::capture(const KvStore& store,
+                         KvStore::ScannerPause& scanner_pause,
+                         RdbSnapshot* snapshot, std::string* error) {
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
+    (void)scanner_pause;
+    return capture_entries(store, snapshot, error);
+}
+
+bool RdbManager::capture_entries(const KvStore& store, RdbSnapshot* snapshot,
+                                 std::string* error) {
+    if (snapshot == nullptr) {
+        if (error != nullptr) {
+            *error = "RDB snapshot output is null";
+        }
+        return false;
     }
-
-    for (const auto& entry : entries) {
+    RdbSnapshot captured;
+    captured.entries = store.export_all();
+    if (captured.entries.size() > RdbFormat::MAX_RECORDS) {
+        if (error != nullptr) {
+            *error = "RDB save rejected: record count exceeds limit";
+        }
+        Log::Error("RDB save rejected: record count exceeds limit");
+        return false;
+    }
+    for (const auto& entry : captured.entries) {
         if (entry.key.empty() || entry.key.size() > RdbFormat::MAX_KEY_SIZE ||
             entry.value.size() > RdbFormat::MAX_VALUE_SIZE ||
             entry.expiry_ms < 0) {
+            if (error != nullptr) {
+                *error = "RDB save rejected: entry exceeds format limit";
+            }
             Log::Error("RDB save rejected: entry exceeds format limit");
-            std::lock_guard<std::mutex> lock(result_mutex_);
-            last_save_result_ = result;
-            return result;
+            return false;
         }
     }
+    *snapshot = std::move(captured);
+    return true;
+}
 
+bool RdbManager::serialize(const RdbSnapshot& snapshot,
+                           std::vector<std::uint8_t>* image,
+                           RdbSaveTimings* timings, std::string* error) {
+    const std::uint64_t started_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const bool ok = serialize_entries(snapshot, image, error);
+    if (timings != nullptr) {
+        const std::uint64_t finished_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        timings->serialize_us =
+            finished_us >= started_us ? finished_us - started_us : 0;
+    }
+    return ok;
+}
+
+bool RdbManager::serialize_entries(const RdbSnapshot& snapshot,
+                                   std::vector<std::uint8_t>* image,
+                                   std::string* error) {
+    if (image == nullptr) {
+        if (error != nullptr) {
+            *error = "RDB image output is null";
+        }
+        return false;
+    }
     std::vector<uint8_t> buffer;
     buffer.reserve(RdbFormat::HEADER_SIZE + RdbFormat::CHECKSUM_SIZE);
-
     buffer.insert(buffer.end(),
                   reinterpret_cast<const uint8_t*>(RdbFormat::MAGIC),
                   reinterpret_cast<const uint8_t*>(RdbFormat::MAGIC) + 4);
     append_u32(buffer, RdbFormat::VERSION);
-    append_u32(buffer, static_cast<uint32_t>(entries.size()));
+    append_u32(buffer, static_cast<uint32_t>(snapshot.entries.size()));
 
-    for (const auto& entry : entries) {
+    for (const auto& entry : snapshot.entries) {
         if (!append_length_prefixed(buffer, entry.key) ||
             !append_length_prefixed(buffer, entry.value)) {
+            if (error != nullptr) {
+                *error = "RDB save rejected: serialized image exceeds 64 MiB";
+            }
             Log::Error("RDB save rejected: serialized image exceeds 64 MiB");
-            std::lock_guard<std::mutex> lock(result_mutex_);
-            last_save_result_ = result;
-            return result;
+            return false;
         }
         if (buffer.size() >
             RdbFormat::MAX_FILE_SIZE - RdbFormat::CHECKSUM_SIZE - 8) {
+            if (error != nullptr) {
+                *error = "RDB save rejected: serialized image exceeds 64 MiB";
+            }
             Log::Error("RDB save rejected: serialized image exceeds 64 MiB");
-            std::lock_guard<std::mutex> lock(result_mutex_);
-            last_save_result_ = result;
-            return result;
+            return false;
         }
         append_u64(buffer, static_cast<uint64_t>(entry.expiry_ms));
     }
-
     const uint32_t checksum = RdbFormat::crc32c(buffer.data(), buffer.size());
     append_u32(buffer, checksum);
+    *image = std::move(buffer);
+    return true;
+}
 
+RdbSaveResult RdbManager::save_checked_under_lock(const KvStore& store) {
+    RdbSnapshot snapshot;
+    std::string capture_error;
+    if (!capture_entries(store, &snapshot, &capture_error)) {
+        std::lock_guard<std::mutex> lock(result_mutex_);
+        last_save_result_ = RdbSaveResult::Failed;
+        return RdbSaveResult::Failed;
+    }
+    std::vector<std::uint8_t> image;
+    std::string serialize_error;
+    if (!serialize_entries(snapshot, &image, &serialize_error)) {
+        std::lock_guard<std::mutex> lock(result_mutex_);
+        last_save_result_ = RdbSaveResult::Failed;
+        return RdbSaveResult::Failed;
+    }
+    return write_durable_under_lock(image, nullptr, nullptr);
+}
+
+RdbSaveResult RdbManager::write_durable(const std::vector<std::uint8_t>& image,
+                                        RdbSaveTimings* timings,
+                                        std::string* error) {
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
+    return write_durable_under_lock(image, timings, error);
+}
+
+RdbSaveResult
+RdbManager::write_durable_under_lock(const std::vector<std::uint8_t>& image,
+                                     RdbSaveTimings* timings,
+                                     std::string* error) {
+    const auto now_us = []() {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    };
+    const auto set_error = [error](const char* message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+    };
+
+    if (image.size() < RdbFormat::MIN_FILE_SIZE ||
+        image.size() > RdbFormat::MAX_FILE_SIZE) {
+        set_error("RDB image size is outside the accepted range");
+        std::lock_guard<std::mutex> lock(result_mutex_);
+        last_save_result_ = RdbSaveResult::Failed;
+        return RdbSaveResult::Failed;
+    }
+
+    RdbSaveResult result = RdbSaveResult::Failed;
     std::string temp_path;
     int fd = -1;
+    const std::uint64_t write_started_us = now_us();
     for (int attempt = 0; attempt < 100; ++attempt) {
         temp_path = make_temp_path();
         fd = file_operations_->open_exclusive(temp_path, 0600);
@@ -219,32 +329,40 @@ RdbSaveResult RdbManager::save_checked_under_lock(const KvStore& store) {
             break;
         }
         if (errno != EEXIST) {
+            set_error("failed to create RDB temporary file");
             std::lock_guard<std::mutex> lock(result_mutex_);
             last_save_result_ = result;
             return result;
         }
     }
     if (fd < 0) {
+        set_error("failed to create RDB temporary file");
         std::lock_guard<std::mutex> lock(result_mutex_);
         last_save_result_ = result;
         return result;
     }
 
-    if (!write_all(file_operations_.get(), fd, buffer.data(), buffer.size())) {
+    if (!write_all(file_operations_.get(), fd, image.data(), image.size())) {
         const int saved_errno = errno;
         file_operations_->close_fd(fd);
         file_operations_->unlink_file(temp_path);
         errno = saved_errno;
+        set_error("failed to write RDB snapshot");
         std::lock_guard<std::mutex> lock(result_mutex_);
         last_save_result_ = result;
         return result;
     }
+    if (timings != nullptr) {
+        timings->write_us = now_us() - write_started_us;
+    }
 
+    const std::uint64_t fsync_started_us = now_us();
     if (file_operations_->fsync_fd(fd) < 0) {
         const int saved_errno = errno;
         file_operations_->close_fd(fd);
         file_operations_->unlink_file(temp_path);
         errno = saved_errno;
+        set_error("RDB snapshot fsync failed");
         std::lock_guard<std::mutex> lock(result_mutex_);
         last_save_result_ = result;
         return result;
@@ -254,6 +372,7 @@ RdbSaveResult RdbManager::save_checked_under_lock(const KvStore& store) {
         const int saved_errno = errno;
         file_operations_->unlink_file(temp_path);
         errno = saved_errno;
+        set_error("RDB snapshot close failed");
         std::lock_guard<std::mutex> lock(result_mutex_);
         last_save_result_ = result;
         return result;
@@ -263,6 +382,7 @@ RdbSaveResult RdbManager::save_checked_under_lock(const KvStore& store) {
         const int saved_errno = errno;
         file_operations_->unlink_file(temp_path);
         errno = saved_errno;
+        set_error("RDB snapshot rename failed");
         std::lock_guard<std::mutex> lock(result_mutex_);
         last_save_result_ = result;
         return result;
@@ -271,6 +391,7 @@ RdbSaveResult RdbManager::save_checked_under_lock(const KvStore& store) {
     int dir_fd = file_operations_->open_parent_dir(rdb_path_);
     if (dir_fd < 0) {
         result = RdbSaveResult::DurabilityUnconfirmed;
+        set_error("RDB parent directory could not be opened");
     } else {
         const int fsync_result = file_operations_->fsync_dir(dir_fd);
         const int saved_errno = errno;
@@ -279,7 +400,11 @@ RdbSaveResult RdbManager::save_checked_under_lock(const KvStore& store) {
                                    : RdbSaveResult::DurabilityUnconfirmed;
         if (fsync_result < 0) {
             errno = saved_errno;
+            set_error("RDB parent directory fsync failed");
         }
+    }
+    if (timings != nullptr) {
+        timings->fsync_us = now_us() - fsync_started_us;
     }
 
     {

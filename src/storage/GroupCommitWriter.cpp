@@ -272,7 +272,8 @@ bool GroupCommitWriter::request_rotate(WalBarrierCompletion completion,
                                       std::move(completion), error);
 }
 
-bool GroupCommitWriter::request_cleanup(BarrierCompletion completion,
+bool GroupCommitWriter::request_cleanup(std::uint64_t first_retained_start_lsn,
+                                        BarrierCompletion completion,
                                         std::string* error) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (state_ != GroupCommitWriterState::kPaused) {
@@ -281,8 +282,28 @@ bool GroupCommitWriter::request_cleanup(BarrierCompletion completion,
         }
         return false;
     }
-    return enqueue_barrier_locked(CommandKind::kCleanup, std::move(completion),
-                                  error);
+    if (first_retained_start_lsn == 0) {
+        if (error != nullptr) {
+            *error = "group commit cleanup boundary must be positive";
+        }
+        return false;
+    }
+    if (pending_barriers_ >= kMaxPendingBarriers) {
+        ++stats_.queue_rejections;
+        if (error != nullptr) {
+            *error = "too many pending group commit barriers";
+        }
+        return false;
+    }
+    Command command;
+    command.kind = CommandKind::kCleanup;
+    command.bytes = kGroupCommitBarrierBytes;
+    command.cleanup_boundary_lsn = first_retained_start_lsn;
+    command.barrier_completion = std::move(completion);
+    queue_.push_back(std::move(command));
+    ++pending_barriers_;
+    condition_.notify_one();
+    return true;
 }
 
 bool GroupCommitWriter::resume(std::string* error) {
@@ -561,12 +582,20 @@ void GroupCommitWriter::process_wal_barrier(Command command) {
             }
         }
     } else {
-        info.success = wal_->cleanup_except_active(&error);
+        info.success =
+            wal_->cleanup_before(command.cleanup_boundary_lsn, &error);
         info.next_lsn = wal_->next_lsn();
         const WalSegmentInfo* active = wal_->active_segment();
         if (active != nullptr) {
             info.active_segment_start_lsn = active->start_lsn;
             info.active_segment_bytes = active->size;
+        }
+    }
+    if (info.success) {
+        info.live_segment_starts.clear();
+        info.live_segment_starts.reserve(wal_->segments().size());
+        for (const WalSegmentInfo& segment : wal_->segments()) {
+            info.live_segment_starts.push_back(segment.start_lsn);
         }
     }
     if (!info.success) {
@@ -854,6 +883,11 @@ void GroupCommitWriter::refresh_wal_snapshot_locked() {
     } else {
         wal_snapshot_.active_segment_start_lsn = 0;
         wal_snapshot_.active_segment_bytes = 0;
+    }
+    wal_snapshot_.live_segment_starts.clear();
+    wal_snapshot_.live_segment_starts.reserve(wal_->segments().size());
+    for (const WalSegmentInfo& segment : wal_->segments()) {
+        wal_snapshot_.live_segment_starts.push_back(segment.start_lsn);
     }
 }
 

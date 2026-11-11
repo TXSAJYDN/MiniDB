@@ -104,8 +104,15 @@ class WalManager {
                         std::string* error = nullptr);
 
     // Called only after a new manifest has been durably published.  Removes
-    // every segment file except the active one, including residue that was
-    // not part of the recovered live set, then fsyncs the WAL directory.
+    // only segment files whose start LSN is strictly before the supplied
+    // boundary, then fsyncs the WAL directory.  The boundary must name a live
+    // segment; that segment and every later segment are retained.  This is the
+    // crash-safe primitive for a checkpoint whose snapshot and manifest were
+    // captured before later mutations entered the WAL.
+    bool cleanup_before(std::uint64_t first_retained_start_lsn,
+                        std::string* error = nullptr);
+
+    // Convenience wrapper that retains only the active segment.
     bool cleanup_except_active(std::string* error = nullptr);
 
     const std::vector<WalSegmentInfo>& segments() const noexcept {

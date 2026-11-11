@@ -216,6 +216,38 @@ TEST_F(WalManagerTest, CleanupRemovesResidueAndKeepsActive) {
     EXPECT_TRUE(fs::exists(stale));
 }
 
+TEST_F(WalManagerTest, CleanupBeforeRetainsBoundaryAndAllLaterSegments) {
+    WalManager manager(wal_dir_);
+    ASSERT_TRUE(manager.open({}, 1));
+    ASSERT_EQ(manager.append(MakeRecord(1), DurabilityMode::kSync),
+              WalResult::kOk);
+    ASSERT_TRUE(manager.rotate(2));
+    ASSERT_EQ(manager.append(MakeRecord(2), DurabilityMode::kSync),
+              WalResult::kOk);
+    ASSERT_TRUE(manager.rotate(3));
+    ASSERT_EQ(manager.append(MakeRecord(3), DurabilityMode::kSync),
+              WalResult::kOk);
+    const std::uint64_t total_before = manager.total_bytes();
+
+    std::string error;
+    ASSERT_TRUE(manager.cleanup_before(2, &error)) << error;
+    ASSERT_EQ(manager.segments().size(), 2u);
+    EXPECT_EQ(manager.segments()[0].start_lsn, 2u);
+    EXPECT_EQ(manager.segments()[1].start_lsn, 3u);
+    EXPECT_FALSE(fs::exists(wal_dir_ + "/" + wal_segment_name(1)));
+    EXPECT_TRUE(fs::exists(wal_dir_ + "/" + wal_segment_name(2)));
+    EXPECT_TRUE(fs::exists(wal_dir_ + "/" + wal_segment_name(3)));
+    EXPECT_LT(manager.total_bytes(), total_before);
+    EXPECT_EQ(manager.stats().segments_removed, 1u);
+
+    const std::uint64_t retained_total = manager.total_bytes();
+    error.clear();
+    EXPECT_FALSE(manager.cleanup_before(99, &error));
+    EXPECT_FALSE(error.empty());
+    EXPECT_EQ(manager.segments().size(), 2u);
+    EXPECT_EQ(manager.total_bytes(), retained_total);
+}
+
 TEST_F(WalManagerTest, RemoveSegmentRefusesActiveAndRemovesObsolete) {
     WalManager manager(wal_dir_);
     ASSERT_TRUE(manager.open({}, 1));

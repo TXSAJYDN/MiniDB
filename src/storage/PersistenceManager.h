@@ -16,9 +16,14 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace minidb {
+
+namespace detail {
+struct PersistenceManagerCallbackState;
+}
 
 enum class MutationStatus : std::uint8_t {
     kOk,
@@ -63,6 +68,18 @@ using MutationCompletion = std::function<void(MutationOutcome)>;
 using CheckpointCompletion =
     std::function<void(RdbSaveResult, const std::string&)>;
 
+enum class BackgroundCheckpointState : std::uint8_t {
+    kIdle,
+    kCapture,
+    kWriting,
+    kFinalizing,
+    kCleanup,
+    kFailed,
+};
+
+const char*
+background_checkpoint_state_name(BackgroundCheckpointState state) noexcept;
+
 struct PersistenceStats {
     std::uint64_t mutations = 0;
     std::uint64_t sync_mutations = 0;
@@ -76,6 +93,29 @@ struct PersistenceStats {
     // apply; it excludes network parsing and response serialization.
     std::uint64_t sync_mutation_total_us = 0;
     std::uint64_t sync_mutation_max_us = 0;
+
+    // Background checkpoint timings.  Admission-blocked covers only the two
+    // short cut points (pause/drain/rotate and final drain), never the RDB
+    // serialization or durable write.
+    std::uint64_t checkpoint_admission_blocked_total_us = 0;
+    std::uint64_t checkpoint_admission_blocked_max_us = 0;
+    std::uint64_t checkpoint_snapshot_capture_total_us = 0;
+    std::uint64_t checkpoint_snapshot_capture_max_us = 0;
+    std::uint64_t checkpoint_snapshot_serialize_total_us = 0;
+    std::uint64_t checkpoint_snapshot_serialize_max_us = 0;
+    std::uint64_t checkpoint_snapshot_write_total_us = 0;
+    std::uint64_t checkpoint_snapshot_write_max_us = 0;
+    std::uint64_t checkpoint_snapshot_fsync_total_us = 0;
+    std::uint64_t checkpoint_snapshot_fsync_max_us = 0;
+    std::uint64_t checkpoint_manifest_total_us = 0;
+    std::uint64_t checkpoint_wal_cleanup_total_us = 0;
+    std::uint64_t checkpoint_total_us = 0;
+    std::uint64_t checkpoint_max_us = 0;
+    std::uint64_t checkpoint_failures = 0;
+    std::uint64_t save_client_latency_total_us = 0;
+    std::uint64_t save_client_latency_max_us = 0;
+    BackgroundCheckpointState background_checkpoint_state =
+        BackgroundCheckpointState::kIdle;
 };
 
 // A single-lock snapshot for diagnostic endpoints. Reading these values via
@@ -191,11 +231,35 @@ class PersistenceManager {
         MutationCompletion completion;
     };
 
+    enum class CheckpointPhase : std::uint8_t {
+        kPause,
+        kRotate,
+        kWriting,
+        kFinalPause,
+        kPublish,
+        kCleanup,
+    };
+
     struct CheckpointOperation {
         CheckpointCompletion completion;
         bool shutdown = false;
+        CheckpointPhase phase = CheckpointPhase::kPause;
         std::uint64_t started_us = 0;
-        std::uint64_t paused_us = 0;
+        std::uint64_t admission_blocked_started_us = 0;
+        std::uint64_t checkpoint_lsn = 0;
+        std::uint64_t first_retained_start_lsn = 0;
+        std::uint64_t capture_us = 0;
+        std::uint64_t serialize_us = 0;
+        std::uint64_t write_us = 0;
+        std::uint64_t fsync_us = 0;
+        std::uint64_t manifest_us = 0;
+        std::uint64_t cleanup_started_us = 0;
+        std::uint64_t cleanup_us = 0;
+        bool cleanup_started = false;
+    };
+
+    struct CheckpointJob {
+        RdbSnapshot snapshot;
     };
 
     MutationOutcome set_impl(const std::string& key, const std::string& value);
@@ -217,8 +281,16 @@ class PersistenceManager {
                                  std::string* error);
     void on_checkpoint_paused(bool success, const std::string& error);
     void on_checkpoint_rotated(const GroupCommitWalBarrierInfo& info);
+    void on_checkpoint_written(RdbSaveResult result, const std::string& error,
+                               std::uint64_t serialize_us,
+                               std::uint64_t write_us, std::uint64_t fsync_us);
+    void on_checkpoint_final_paused(bool success, const std::string& error);
     void on_checkpoint_cleanup(bool success, const std::string& error);
     void finish_checkpoint(RdbSaveResult result, const std::string& error);
+    void join_checkpoint_worker();
+    void dispatch_owner(std::function<void()> work);
+    void pause_checkpoint_admission_locked(std::uint64_t now_us);
+    void resume_checkpoint_admission_locked(std::uint64_t now_us);
     void on_group_commit_completion(GroupCommitCompletion completion);
     WalResult append_with_checkpoint_retry(const WalRecord& record,
                                            std::string* error);
@@ -239,6 +311,8 @@ class PersistenceManager {
     std::unique_ptr<WalManager> wal_;
     std::shared_ptr<GroupCommitWriter> group_commit_writer_;
     GroupCommitWriter::OwnerDispatch owner_dispatch_;
+    std::shared_ptr<detail::PersistenceManagerCallbackState>
+        owner_callback_state_;
     mutable std::mutex operation_mutex_;
     std::uint64_t last_lsn_ = 0;
     bool opened_ = false;
@@ -252,6 +326,7 @@ class PersistenceManager {
     std::unique_ptr<CheckpointOperation> checkpoint_operation_;
     PersistenceStats stats_;
     std::function<void(const WalRecord&)> after_apply_callback_;
+    std::thread checkpoint_worker_;
 };
 
 const char* mutation_status_name(MutationStatus status);

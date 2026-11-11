@@ -437,18 +437,37 @@ bool WalManager::remove_segment(const WalSegmentInfo& segment,
     return true;
 }
 
-bool WalManager::cleanup_except_active(std::string* error) {
+bool WalManager::cleanup_before(std::uint64_t first_retained_start_lsn,
+                                std::string* error) {
     if (!opened_ || !healthy_ || segments_.empty()) {
         set_error(error, "WAL manager is not open for cleanup");
         return false;
     }
-    const WalSegmentInfo active = segments_.back();
+    if (first_retained_start_lsn == 0) {
+        set_error(error, "WAL cleanup boundary must be positive");
+        return false;
+    }
+    const auto boundary =
+        std::find_if(segments_.begin(), segments_.end(),
+                     [first_retained_start_lsn](const WalSegmentInfo& segment) {
+                         return segment.start_lsn == first_retained_start_lsn;
+                     });
+    if (boundary == segments_.end()) {
+        set_error(error,
+                  "WAL cleanup boundary is not a live segment start LSN");
+        return false;
+    }
+
+    // Remove prefix residue as well as live prefix segments.  Residue at or
+    // after the boundary is intentionally retained: it can be ignored by
+    // recovery, and deleting it without a published manifest would weaken the
+    // crash-safety argument.
     std::vector<WalSegmentInfo> on_disk;
     if (!list_wal_segments(wal_dir_, &on_disk, error, limits_)) {
         return false;
     }
     for (const WalSegmentInfo& segment : on_disk) {
-        if (segment.start_lsn == active.start_lsn) {
+        if (segment.start_lsn >= first_retained_start_lsn) {
             continue;
         }
         if (operations_->unlink_file(segment.path) < 0 && errno != ENOENT) {
@@ -461,10 +480,26 @@ bool WalManager::cleanup_except_active(std::string* error) {
     if (!directory_sync(error)) {
         return false;
     }
-    segments_.clear();
-    segments_.push_back(active);
-    total_bytes_ = active.size;
+
+    segments_.erase(segments_.begin(), boundary);
+    total_bytes_ = 0;
+    for (const WalSegmentInfo& segment : segments_) {
+        if (segment.size >
+            std::numeric_limits<std::uint64_t>::max() - total_bytes_) {
+            total_bytes_ = std::numeric_limits<std::uint64_t>::max();
+            break;
+        }
+        total_bytes_ += segment.size;
+    }
     return true;
+}
+
+bool WalManager::cleanup_except_active(std::string* error) {
+    if (segments_.empty()) {
+        set_error(error, "WAL manager is not open for cleanup");
+        return false;
+    }
+    return cleanup_before(segments_.back().start_lsn, error);
 }
 
 const WalSegmentInfo* WalManager::active_segment() const noexcept {

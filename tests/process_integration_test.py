@@ -250,15 +250,20 @@ def kv_request(port, command_type, args=(), timeout=5.0):
 
 class ServerProcess:
     def __init__(self, executable, port, rdb_path=None, cwd=None,
-                 durability_mode=None):
+                 durability_mode=None, env_overrides=None):
         command = [executable, "-p", str(port)]
         if rdb_path is not None:
             command += ["-r", rdb_path]
         if durability_mode is not None:
             command += ["-d", durability_mode]
+        process_env = None
+        if env_overrides:
+            process_env = os.environ.copy()
+            process_env.update(env_overrides)
         self.proc = subprocess.Popen(
             command,
             cwd=cwd,
+            env=process_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -350,8 +355,9 @@ class ServerProcess:
         self.kill_group()
 
 
-def start_http(port, rdb_path, cwd, durability_mode=None):
-    server = ServerProcess(HTTP_BIN, port, rdb_path, cwd, durability_mode)
+def start_http(port, rdb_path, cwd, durability_mode=None, env_overrides=None):
+    server = ServerProcess(HTTP_BIN, port, rdb_path, cwd, durability_mode,
+                           env_overrides)
     try:
         server.wait_for_http(port)
     except Exception:
@@ -360,8 +366,9 @@ def start_http(port, rdb_path, cwd, durability_mode=None):
     return server
 
 
-def start_kv(port, rdb_path, cwd, durability_mode=None):
-    server = ServerProcess(KV_BIN, port, rdb_path, cwd, durability_mode)
+def start_kv(port, rdb_path, cwd, durability_mode=None, env_overrides=None):
+    server = ServerProcess(KV_BIN, port, rdb_path, cwd, durability_mode,
+                           env_overrides)
     try:
         server.wait_for_kv(port)
     except Exception:
@@ -471,6 +478,53 @@ def check_timing_contract(stats, label):
     check(timing["sync_mutation_total_us"] >=
           timing["sync_mutation_max_us"],
           f"{label} SYNC timing is inconsistent: {stats!r}")
+
+    persistence = stats.get("persistence")
+    check(isinstance(persistence, dict),
+          f"{label} stats omitted persistence: {stats!r}")
+    persistence_required = (
+        "checkpoint_pause_us",
+        "checkpoint_admission_blocked_total_us",
+        "checkpoint_admission_blocked_max_us",
+        "checkpoint_snapshot_capture_total_us",
+        "checkpoint_snapshot_capture_max_us",
+        "checkpoint_snapshot_serialize_total_us",
+        "checkpoint_snapshot_serialize_max_us",
+        "checkpoint_snapshot_write_total_us",
+        "checkpoint_snapshot_write_max_us",
+        "checkpoint_snapshot_fsync_total_us",
+        "checkpoint_snapshot_fsync_max_us",
+        "checkpoint_manifest_total_us",
+        "checkpoint_wal_cleanup_total_us",
+        "checkpoint_total_us",
+        "checkpoint_max_us",
+        "checkpoint_failures",
+        "save_client_latency_total_us",
+        "save_client_latency_max_us",
+    )
+    for name in persistence_required:
+        check(isinstance(persistence.get(name), int) and persistence[name] >= 0,
+              f"{label} persistence field {name} is invalid: {stats!r}")
+    for total, maximum in (
+        ("checkpoint_admission_blocked_total_us",
+         "checkpoint_admission_blocked_max_us"),
+        ("checkpoint_snapshot_capture_total_us",
+         "checkpoint_snapshot_capture_max_us"),
+        ("checkpoint_snapshot_serialize_total_us",
+         "checkpoint_snapshot_serialize_max_us"),
+        ("checkpoint_snapshot_write_total_us",
+         "checkpoint_snapshot_write_max_us"),
+        ("checkpoint_snapshot_fsync_total_us",
+         "checkpoint_snapshot_fsync_max_us"),
+        ("checkpoint_total_us", "checkpoint_max_us"),
+        ("save_client_latency_total_us", "save_client_latency_max_us"),
+    ):
+        check(persistence[total] >= persistence[maximum],
+              f"{label} {total} is smaller than {maximum}: {stats!r}")
+    check(persistence.get("background_checkpoint_state") in
+          ("idle", "capture", "writing", "finalizing", "cleanup", "failed"),
+          f"{label} background checkpoint state is invalid: {stats!r}")
+
     bounds = timing.get("fsync_latency_bucket_bounds_us")
     counts = timing.get("fsync_latency_bucket_counts")
     check(isinstance(bounds, list) and bounds and
@@ -952,6 +1006,97 @@ def test_kv_sync_crash_recovery():
                   f"KV recovery shutdown failed:\n{restarted.log}")
         finally:
             restarted.cleanup()
+
+
+def test_background_checkpoint_rename_crash():
+    with tempfile.TemporaryDirectory(
+            prefix="minidb-process-background-rename-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "background-rename.rdb")
+        port = free_loopback_port()
+        marker = os.path.join(temp_dir, "rdb-published.marker")
+        release = os.path.join(temp_dir, "rdb-published.release")
+        env = {
+            "MINIDB_TEST_RDB_PUBLISH_MARKER": marker,
+            "MINIDB_TEST_RDB_PUBLISH_RELEASE": release,
+        }
+        server = start_http(port, rdb_path, temp_dir, "sync", env)
+        save_socket = None
+        try:
+            status, _, payload = read_http_response(
+                port, "POST", "/kv/before-capture", b"snapshot-value")
+            check(status == 200 and payload == b"OK\n",
+                  f"background checkpoint seed failed: "
+                  f"status={status}, body={payload!r}")
+
+            save_socket = connect_http(port, timeout=20.0)
+            save_socket.sendall(
+                http_request_bytes(port, "POST", "/save", connection="close"))
+            wait_until(lambda: os.path.exists(marker), timeout=10.0,
+                       message="checkpoint worker did not reach RDB publish")
+
+            # The RDB rename and directory fsync are complete, but the old
+            # manifest is still authoritative. Admission must already be
+            # resumed so this second write lands in WAL.
+            status, _, payload = read_http_response(
+                port, "POST", "/kv/after-capture", b"wal-value")
+            check(status == 200 and payload == b"OK\n",
+                  f"writes did not resume during background RDB publish: "
+                  f"status={status}, body={payload!r}")
+            stats = read_http_stats(port)
+            check(stats["persistence"]["checkpoints"] == 0,
+                  f"checkpoint published before the crash window: {stats!r}")
+            check(stats["persistence"]["background_checkpoint_state"] ==
+                  "writing",
+                  f"checkpoint state did not expose background writing: {stats!r}")
+            check(stats["recovery"]["checkpoint_lsn"] == 0,
+                  f"old manifest was unexpectedly replaced: {stats!r}")
+            server.kill_group()
+        finally:
+            if save_socket is not None:
+                save_socket.close()
+            server.cleanup()
+
+        restarted = start_http(port, rdb_path, temp_dir, "sync")
+        try:
+            for key, value in (
+                    ("before-capture", b"snapshot-value"),
+                    ("after-capture", b"wal-value")):
+                status, _, payload = read_http_response(
+                    port, "GET", f"/kv/{key}")
+                check(status == 200 and payload == value,
+                      f"background checkpoint crash lost {key}: "
+                      f"status={status}, body={payload!r}")
+            stats = read_http_stats(port)
+            check(stats["recovery"]["checkpoint_lsn"] == 0,
+                  f"recovery did not honor the old manifest: {stats!r}")
+            check(stats["recovery"]["wal_records_replayed"] >= 2,
+                  f"recovery did not replay WAL over the new RDB: {stats!r}")
+
+            status, _, payload = read_http_response(
+                port, "POST", "/save", timeout=20.0)
+            check(status == 200,
+                  f"post-recovery SAVE failed: status={status}, body={payload!r}")
+            stats = read_http_stats(port)
+            check(stats["persistence"]["checkpoints"] == 1,
+                  f"post-recovery checkpoint was not recorded: {stats!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"background checkpoint recovery shutdown failed:\n"
+                  f"{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+        # recovery.checkpoint_lsn is a startup-recovery snapshot. Confirm the
+        # newly published manifest in a fresh process instead of expecting the
+        # running process to rewrite that immutable statistic.
+        reopened = start_http(port, rdb_path, temp_dir, "sync")
+        try:
+            stats = read_http_stats(port)
+            check(stats["recovery"]["checkpoint_lsn"] >= 2,
+                  f"new manifest was not visible after restart: {stats!r}")
+            check(reopened.terminate_group(signal.SIGTERM) == 0,
+                  f"post-checkpoint restart shutdown failed:\n{reopened.log}")
+        finally:
+            reopened.cleanup()
 
 
 def test_interval_flush_recovery():
@@ -1598,6 +1743,7 @@ CASES = {
     "HttpSyncCrashRecovery": test_http_sync_crash_recovery,
     "KvSyncCrashRecovery": test_kv_sync_crash_recovery,
     "IntervalFlushRecovery": test_interval_flush_recovery,
+    "BackgroundCheckpointRenameCrash": test_background_checkpoint_rename_crash,
     "WriterLockConflict": test_writer_lock_conflict,
     "WalTailTruncation": test_wal_tail_truncation,
     "ManifestCorruption": test_manifest_corruption,

@@ -4,16 +4,106 @@
 #include "CheckpointManifest.h"
 #include "WalFormat.h"
 
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace minidb {
+
+namespace detail {
+
+// A cross-thread completion may already be sitting in the owner EventLoop
+// queue when the manager is destroyed.  The queue owns that std::function, so
+// it cannot be cancelled; instead, both the worker and the owner share this
+// state and the callback becomes a no-op once destruction starts.
+struct PersistenceManagerCallbackState {
+    void run(std::function<void()> work) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping || owner == nullptr) {
+                return;
+            }
+            ++active_callbacks;
+        }
+        struct ActiveGuard {
+            PersistenceManagerCallbackState* state;
+            ~ActiveGuard() {
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    --state->active_callbacks;
+                }
+                state->condition.notify_all();
+            }
+        } guard{this};
+        work();
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> lock(mutex);
+        stopping = true;
+        owner = nullptr;
+    }
+
+    void wait_for_idle() {
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait(lock, [this]() { return active_callbacks == 0; });
+    }
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    PersistenceManager* owner = nullptr;
+    bool stopping = false;
+    std::size_t active_callbacks = 0;
+};
+
+} // namespace detail
+
 namespace {
+
+namespace fs = std::filesystem;
+
+// Crash-test seam for the asynchronous checkpoint path only.  A process test
+// can observe that the new RDB and parent directory are durable while the old
+// manifest is still authoritative, then SIGKILL the server.  Production never
+// sets these variables, so this is a no-op outside crash tests.
+void maybe_pause_after_checkpoint_rdb_publish() {
+    const char* marker_path = std::getenv("MINIDB_TEST_RDB_PUBLISH_MARKER");
+    if (marker_path == nullptr || *marker_path == '\0') {
+        return;
+    }
+    std::ofstream marker(marker_path, std::ios::trunc);
+    if (!marker.is_open()) {
+        return;
+    }
+    marker << "rdb-published\n";
+    marker.close();
+
+    const char* release_path = std::getenv("MINIDB_TEST_RDB_PUBLISH_RELEASE");
+    if (release_path == nullptr || *release_path == '\0') {
+        return;
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    std::error_code ec;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (fs::exists(release_path, ec) && !ec) {
+            return;
+        }
+        ec.clear();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
 
 const char* mutation_io_error = "persistence I/O failure";
 const char* group_commit_active_error =
@@ -75,6 +165,9 @@ PersistenceManager::PersistenceManager(
       wal_operations_(std::move(wal_operations)),
       rdb_operations_(std::move(rdb_operations)), limits_(limits),
       rdb_manager_(std::make_unique<RdbManager>(rdb_path_, rdb_operations_)) {
+    owner_callback_state_ =
+        std::make_shared<detail::PersistenceManagerCallbackState>();
+    owner_callback_state_->owner = this;
     if (!store_) {
         throw std::invalid_argument("PersistenceManager requires a KvStore");
     }
@@ -89,8 +182,15 @@ PersistenceManager::PersistenceManager(
 }
 
 PersistenceManager::~PersistenceManager() {
-    // The writer borrows WalManager.  Join it before member destruction so a
-    // queued mutation never observes a half-destroyed WAL.
+    // Stop accepting owner-loop callbacks first.  A checkpoint worker may have
+    // already queued its completion; that queued closure must not touch a
+    // half-destroyed manager.  Wait for a callback that already started, then
+    // join the worker before destroying the RDB manager or dispatcher.
+    if (owner_callback_state_) {
+        owner_callback_state_->stop();
+        owner_callback_state_->wait_for_idle();
+    }
+    join_checkpoint_worker();
     if (group_commit_writer_) {
         group_commit_writer_->stop();
         group_commit_writer_.reset();
@@ -471,8 +571,21 @@ bool PersistenceManager::ensure_group_commit_writer_locked(std::string* error) {
 
     std::shared_ptr<GroupCommitWriter> writer;
     try {
+        auto callback_state = owner_callback_state_;
+        auto raw_dispatch = owner_dispatch_;
+        GroupCommitWriter::OwnerDispatch guarded_dispatch =
+            [callback_state, raw_dispatch = std::move(raw_dispatch)](
+                std::function<void()> work) mutable {
+                if (!raw_dispatch || !work) {
+                    return;
+                }
+                raw_dispatch(
+                    [callback_state, work = std::move(work)]() mutable {
+                        callback_state->run(std::move(work));
+                    });
+            };
         writer = std::make_shared<GroupCommitWriter>(
-            wal_.get(), durability_mode_, owner_dispatch_,
+            wal_.get(), durability_mode_, std::move(guarded_dispatch),
             [this](GroupCommitCompletion completion) {
                 on_group_commit_completion(std::move(completion));
             });
@@ -527,7 +640,7 @@ MutationAdmission PersistenceManager::set_async(const std::string& key,
         return admission_fail(MutationAdmissionStatus::kShuttingDown,
                               "persistence is shutting down");
     }
-    if (!accepting_mutations_ || control_pending_) {
+    if (!accepting_mutations_) {
         return admission_fail(MutationAdmissionStatus::kNotReady,
                               "persistence admission is paused");
     }
@@ -572,7 +685,7 @@ MutationAdmission PersistenceManager::del_async(std::string key,
         return admission_fail(MutationAdmissionStatus::kShuttingDown,
                               "persistence is shutting down");
     }
-    if (!accepting_mutations_ || control_pending_) {
+    if (!accepting_mutations_) {
         return admission_fail(MutationAdmissionStatus::kNotReady,
                               "persistence admission is paused");
     }
@@ -613,7 +726,7 @@ PersistenceManager::expire_async(std::string key, std::int64_t ttl_ms,
         return admission_fail(MutationAdmissionStatus::kShuttingDown,
                               "persistence is shutting down");
     }
-    if (!accepting_mutations_ || control_pending_) {
+    if (!accepting_mutations_) {
         return admission_fail(MutationAdmissionStatus::kNotReady,
                               "persistence admission is paused");
     }
@@ -743,7 +856,7 @@ bool PersistenceManager::flush_interval_async(
         // fsync.  Preserve asynchronous completion without manufacturing a
         // WAL or manifest just because an INTERVAL timer tick fired.
         if (completion) {
-            owner_dispatch_([completion = std::move(completion)]() mutable {
+            dispatch_owner([completion = std::move(completion)]() mutable {
                 completion(true, {});
             });
         }
@@ -815,7 +928,7 @@ bool PersistenceManager::start_checkpoint_locked(
         }
         return false;
     }
-    if (control_pending_) {
+    if (checkpoint_operation_) {
         if (error != nullptr) {
             *error = "another persistence control operation is in progress";
         }
@@ -830,6 +943,12 @@ bool PersistenceManager::start_checkpoint_locked(
     if (!shutdown && shutdown_requested_) {
         if (error != nullptr) {
             *error = "persistence is shutting down";
+        }
+        return false;
+    }
+    if (checkpoint_worker_.joinable()) {
+        if (error != nullptr) {
+            *error = "previous checkpoint worker has not been joined";
         }
         return false;
     }
@@ -848,10 +967,11 @@ bool PersistenceManager::start_checkpoint_locked(
     operation->started_us = steady_now_us();
     checkpoint_operation_ = std::move(operation);
     control_pending_ = true;
-    accepting_mutations_ = false;
     if (shutdown) {
         shutdown_requested_ = true;
     }
+    pause_checkpoint_admission_locked(steady_now_us());
+    stats_.background_checkpoint_state = BackgroundCheckpointState::kCapture;
 
     const GroupCommitWriterState state = group_commit_writer_->state();
     std::string control_error;
@@ -863,6 +983,7 @@ bool PersistenceManager::start_checkpoint_locked(
             },
             &control_error);
     } else if (state == GroupCommitWriterState::kPaused) {
+        checkpoint_operation_->phase = CheckpointPhase::kRotate;
         requested = group_commit_writer_->request_rotate(
             [this](const GroupCommitWalBarrierInfo& info) {
                 on_checkpoint_rotated(info);
@@ -873,14 +994,18 @@ bool PersistenceManager::start_checkpoint_locked(
     }
 
     if (!requested) {
+        resume_checkpoint_admission_locked(steady_now_us());
         checkpoint_operation_.reset();
         control_pending_ = false;
         if (shutdown) {
             shutdown_requested_ = false;
         }
-        if (state == GroupCommitWriterState::kRunning) {
+        if (state == GroupCommitWriterState::kRunning && !failed_) {
             accepting_mutations_ = true;
         }
+        stats_.background_checkpoint_state =
+            failed_ ? BackgroundCheckpointState::kFailed
+                    : BackgroundCheckpointState::kIdle;
         if (error != nullptr) {
             *error = control_error;
         }
@@ -889,9 +1014,37 @@ bool PersistenceManager::start_checkpoint_locked(
     return true;
 }
 
+void PersistenceManager::pause_checkpoint_admission_locked(
+    std::uint64_t now_us) {
+    accepting_mutations_ = false;
+    if (checkpoint_operation_ &&
+        checkpoint_operation_->admission_blocked_started_us == 0) {
+        checkpoint_operation_->admission_blocked_started_us = now_us;
+    }
+}
+
+void PersistenceManager::resume_checkpoint_admission_locked(
+    std::uint64_t now_us) {
+    if (!checkpoint_operation_ ||
+        checkpoint_operation_->admission_blocked_started_us == 0) {
+        return;
+    }
+    const std::uint64_t started_us =
+        checkpoint_operation_->admission_blocked_started_us;
+    checkpoint_operation_->admission_blocked_started_us = 0;
+    if (now_us >= started_us) {
+        const std::uint64_t elapsed_us = now_us - started_us;
+        observe_timing(elapsed_us,
+                       &stats_.checkpoint_admission_blocked_total_us,
+                       &stats_.checkpoint_admission_blocked_max_us);
+        add_saturated(&stats_.checkpoint_pause_us, elapsed_us);
+    }
+}
+
 void PersistenceManager::on_checkpoint_paused(bool success,
                                               const std::string& error) {
     bool finish_now = false;
+    RdbSaveResult result = RdbSaveResult::Failed;
     std::string finish_error;
     {
         std::lock_guard<std::mutex> lock(operation_mutex_);
@@ -909,7 +1062,7 @@ void PersistenceManager::on_checkpoint_paused(bool success,
             finish_error =
                 "checkpoint paused before all mutations were applied";
         } else {
-            checkpoint_operation_->paused_us = steady_now_us();
+            checkpoint_operation_->phase = CheckpointPhase::kRotate;
             std::string rotate_error;
             if (!group_commit_writer_->request_rotate(
                     [this](const GroupCommitWalBarrierInfo& info) {
@@ -923,110 +1076,370 @@ void PersistenceManager::on_checkpoint_paused(bool success,
         }
     }
     if (finish_now) {
-        finish_checkpoint(RdbSaveResult::Failed, finish_error);
+        finish_checkpoint(result, finish_error);
     }
 }
 
 void PersistenceManager::on_checkpoint_rotated(
     const GroupCommitWalBarrierInfo& info) {
-    bool finish_now = true;
-    bool wait_for_cleanup = false;
-    bool resume_after_failure = false;
+    bool finish_now = false;
     RdbSaveResult result = RdbSaveResult::Failed;
     std::string finish_error;
-
-    if (!info.success) {
-        std::lock_guard<std::mutex> lock(operation_mutex_);
-        mark_failed();
-        finish_error = info.error.empty() ? "group commit rotate barrier failed"
-                                          : info.error;
-    } else {
+    {
         std::lock_guard<std::mutex> lock(operation_mutex_);
         if (!checkpoint_operation_) {
             return;
         }
-
-        const std::uint64_t checkpoint_lsn =
-            info.next_lsn == 0 ? 0 : info.next_lsn - 1;
-        if (info.next_lsn == 0 || checkpoint_lsn != last_lsn_) {
+        if (!info.success) {
             mark_failed();
-            finish_error = "checkpoint rotate LSN does not match applied LSN";
-        } else if (info.active_segment_start_lsn != checkpoint_lsn + 1) {
-            mark_failed();
-            finish_error =
-                "active WAL segment does not begin after checkpoint LSN";
+            finish_now = true;
+            finish_error = info.error.empty()
+                               ? "group commit rotate barrier failed"
+                               : info.error;
         } else {
-            KvStore::ScannerPause scanner_pause = store_->pause_scanner();
-            const RdbSaveResult save_result =
-                rdb_manager_->save_checked(*store_, scanner_pause);
-            if (save_result != RdbSaveResult::Ok) {
-                result = save_result;
+            const std::uint64_t checkpoint_lsn =
+                info.next_lsn == 0 ? 0 : info.next_lsn - 1;
+            if (info.next_lsn == 0 || checkpoint_lsn != last_lsn_) {
+                mark_failed();
+                finish_now = true;
                 finish_error =
-                    save_result == RdbSaveResult::DurabilityUnconfirmed
-                        ? "checkpoint snapshot durability is unconfirmed"
-                        : "failed to publish checkpoint snapshot";
-                if (save_result == RdbSaveResult::DurabilityUnconfirmed) {
-                    mark_failed();
-                } else if (!checkpoint_operation_->shutdown) {
-                    resume_after_failure = true;
-                }
+                    "checkpoint rotate LSN does not match applied LSN";
+            } else if (info.active_segment_start_lsn != checkpoint_lsn + 1) {
+                mark_failed();
+                finish_now = true;
+                finish_error =
+                    "active WAL segment does not begin after checkpoint LSN";
             } else {
-                CheckpointManifest manifest;
-                manifest.checkpoint_lsn = checkpoint_lsn;
-                manifest.retained_segment_starts.push_back(
-                    info.active_segment_start_lsn);
-                std::string manifest_error;
-                const ManifestWriteResult manifest_result =
-                    write_manifest_atomic(manifest_path_, manifest,
-                                          wal_operations_.get(),
-                                          &manifest_error);
-                if (manifest_result != ManifestWriteResult::kOk) {
-                    finish_error = manifest_error.empty()
-                                       ? "failed to publish checkpoint manifest"
-                                       : manifest_error;
-                    if (manifest_result ==
-                        ManifestWriteResult::kDurabilityUnconfirmed) {
+                RdbSnapshot snapshot;
+                std::string capture_error;
+                const std::uint64_t capture_started_us = steady_now_us();
+                const bool captured =
+                    rdb_manager_->capture(*store_, &snapshot, &capture_error);
+                const std::uint64_t capture_finished_us = steady_now_us();
+                checkpoint_operation_->capture_us =
+                    capture_finished_us >= capture_started_us
+                        ? capture_finished_us - capture_started_us
+                        : 0;
+                if (!captured) {
+                    finish_now = true;
+                    finish_error = capture_error.empty()
+                                       ? "failed to capture checkpoint snapshot"
+                                       : capture_error;
+                    // The existing RDB, manifest and WAL remain untouched.
+                    // Resume normal admissions before reporting the failure.
+                    std::string resume_error;
+                    if (!group_commit_writer_->resume(&resume_error)) {
                         mark_failed();
-                        result = RdbSaveResult::DurabilityUnconfirmed;
-                    } else {
-                        result = RdbSaveResult::Failed;
-                        if (!checkpoint_operation_->shutdown) {
-                            resume_after_failure = true;
-                        }
+                        finish_error +=
+                            "; group commit could not resume: " + resume_error;
                     }
                 } else {
-                    std::string cleanup_error;
-                    if (group_commit_writer_->request_cleanup(
-                            [this](bool cleanup_success,
-                                   const std::string& error) {
-                                on_checkpoint_cleanup(cleanup_success, error);
-                            },
-                            &cleanup_error)) {
-                        // The manifest is durable.  Keep the owner paused
-                        // until cleanup reports completion.
-                        wait_for_cleanup = true;
-                    } else {
-                        // A checkpoint is already durable.  Leaving the writer
-                        // paused lets the next SAVE retry cleanup without
-                        // publishing an unsafe manifest.
-                        result = RdbSaveResult::Ok;
-                    }
-                }
-            }
+                    checkpoint_operation_->checkpoint_lsn = checkpoint_lsn;
+                    checkpoint_operation_->phase = CheckpointPhase::kWriting;
+                    stats_.background_checkpoint_state =
+                        BackgroundCheckpointState::kWriting;
 
-            if (resume_after_failure) {
-                std::string resume_error;
-                if (!group_commit_writer_->resume(&resume_error)) {
-                    mark_failed();
-                    result = RdbSaveResult::Failed;
-                    finish_error =
-                        "could not resume after checkpoint failure: " +
-                        resume_error;
+                    std::string resume_error;
+                    if (!group_commit_writer_->resume(&resume_error)) {
+                        mark_failed();
+                        finish_now = true;
+                        finish_error = "captured snapshot but group commit "
+                                       "could not resume: " +
+                                       resume_error;
+                    } else {
+                        // The snapshot is independent of the live store.  Only
+                        // this short handoff remains inside the admission cut;
+                        // serialization and durable I/O run on the worker.
+                        resume_checkpoint_admission_locked(steady_now_us());
+                        accepting_mutations_ = true;
+                    }
+
+                    if (!finish_now) {
+                        try {
+                            CheckpointJob job;
+                            job.snapshot = std::move(snapshot);
+                            checkpoint_worker_ = std::thread([this,
+                                                              job = std::move(
+                                                                  job)]() mutable {
+                                std::vector<std::uint8_t> image;
+                                RdbSaveTimings timings;
+                                std::string serialize_error;
+                                RdbSaveResult write_result =
+                                    RdbSaveResult::Failed;
+                                std::string write_error;
+                                if (!rdb_manager_->serialize(
+                                        job.snapshot, &image, &timings,
+                                        &serialize_error)) {
+                                    write_error =
+                                        serialize_error.empty()
+                                            ? "RDB serialization failed"
+                                            : serialize_error;
+                                } else {
+                                    write_result = rdb_manager_->write_durable(
+                                        image, &timings, &write_error);
+                                    if (write_result == RdbSaveResult::Ok) {
+                                        maybe_pause_after_checkpoint_rdb_publish();
+                                    }
+                                    if (write_result != RdbSaveResult::Ok &&
+                                        write_error.empty()) {
+                                        write_error =
+                                            write_result ==
+                                                    RdbSaveResult::
+                                                        DurabilityUnconfirmed
+                                                ? "checkpoint snapshot "
+                                                  "durability is "
+                                                  "unconfirmed"
+                                                : "failed to publish "
+                                                  "checkpoint snapshot";
+                                    }
+                                }
+                                try {
+                                    dispatch_owner([this, write_result,
+                                                    write_error =
+                                                        std::move(write_error),
+                                                    timings]() mutable {
+                                        on_checkpoint_written(
+                                            write_result, write_error,
+                                            timings.serialize_us,
+                                            timings.write_us, timings.fsync_us);
+                                    });
+                                } catch (const std::exception& ex) {
+                                    Log::Error(
+                                        std::string("checkpoint completion "
+                                                    "dispatch failed: ") +
+                                        ex.what());
+                                } catch (...) {
+                                    Log::Error("checkpoint completion "
+                                               "dispatch failed");
+                                }
+                            });
+                        } catch (const std::exception& ex) {
+                            mark_failed();
+                            finish_now = true;
+                            finish_error =
+                                std::string(
+                                    "failed to start checkpoint worker: ") +
+                                ex.what();
+                        } catch (...) {
+                            mark_failed();
+                            finish_now = true;
+                            finish_error = "failed to start checkpoint worker";
+                        }
+                    }
                 }
             }
         }
     }
+    if (finish_now) {
+        finish_checkpoint(result, finish_error);
+    }
+}
 
+void PersistenceManager::on_checkpoint_written(RdbSaveResult result,
+                                               const std::string& error,
+                                               std::uint64_t serialize_us,
+                                               std::uint64_t write_us,
+                                               std::uint64_t fsync_us) {
+    join_checkpoint_worker();
+    bool finish_now = false;
+    bool finalize_immediately = false;
+    std::string finish_error = error;
+    {
+        std::lock_guard<std::mutex> lock(operation_mutex_);
+        if (!checkpoint_operation_) {
+            return;
+        }
+        if (checkpoint_operation_->phase != CheckpointPhase::kWriting) {
+            mark_failed();
+            finish_now = true;
+            finish_error = "checkpoint worker completed in the wrong phase";
+        } else {
+            checkpoint_operation_->serialize_us = serialize_us;
+            checkpoint_operation_->write_us = write_us;
+            checkpoint_operation_->fsync_us = fsync_us;
+            if (result != RdbSaveResult::Ok) {
+                finish_now = true;
+                if (result == RdbSaveResult::DurabilityUnconfirmed) {
+                    mark_failed();
+                } else {
+                    if (finish_error.empty()) {
+                        finish_error = "failed to publish checkpoint snapshot";
+                    }
+                    if (!checkpoint_operation_->shutdown &&
+                        group_commit_writer_->state() ==
+                            GroupCommitWriterState::kPaused) {
+                        std::string resume_error;
+                        if (!group_commit_writer_->resume(&resume_error)) {
+                            mark_failed();
+                            finish_error +=
+                                "; group commit could not resume: " +
+                                resume_error;
+                        }
+                    }
+                }
+            } else {
+                checkpoint_operation_->phase = CheckpointPhase::kFinalPause;
+                stats_.background_checkpoint_state =
+                    BackgroundCheckpointState::kFinalizing;
+                // Cut admission again before draining writes that arrived
+                // while the snapshot was being serialized and written.
+                pause_checkpoint_admission_locked(steady_now_us());
+                const GroupCommitWriterState state =
+                    group_commit_writer_->state();
+                if (state == GroupCommitWriterState::kRunning) {
+                    std::string pause_error;
+                    if (!group_commit_writer_->request_pause(
+                            [this](bool success,
+                                   const std::string& barrier_error) {
+                                on_checkpoint_final_paused(success,
+                                                           barrier_error);
+                            },
+                            &pause_error)) {
+                        mark_failed();
+                        finish_now = true;
+                        finish_error = pause_error;
+                    }
+                } else if (state == GroupCommitWriterState::kPaused &&
+                           pending_mutations_.empty()) {
+                    finalize_immediately = true;
+                } else {
+                    mark_failed();
+                    finish_now = true;
+                    finish_error = "group commit writer is not available for "
+                                   "checkpoint finalization";
+                }
+            }
+        }
+    }
+    if (finalize_immediately) {
+        on_checkpoint_final_paused(true, {});
+        return;
+    }
+    if (finish_now) {
+        finish_checkpoint(result, finish_error);
+    }
+}
+
+void PersistenceManager::on_checkpoint_final_paused(bool success,
+                                                    const std::string& error) {
+    bool finish_now = false;
+    bool wait_for_cleanup = false;
+    RdbSaveResult result = RdbSaveResult::Failed;
+    std::string finish_error;
+    {
+        std::lock_guard<std::mutex> lock(operation_mutex_);
+        if (!checkpoint_operation_) {
+            return;
+        }
+        if (!success) {
+            mark_failed();
+            finish_now = true;
+            finish_error =
+                error.empty() ? "checkpoint final pause barrier failed" : error;
+        } else if (!pending_mutations_.empty()) {
+            mark_failed();
+            finish_now = true;
+            finish_error =
+                "checkpoint final pause completed before all mutations applied";
+        } else {
+            checkpoint_operation_->phase = CheckpointPhase::kPublish;
+            const GroupCommitWalSnapshot wal_snapshot =
+                group_commit_writer_->wal_snapshot();
+            std::vector<std::uint64_t> retained;
+            const std::uint64_t first_required =
+                checkpoint_operation_->checkpoint_lsn + 1;
+            const auto first = std::lower_bound(
+                wal_snapshot.live_segment_starts.begin(),
+                wal_snapshot.live_segment_starts.end(), first_required);
+            if (first == wal_snapshot.live_segment_starts.end() ||
+                *first != first_required) {
+                mark_failed();
+                finish_now = true;
+                finish_error = "retained WAL does not begin immediately after "
+                               "checkpoint LSN";
+            } else {
+                retained.assign(first, wal_snapshot.live_segment_starts.end());
+                for (std::size_t index = 1; index < retained.size(); ++index) {
+                    if (retained[index] <= retained[index - 1]) {
+                        mark_failed();
+                        finish_now = true;
+                        finish_error =
+                            "retained WAL segment list is not strictly ordered";
+                        break;
+                    }
+                }
+                if (!finish_now) {
+                    checkpoint_operation_->first_retained_start_lsn =
+                        retained.front();
+                    CheckpointManifest manifest;
+                    manifest.checkpoint_lsn =
+                        checkpoint_operation_->checkpoint_lsn;
+                    manifest.retained_segment_starts = retained;
+                    std::string manifest_error;
+                    const std::uint64_t manifest_started_us = steady_now_us();
+                    const ManifestWriteResult manifest_result =
+                        write_manifest_atomic(manifest_path_, manifest,
+                                              wal_operations_.get(),
+                                              &manifest_error);
+                    const std::uint64_t manifest_finished_us = steady_now_us();
+                    checkpoint_operation_->manifest_us =
+                        manifest_finished_us >= manifest_started_us
+                            ? manifest_finished_us - manifest_started_us
+                            : 0;
+                    if (manifest_result != ManifestWriteResult::kOk) {
+                        finish_now = true;
+                        finish_error =
+                            manifest_error.empty()
+                                ? "failed to publish checkpoint manifest"
+                                : manifest_error;
+                        if (manifest_result ==
+                            ManifestWriteResult::kDurabilityUnconfirmed) {
+                            mark_failed();
+                            result = RdbSaveResult::DurabilityUnconfirmed;
+                        } else {
+                            result = RdbSaveResult::Failed;
+                            std::string resume_error;
+                            if (!group_commit_writer_->resume(&resume_error)) {
+                                mark_failed();
+                                finish_error +=
+                                    "; group commit could not resume: " +
+                                    resume_error;
+                            }
+                        }
+                    } else {
+                        checkpoint_operation_->phase =
+                            CheckpointPhase::kCleanup;
+                        stats_.background_checkpoint_state =
+                            BackgroundCheckpointState::kCleanup;
+                        std::string cleanup_schedule_error;
+                        checkpoint_operation_->cleanup_started_us =
+                            steady_now_us();
+                        checkpoint_operation_->cleanup_started = true;
+                        if (group_commit_writer_->request_cleanup(
+                                retained.front(),
+                                [this](bool cleanup_success,
+                                       const std::string& cleanup_error) {
+                                    on_checkpoint_cleanup(cleanup_success,
+                                                          cleanup_error);
+                                },
+                                &cleanup_schedule_error)) {
+                            wait_for_cleanup = true;
+                        } else {
+                            // The manifest is already durable, so the
+                            // checkpoint itself succeeded.  Keep the writer
+                            // paused for the same retry contract as a cleanup
+                            // I/O failure.
+                            checkpoint_operation_->cleanup_started = false;
+                            checkpoint_operation_->cleanup_us = 0;
+                            result = RdbSaveResult::Ok;
+                            finish_now = true;
+                            finish_error.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (wait_for_cleanup) {
         return;
     }
@@ -1036,7 +1449,7 @@ void PersistenceManager::on_checkpoint_rotated(
 }
 
 void PersistenceManager::on_checkpoint_cleanup(bool success,
-                                               const std::string&) {
+                                               const std::string& error) {
     bool finish_now = true;
     RdbSaveResult result = RdbSaveResult::Ok;
     std::string finish_error;
@@ -1045,19 +1458,32 @@ void PersistenceManager::on_checkpoint_cleanup(bool success,
         if (!checkpoint_operation_) {
             return;
         }
-        if (success && !checkpoint_operation_->shutdown) {
-            std::string resume_error;
-            if (!group_commit_writer_->resume(&resume_error)) {
-                mark_failed();
-                result = RdbSaveResult::Failed;
-                finish_error =
-                    "cleanup completed but group commit could not resume: " +
-                    resume_error;
+        if (checkpoint_operation_->cleanup_started) {
+            const std::uint64_t now = steady_now_us();
+            checkpoint_operation_->cleanup_us =
+                now >= checkpoint_operation_->cleanup_started_us
+                    ? now - checkpoint_operation_->cleanup_started_us
+                    : 0;
+            checkpoint_operation_->cleanup_started = false;
+        }
+        if (success) {
+            if (!checkpoint_operation_->shutdown) {
+                std::string resume_error;
+                if (!group_commit_writer_->resume(&resume_error)) {
+                    mark_failed();
+                    result = RdbSaveResult::Failed;
+                    finish_error = "cleanup completed but group commit could "
+                                   "not resume: " +
+                                   resume_error;
+                }
             }
-        } else if (!success) {
+        } else {
             // Manifest publication already made this checkpoint durable.
             // Residue is harmless; leave the writer paused so a later SAVE
-            // retries cleanup.
+            // retries prefix cleanup without reusing an unsafe boundary.
+            Log::Error("checkpoint WAL cleanup failed: " +
+                       (error.empty() ? std::string("unknown error") : error));
+            finish_error.clear();
         }
     }
     if (finish_now) {
@@ -1065,34 +1491,97 @@ void PersistenceManager::on_checkpoint_cleanup(bool success,
     }
 }
 
+void PersistenceManager::join_checkpoint_worker() {
+    if (checkpoint_worker_.joinable()) {
+        checkpoint_worker_.join();
+    }
+}
+
+void PersistenceManager::dispatch_owner(std::function<void()> work) {
+    if (!work || !owner_dispatch_ || !owner_callback_state_) {
+        return;
+    }
+    auto callback_state = owner_callback_state_;
+    owner_dispatch_([callback_state, work = std::move(work)]() mutable {
+        callback_state->run(std::move(work));
+    });
+}
+
 void PersistenceManager::finish_checkpoint(RdbSaveResult result,
                                            const std::string& error) {
+    join_checkpoint_worker();
     CheckpointCompletion completion;
     bool shutdown = false;
-    std::uint64_t pause_us = 0;
+    std::uint64_t admission_blocked_us = 0;
+    std::uint64_t capture_us = 0;
+    std::uint64_t serialize_us = 0;
+    std::uint64_t write_us = 0;
+    std::uint64_t fsync_us = 0;
+    std::uint64_t manifest_us = 0;
+    std::uint64_t cleanup_us = 0;
+    bool measure_save_latency = false;
     {
         std::lock_guard<std::mutex> lock(operation_mutex_);
         if (!checkpoint_operation_) {
             return;
         }
+        const std::uint64_t now = steady_now_us();
+        if (checkpoint_operation_->admission_blocked_started_us != 0) {
+            const std::uint64_t started =
+                checkpoint_operation_->admission_blocked_started_us;
+            if (now >= started) {
+                admission_blocked_us = now - started;
+                observe_timing(admission_blocked_us,
+                               &stats_.checkpoint_admission_blocked_total_us,
+                               &stats_.checkpoint_admission_blocked_max_us);
+                add_saturated(&stats_.checkpoint_pause_us,
+                              admission_blocked_us);
+            }
+            checkpoint_operation_->admission_blocked_started_us = 0;
+        }
+        capture_us = checkpoint_operation_->capture_us;
+        serialize_us = checkpoint_operation_->serialize_us;
+        write_us = checkpoint_operation_->write_us;
+        fsync_us = checkpoint_operation_->fsync_us;
+        manifest_us = checkpoint_operation_->manifest_us;
+        cleanup_us = checkpoint_operation_->cleanup_us;
         completion = std::move(checkpoint_operation_->completion);
         shutdown = checkpoint_operation_->shutdown;
-        const std::uint64_t paused_us = checkpoint_operation_->paused_us;
-        if (paused_us != 0) {
-            const std::uint64_t now = steady_now_us();
-            if (now >= paused_us) {
-                pause_us = now - paused_us;
+        measure_save_latency = !shutdown;
+        if (result == RdbSaveResult::Ok) {
+            ++stats_.checkpoints;
+            observe_timing(capture_us,
+                           &stats_.checkpoint_snapshot_capture_total_us,
+                           &stats_.checkpoint_snapshot_capture_max_us);
+            observe_timing(serialize_us,
+                           &stats_.checkpoint_snapshot_serialize_total_us,
+                           &stats_.checkpoint_snapshot_serialize_max_us);
+            observe_timing(write_us, &stats_.checkpoint_snapshot_write_total_us,
+                           &stats_.checkpoint_snapshot_write_max_us);
+            observe_timing(fsync_us, &stats_.checkpoint_snapshot_fsync_total_us,
+                           &stats_.checkpoint_snapshot_fsync_max_us);
+            add_saturated(&stats_.checkpoint_manifest_total_us, manifest_us);
+            add_saturated(&stats_.checkpoint_wal_cleanup_total_us, cleanup_us);
+            if (now >= checkpoint_operation_->started_us) {
+                observe_timing(now - checkpoint_operation_->started_us,
+                               &stats_.checkpoint_total_us,
+                               &stats_.checkpoint_max_us);
+                if (measure_save_latency) {
+                    observe_timing(now - checkpoint_operation_->started_us,
+                                   &stats_.save_client_latency_total_us,
+                                   &stats_.save_client_latency_max_us);
+                }
             }
+        } else {
+            ++stats_.checkpoint_failures;
         }
         checkpoint_operation_.reset();
         control_pending_ = false;
-        if (result == RdbSaveResult::Ok) {
-            ++stats_.checkpoints;
-            add_saturated(&stats_.checkpoint_pause_us, pause_us);
-        }
-        if (!shutdown && group_commit_writer_ &&
-            group_commit_writer_->state() == GroupCommitWriterState::kRunning &&
-            !failed_) {
+        stats_.background_checkpoint_state =
+            failed_ ? BackgroundCheckpointState::kFailed
+                    : BackgroundCheckpointState::kIdle;
+        if (!shutdown && !failed_ && group_commit_writer_ &&
+            group_commit_writer_->state() == GroupCommitWriterState::kRunning) {
             accepting_mutations_ = true;
         } else {
             accepting_mutations_ = false;
@@ -1111,6 +1600,9 @@ void PersistenceManager::finish_checkpoint(RdbSaveResult result,
         std::lock_guard<std::mutex> lock(operation_mutex_);
         shutdown_complete_ = true;
         accepting_mutations_ = false;
+        stats_.background_checkpoint_state =
+            failed_ ? BackgroundCheckpointState::kFailed
+                    : BackgroundCheckpointState::kIdle;
     }
 
     if (completion) {
@@ -1446,6 +1938,25 @@ PersistenceSnapshot PersistenceManager::snapshot() const {
         result.group_commit = GroupCommitStats{};
     }
     return result;
+}
+
+const char*
+background_checkpoint_state_name(BackgroundCheckpointState state) noexcept {
+    switch (state) {
+    case BackgroundCheckpointState::kIdle:
+        return "idle";
+    case BackgroundCheckpointState::kCapture:
+        return "capture";
+    case BackgroundCheckpointState::kWriting:
+        return "writing";
+    case BackgroundCheckpointState::kFinalizing:
+        return "finalizing";
+    case BackgroundCheckpointState::kCleanup:
+        return "cleanup";
+    case BackgroundCheckpointState::kFailed:
+        return "failed";
+    }
+    return "unknown";
 }
 
 const char* mutation_status_name(MutationStatus status) {

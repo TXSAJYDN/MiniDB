@@ -13,6 +13,7 @@ They are not a production SLA or a capacity claim.
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import platform
@@ -457,7 +458,107 @@ def kill_hard(server):
     server.log_file.close()
 
 
+def _checkpoint_metrics(stats_before, stats_after, save_client_us):
+    try:
+        before = stats_before["persistence"]
+        after = stats_after["persistence"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError(
+            "STATS is missing R4-B checkpoint metrics; rebuild the KV server"
+        ) from error
+
+    total_fields = (
+        "checkpoint_admission_blocked_total_us",
+        "checkpoint_snapshot_capture_total_us",
+        "checkpoint_snapshot_serialize_total_us",
+        "checkpoint_snapshot_write_total_us",
+        "checkpoint_snapshot_fsync_total_us",
+        "checkpoint_manifest_total_us",
+        "checkpoint_wal_cleanup_total_us",
+        "checkpoint_total_us",
+        "save_client_latency_total_us",
+        "checkpoint_failures",
+    )
+    max_fields = (
+        "checkpoint_admission_blocked_max_us",
+        "checkpoint_snapshot_capture_max_us",
+        "checkpoint_snapshot_serialize_max_us",
+        "checkpoint_snapshot_write_max_us",
+        "checkpoint_snapshot_fsync_max_us",
+        "checkpoint_max_us",
+        "save_client_latency_max_us",
+    )
+    for name in total_fields + max_fields:
+        if name not in before or name not in after:
+            raise RuntimeError(f"persistence.{name} is missing")
+        for label, value in (("before", before[name]), ("after", after[name])):
+            if type(value) is not int or value < 0:
+                raise RuntimeError(
+                    f"persistence.{name} is invalid {label}: {value!r}")
+
+    deltas = {name: _delta(after[name], before[name])
+              for name in total_fields}
+    if deltas["checkpoint_failures"] != 0:
+        raise RuntimeError(
+            f"checkpoint failed during probe: {deltas['checkpoint_failures']}")
+    if deltas["checkpoint_total_us"] <= 0:
+        raise RuntimeError("checkpoint completion timing was not recorded")
+    state = after.get("background_checkpoint_state")
+    if state != "idle":
+        raise RuntimeError(f"checkpoint state is not idle after SAVE: {state!r}")
+
+    compatibility_delta = _delta(
+        after["checkpoint_pause_us"], before["checkpoint_pause_us"])
+    if compatibility_delta != deltas["checkpoint_admission_blocked_total_us"]:
+        raise RuntimeError(
+            "checkpoint_pause_us does not match admission-blocked total")
+
+    phase_work_us = sum(deltas[name] for name in (
+        "checkpoint_snapshot_capture_total_us",
+        "checkpoint_snapshot_serialize_total_us",
+        "checkpoint_snapshot_write_total_us",
+        "checkpoint_snapshot_fsync_total_us",
+        "checkpoint_manifest_total_us",
+        "checkpoint_wal_cleanup_total_us",
+    ))
+    total_us = deltas["checkpoint_total_us"]
+    if phase_work_us > total_us:
+        raise RuntimeError(
+            f"checkpoint phase timings exceed total: {phase_work_us} > {total_us}")
+
+    return {
+        "save_client_us": round(save_client_us, 3),
+        "admission_blocked_us": deltas[
+            "checkpoint_admission_blocked_total_us"],
+        "snapshot_capture_us": deltas[
+            "checkpoint_snapshot_capture_total_us"],
+        "snapshot_serialize_us": deltas[
+            "checkpoint_snapshot_serialize_total_us"],
+        "snapshot_write_us": deltas[
+            "checkpoint_snapshot_write_total_us"],
+        "snapshot_fsync_us": deltas[
+            "checkpoint_snapshot_fsync_total_us"],
+        "manifest_us": deltas["checkpoint_manifest_total_us"],
+        "wal_cleanup_us": deltas["checkpoint_wal_cleanup_total_us"],
+        "checkpoint_total_us": total_us,
+        "phase_work_us": phase_work_us,
+        "unattributed_us": total_us - phase_work_us,
+        "admission_blocked_max_us":
+            after["checkpoint_admission_blocked_max_us"],
+        "snapshot_capture_max_us": after["checkpoint_snapshot_capture_max_us"],
+        "snapshot_serialize_max_us":
+            after["checkpoint_snapshot_serialize_max_us"],
+        "snapshot_write_max_us": after["checkpoint_snapshot_write_max_us"],
+        "snapshot_fsync_max_us": after["checkpoint_snapshot_fsync_max_us"],
+        "checkpoint_max_us": after["checkpoint_max_us"],
+        "save_client_latency_max_us": after["save_client_latency_max_us"],
+        "checkpoint_failures": deltas["checkpoint_failures"],
+        "background_checkpoint_state": state,
+    }
+
+
 def measure_checkpoint(port):
+    stats_before = read_stats(port)
     began = time.perf_counter_ns()
     with connect_kv(port) as sock:
         sock.sendall(kv_encode(KV_SAVE, []))
@@ -465,7 +566,8 @@ def measure_checkpoint(port):
     elapsed_us = (time.perf_counter_ns() - began) / 1000.0
     if command_type != KV_OK:
         raise RuntimeError(f"SAVE returned {command_type}")
-    return elapsed_us
+    stats_after = read_stats(port)
+    return elapsed_us, _checkpoint_metrics(stats_before, stats_after, elapsed_us)
 
 
 def run_round(kv_binary, durability_mode, client_count, workload, dataset,
@@ -591,12 +693,12 @@ def run_round(kv_binary, durability_mode, client_count, workload, dataset,
         recovery_stats = read_stats(recovery_port)
         sample["recovery_seconds"] = round(recovery_seconds, 6)
         sample["recovery"] = recovery_stats["recovery"]
-        sample["checkpoint_save_us"] = round(
-            measure_checkpoint(recovery_port), 3)
-        stats_checkpoint = read_stats(recovery_port)
-        sample["checkpoint_pause_us"] = max(
-            0, stats_checkpoint["persistence"]["checkpoint_pause_us"] -
-            recovery_stats["persistence"]["checkpoint_pause_us"])
+        checkpoint_save_us, checkpoint_metrics = measure_checkpoint(
+            recovery_port)
+        sample["checkpoint_save_us"] = round(checkpoint_save_us, 3)
+        sample["checkpoint_pause_us"] = checkpoint_metrics[
+            "admission_blocked_us"]
+        sample["checkpoint"] = checkpoint_metrics
         shutdown_result = recovery_server.stop()
         recovery_server = None
         if shutdown_result != 0:
@@ -634,6 +736,45 @@ def _pool_buckets(rounds):
             for bound, count in zip(bounds, counts)]
 
 
+def _checkpoint_summary(rounds):
+    checkpoints = [item["checkpoint"] for item in rounds]
+
+    def median(field):
+        return _median([item[field] for item in checkpoints])
+
+    return {
+        "save_client_us_median": median("save_client_us"),
+        "admission_blocked_us_median": median("admission_blocked_us"),
+        "snapshot_capture_us_median": median("snapshot_capture_us"),
+        "snapshot_serialize_us_median": median("snapshot_serialize_us"),
+        "snapshot_write_us_median": median("snapshot_write_us"),
+        "snapshot_fsync_us_median": median("snapshot_fsync_us"),
+        "manifest_us_median": median("manifest_us"),
+        "wal_cleanup_us_median": median("wal_cleanup_us"),
+        "phase_work_us_median": median("phase_work_us"),
+        "checkpoint_total_us_median": median("checkpoint_total_us"),
+        "unattributed_us_median": median("unattributed_us"),
+        "admission_blocked_max_us_max_observed": max(
+            item["admission_blocked_max_us"] for item in checkpoints),
+        "snapshot_capture_max_us_max_observed": max(
+            item["snapshot_capture_max_us"] for item in checkpoints),
+        "snapshot_serialize_max_us_max_observed": max(
+            item["snapshot_serialize_max_us"] for item in checkpoints),
+        "snapshot_write_max_us_max_observed": max(
+            item["snapshot_write_max_us"] for item in checkpoints),
+        "snapshot_fsync_max_us_max_observed": max(
+            item["snapshot_fsync_max_us"] for item in checkpoints),
+        "checkpoint_max_us_max_observed": max(
+            item["checkpoint_max_us"] for item in checkpoints),
+        "save_client_latency_max_us_max_observed": max(
+            item["save_client_latency_max_us"] for item in checkpoints),
+        "failures_total": sum(
+            item["checkpoint_failures"] for item in checkpoints),
+        "background_state_after_each_save": [
+            item["background_checkpoint_state"] for item in checkpoints],
+    }
+
+
 def aggregate_configuration(mode, client_count, workload, rounds):
     pooled_latencies = []
     for item in rounds:
@@ -661,6 +802,7 @@ def aggregate_configuration(mode, client_count, workload, rounds):
             "write_amplification": item["write_amplification"],
             "checkpoint_save_us": item["checkpoint_save_us"],
             "checkpoint_pause_us": item["checkpoint_pause_us"],
+            "checkpoint": item["checkpoint"],
             "recovery_seconds": item["recovery_seconds"],
             "recovery": item["recovery"],
         })
@@ -736,10 +878,19 @@ def aggregate_configuration(mode, client_count, workload, rounds):
             [item["checkpoint_save_us"] for item in rounds]),
         "checkpoint_pause_us_median": _median(
             [item["checkpoint_pause_us"] for item in rounds]),
+        "checkpoint": _checkpoint_summary(rounds),
         "recovery_seconds_median": _median(
             [item["recovery_seconds"] for item in rounds]),
         "rounds": compact_rounds,
     }
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def command_output(command, cwd=None):
@@ -787,6 +938,190 @@ def environment_record():
     }
 
 
+def preload_dataset_parallel(port, dataset, worker_count):
+    errors = []
+    chunks = [dataset[index::worker_count] for index in range(worker_count)]
+
+    def load_chunk(chunk):
+        sock = None
+        try:
+            sock = connect_kv(port)
+            for key, value in chunk:
+                sock.sendall(kv_encode(KV_SET, [key, value]))
+                command_type, _ = kv_read_frame(sock)
+                if command_type != KV_OK:
+                    raise RuntimeError(
+                        f"parallel preload failed for {key}: {command_type}")
+        except Exception as error:  # noqa: BLE001 - surfaced after join
+            errors.append(str(error))
+        finally:
+            if sock is not None:
+                sock.close()
+
+    threads = [threading.Thread(target=load_chunk, args=(chunk,), daemon=True)
+               for chunk in chunks]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120.0)
+        if thread.is_alive():
+            raise RuntimeError("parallel preload did not stop")
+    if errors:
+        raise RuntimeError(errors[0])
+
+
+def _probe_writer(port, dataset, stop_event, result):
+    sock = None
+    intervals = result["success_intervals_ns"]
+    attempt_intervals = result["attempt_intervals_ns"]
+    try:
+        sock = connect_kv(port)
+        send_ping(sock)
+        index = 0
+        while not stop_event.is_set():
+            key, value = dataset[index % len(dataset)]
+            index += 1
+            started = time.perf_counter_ns()
+            result["attempts"] += 1
+            try:
+                sock.sendall(kv_encode(KV_SET, [key, value]))
+                command_type, _ = kv_read_frame(sock)
+            except (OSError, RuntimeError) as error:
+                result["errors"] += 1
+                result["error_samples"].append(str(error))
+                continue
+            finished = time.perf_counter_ns()
+            attempt_intervals.append((started, finished))
+            if command_type == KV_OK:
+                result["successes"] += 1
+                intervals.append((started, finished))
+            else:
+                result["errors"] += 1
+                result["error_samples"].append(f"SET returned {command_type}")
+    except Exception as error:  # noqa: BLE001 - summarized in artifact
+        result["errors"] += 1
+        result["error_samples"].append(str(error))
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def run_checkpoint_probe_round(kv_binary, durability_mode, dataset,
+                               writer_count, round_index, temp_dir):
+    tag = f"checkpoint-{durability_mode}-w{writer_count}-r{round_index}"
+    port = free_loopback_port()
+    rdb_path = os.path.join(temp_dir, tag + ".rdb")
+    log_path = os.path.join(temp_dir, tag + "-server.log")
+    server = ServerProcess(kv_binary, port, rdb_path, log_path,
+                           durability_mode=durability_mode)
+    try:
+        server.wait_ready("kv")
+        preload_started = time.monotonic()
+        preload_dataset_parallel(port, dataset, min(32, len(dataset)))
+        preload_seconds = time.monotonic() - preload_started
+        if durability_mode == "interval":
+            time.sleep(0.15)
+
+        stats_before = read_stats(port)
+        stop_event = threading.Event()
+        results = [{
+            "attempts": 0,
+            "successes": 0,
+            "errors": 0,
+            "error_samples": [],
+            "success_intervals_ns": [],
+            "attempt_intervals_ns": [],
+        } for _ in range(writer_count)]
+        threads = [
+            threading.Thread(
+                target=_probe_writer,
+                args=(port, dataset, stop_event, results[index]),
+                daemon=True)
+            for index in range(writer_count)
+        ]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.20)
+
+        save_started_ns = time.perf_counter_ns()
+        with connect_kv(port) as sock:
+            sock.sendall(kv_encode(KV_SAVE, []))
+            command_type, _ = kv_read_frame(sock)
+        save_finished_ns = time.perf_counter_ns()
+        if command_type != KV_OK:
+            raise RuntimeError(f"checkpoint probe SAVE returned {command_type}")
+        time.sleep(0.10)
+        stop_event.set()
+        for thread in threads:
+            thread.join(timeout=30.0)
+            if thread.is_alive():
+                raise RuntimeError("checkpoint probe writer did not stop")
+
+        stats_after = read_stats(port)
+        save_us = (save_finished_ns - save_started_ns) / 1000.0
+        checkpoint = _checkpoint_metrics(stats_before, stats_after, save_us)
+        successes = sum(item["successes"] for item in results)
+        errors = sum(item["errors"] for item in results)
+        in_flight_during_save = sum(
+            1 for item in results for started, finished
+            in item["attempt_intervals_ns"]
+            if started <= save_finished_ns and finished >= save_started_ns)
+        successful_in_flight_during_save = sum(
+            1 for item in results for started, finished
+            in item["success_intervals_ns"]
+            if started <= save_finished_ns and finished >= save_started_ns)
+        error_samples = [
+            sample for item in results for sample in item["error_samples"]
+        ][:5]
+        sample = {
+            "round": round_index,
+            "dataset_keys": len(dataset),
+            "preload_seconds": round(preload_seconds, 6),
+            "writers": writer_count,
+            "writer_successes": successes,
+            "writer_errors": errors,
+            "writer_error_samples": error_samples,
+            "in_flight_during_save": in_flight_during_save,
+            "successful_in_flight_during_save": successful_in_flight_during_save,
+            "checkpoint": checkpoint,
+        }
+        kill_hard(server)
+        return sample
+    finally:
+        if server.proc.poll() is None:
+            try:
+                server.stop()
+            except Exception:
+                pass
+        elif not server.log_file.closed:
+            server.log_file.close()
+
+
+def aggregate_checkpoint_probe(durability_mode, dataset_keys, value_size,
+                               writer_count, rounds):
+    def median(field):
+        return _median([item[field] for item in rounds])
+
+    return {
+        "durability_mode": durability_mode,
+        "dataset_keys": dataset_keys,
+        "value_size_bytes": value_size,
+        "writers": writer_count,
+        "round_count": len(rounds),
+        "preload_seconds_median": median("preload_seconds"),
+        "writer_successes_total": sum(
+            item["writer_successes"] for item in rounds),
+        "writer_errors_total": sum(
+            item["writer_errors"] for item in rounds),
+        "in_flight_during_save_total": sum(
+            item["in_flight_during_save"] for item in rounds),
+        "successful_in_flight_during_save_total": sum(
+            item["successful_in_flight_during_save"] for item in rounds),
+        "checkpoint": _checkpoint_summary(rounds),
+        "rounds": rounds,
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kv", required=True,
@@ -801,8 +1136,14 @@ def parse_args():
                         default=[1, 8, 32])
     parser.add_argument("--workloads", nargs="+",
                         default=["write", "mixed", "ttl"])
+    parser.add_argument("--checkpoint-probe-keys", type=int, default=22000)
+    parser.add_argument("--checkpoint-probe-value-size", type=int, default=768)
+    parser.add_argument("--checkpoint-probe-writers", type=int, default=16)
+    parser.add_argument("--checkpoint-probe-rounds", type=int, default=5)
+    parser.add_argument("--checkpoint-probe-mode", default="sync")
+    parser.add_argument("--skip-checkpoint-probe", action="store_true")
     parser.add_argument("--out",
-                        default="bench/results/reliability-20261111-r4a-baseline.json")
+                        default="bench/results/r4b-background-checkpoint-20261111.json")
     return parser.parse_args()
 
 
@@ -822,6 +1163,14 @@ def validate_args(args):
     for workload in args.workloads:
         if workload not in ("write", "mixed", "ttl"):
             raise SystemExit(f"unsupported workload: {workload}")
+    if args.checkpoint_probe_rounds < 5:
+        raise SystemExit("--checkpoint-probe-rounds must be at least 5")
+    if args.checkpoint_probe_keys <= 0 or args.checkpoint_probe_value_size <= 0:
+        raise SystemExit("checkpoint probe dataset sizes must be positive")
+    if args.checkpoint_probe_writers < 1 or args.checkpoint_probe_writers > 31:
+        raise SystemExit("--checkpoint-probe-writers must be in 1..31")
+    if args.checkpoint_probe_mode not in ("sync", "interval"):
+        raise SystemExit("unsupported checkpoint probe mode")
 
 
 def main():
@@ -847,8 +1196,30 @@ def main():
                     configurations.append(aggregate_configuration(
                         mode, client_count, workload, rounds))
 
+        checkpoint_probe = None
+        if not args.skip_checkpoint_probe:
+            probe_dataset = make_dataset(
+                args.checkpoint_probe_keys,
+                args.checkpoint_probe_value_size)
+            print(
+                "running checkpoint probe "
+                f"mode={args.checkpoint_probe_mode} "
+                f"keys={args.checkpoint_probe_keys} "
+                f"writers={args.checkpoint_probe_writers}",
+                file=sys.stderr, flush=True)
+            probe_rounds = [
+                run_checkpoint_probe_round(
+                    args.kv, args.checkpoint_probe_mode, probe_dataset,
+                    args.checkpoint_probe_writers, round_index, temp_dir)
+                for round_index in range(1, args.checkpoint_probe_rounds + 1)
+            ]
+            checkpoint_probe = aggregate_checkpoint_probe(
+                args.checkpoint_probe_mode, args.checkpoint_probe_keys,
+                args.checkpoint_probe_value_size,
+                args.checkpoint_probe_writers, probe_rounds)
+
     output = {
-        "schema": "minidb-reliability-benchmark-v2",
+        "schema": "minidb-reliability-benchmark-v3",
         "generated_at": datetime.datetime.now(
             datetime.timezone.utc).isoformat(),
         "environment": environment_record(),
@@ -871,12 +1242,14 @@ def main():
             "recovery_method":
                 "SIGKILL after the measured round, then fresh-process startup to PING",
             "checkpoint_method":
-                "KV SAVE after recovery, measured client-side and via STATS checkpoint_pause_us",
+                "KV SAVE measured client-side; STATS deltas split admission cuts, snapshot capture, serialize, write, fsync, manifest, cleanup, and total",
+            "checkpoint_probe_method":
+                "fresh server, parallel preload, concurrent SET writers, one SAVE; writers continue during background snapshot serialization/write",
             "timing_method":
                 "STATS deltas measured with std::chrono::steady_clock; successes only",
         },
         "r4a_evidence": {
-            "status": "R4-A group commit implemented; v2 diagnostic timing retained",
+            "status": "R4-A group commit implemented; v3 diagnostic timing retained",
             "adrs": [
                 "docs/decisions/005-group-commit.md",
                 "docs/decisions/006-group-commit-implementation.md",
@@ -889,6 +1262,17 @@ def main():
                 "mean_fields": "computed from measured-window counter and total-time deltas",
                 "fsync_buckets": "fixed 50 us through 100 ms upper bounds plus a greater-than-100 ms overflow bucket",
             },
+        },
+        "r4b_evidence": {
+            "status": "R4-B background full checkpoint implemented",
+            "adr": "docs/decisions/007-background-checkpoint.md",
+            "checkpoint_metrics": "STATS persistence checkpoint_* fields and save_client_latency_* fields",
+            "checkpoint_probe": checkpoint_probe,
+        },
+        "artifact": {
+            "harness_sha256": sha256_file(Path(__file__).resolve()),
+            "kv_binary_sha256": sha256_file(Path(args.kv).resolve()),
+            "out": str(args.out),
         },
         "limits": {
             "concurrent_connections_per_server": 32,
@@ -910,7 +1294,11 @@ def main():
             "Timing counters are successful-operation cumulative values from steady_clock; they are diagnostic, not a production latency SLO.",
             "Observed max timing fields are process-lifetime maxima including preload/warm-up; mean timing fields use measured-window deltas.",
             "Fixed fsync buckets bound memory and cardinality but do not provide per-request traces or arbitrary quantiles.",
-            "This v2 artifact records the current implementation and its diagnostic counters; performance benefit is established only by a matching-environment G4 run, not by instrumentation alone.",
+            "This v3 artifact records the current implementation and its diagnostic counters; performance benefit is established only by a matching-environment G4 run, not by instrumentation alone.",
+            "The checkpoint probe uses a synthetic 22,000-record dataset and competing clients; its admitted-write counts are not a capacity claim.",
+            "in_flight_during_save counts client commands whose measured interval overlaps the SAVE response interval; it is not a strict checkpoint-admission-cut counter.",
+            "writer_errors_total covers the whole probe window and is not attributed solely to checkpoint admission; rejected writes are explicit backpressure, not acknowledged writes that were lost.",
+            "Background checkpoint timing decomposes successful SAVE operations; phase totals need not sum exactly to end-to-end SAVE because barrier scheduling, wakeups, and response work remain unattributed.",
         ],
         "configurations": configurations,
         "elapsed_wall_seconds": round(time.monotonic() - total_started, 3),

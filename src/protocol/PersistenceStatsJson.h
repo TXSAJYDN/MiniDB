@@ -26,6 +26,40 @@ inline std::string persistence_stats_json(const PersistenceSnapshot& stats) {
         << ",\"checkpoints\":" << stats.persistence.checkpoints
         << ",\"interval_flushes\":" << stats.persistence.interval_flushes
         << ",\"checkpoint_pause_us\":" << stats.persistence.checkpoint_pause_us
+        << ",\"checkpoint_admission_blocked_total_us\":"
+        << stats.persistence.checkpoint_admission_blocked_total_us
+        << ",\"checkpoint_admission_blocked_max_us\":"
+        << stats.persistence.checkpoint_admission_blocked_max_us
+        << ",\"checkpoint_snapshot_capture_total_us\":"
+        << stats.persistence.checkpoint_snapshot_capture_total_us
+        << ",\"checkpoint_snapshot_capture_max_us\":"
+        << stats.persistence.checkpoint_snapshot_capture_max_us
+        << ",\"checkpoint_snapshot_serialize_total_us\":"
+        << stats.persistence.checkpoint_snapshot_serialize_total_us
+        << ",\"checkpoint_snapshot_serialize_max_us\":"
+        << stats.persistence.checkpoint_snapshot_serialize_max_us
+        << ",\"checkpoint_snapshot_write_total_us\":"
+        << stats.persistence.checkpoint_snapshot_write_total_us
+        << ",\"checkpoint_snapshot_write_max_us\":"
+        << stats.persistence.checkpoint_snapshot_write_max_us
+        << ",\"checkpoint_snapshot_fsync_total_us\":"
+        << stats.persistence.checkpoint_snapshot_fsync_total_us
+        << ",\"checkpoint_snapshot_fsync_max_us\":"
+        << stats.persistence.checkpoint_snapshot_fsync_max_us
+        << ",\"checkpoint_manifest_total_us\":"
+        << stats.persistence.checkpoint_manifest_total_us
+        << ",\"checkpoint_wal_cleanup_total_us\":"
+        << stats.persistence.checkpoint_wal_cleanup_total_us
+        << ",\"checkpoint_total_us\":" << stats.persistence.checkpoint_total_us
+        << ",\"checkpoint_max_us\":" << stats.persistence.checkpoint_max_us
+        << ",\"checkpoint_failures\":" << stats.persistence.checkpoint_failures
+        << ",\"background_checkpoint_state\":\""
+        << background_checkpoint_state_name(
+               stats.persistence.background_checkpoint_state)
+        << "\",\"save_client_latency_total_us\":"
+        << stats.persistence.save_client_latency_total_us
+        << ",\"save_client_latency_max_us\":"
+        << stats.persistence.save_client_latency_max_us
         << "},\"wal\":{\"appends\":" << stats.wal.appends
         << ",\"bytes_written\":" << stats.wal.bytes_written
         << ",\"data_fsyncs\":" << stats.wal.data_fsyncs

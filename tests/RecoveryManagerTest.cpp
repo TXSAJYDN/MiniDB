@@ -324,5 +324,57 @@ TEST(RecoveryManagerTest, CheckpointStatsDescribeSnapshotAndLiveWal) {
               std::optional<std::string>("tail"));
 }
 
+TEST(RecoveryManagerTest,
+     OldManifestReplaysSetDeleteAndAbsoluteExpireIdempotently) {
+    DatabasePaths paths("minidb_recovery_old_manifest_idempotent_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    {
+        auto store = std::make_shared<KvStore>(clock);
+        PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+        std::string error;
+        ASSERT_TRUE(manager.open(&error)) << error;
+        ASSERT_TRUE(manager.set("seed", "base").ok());
+        ASSERT_EQ(manager.checkpoint(&error), RdbSaveResult::Ok) << error;
+
+        ASSERT_TRUE(manager.set("set-after", "value").ok());
+        ASSERT_TRUE(manager.del("seed").ok());
+        ASSERT_TRUE(manager.set("ttl", "kept").ok());
+        ASSERT_TRUE(manager.expire("ttl", 30000).ok());
+        ASSERT_TRUE(manager.set("expired", "gone").ok());
+        ASSERT_TRUE(manager.expire("expired", 0).ok());
+
+        clock->advance(5000);
+        // Simulate a rename of a newer RDB snapshot immediately before the
+        // manifest publication: the old manifest is still authoritative, so
+        // recovery must tolerate replaying an older WAL prefix over it.
+        RdbManager newer_snapshot(paths.rdb);
+        ASSERT_TRUE(newer_snapshot.save(*store));
+
+        CheckpointManifest manifest;
+        ASSERT_EQ(load_manifest(paths.manifest, &manifest, &error),
+                  ManifestLoadStatus::kOk)
+            << error;
+        EXPECT_EQ(manifest.checkpoint_lsn, 1u);
+    }
+
+    KvStore recovered(clock);
+    RecoveryManager recovery(paths.rdb);
+    std::string error;
+    ASSERT_EQ(recovery.recover(recovered, &error), RecoveryStatus::kOk)
+        << error;
+    EXPECT_EQ(recovered.get("seed").has_value(), false);
+    EXPECT_EQ(recovered.get("set-after"), std::optional<std::string>("value"));
+    EXPECT_EQ(recovered.get("expired").has_value(), false);
+    const auto ttl = recovered.ttl_info("ttl");
+    ASSERT_EQ(ttl.state, KvStore::TtlState::kExpiring);
+    EXPECT_GT(ttl.remaining_ms, 24000);
+    EXPECT_LE(ttl.remaining_ms, 25000);
+
+    clock->advance(25001);
+    EXPECT_FALSE(recovered.get("ttl").has_value());
+    EXPECT_EQ(recovered.get("set-after"), std::optional<std::string>("value"));
+}
+
 } // namespace
 } // namespace minidb

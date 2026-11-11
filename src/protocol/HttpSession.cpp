@@ -87,8 +87,8 @@ const char* reason_phrase(int status) {
 
 HttpSession::HttpSession(const TcpConnectionPtr& conn)
     : conn_(conn), started_(false), processing_(false), closing_(false),
-      closed_(false), drain_scheduled_(false), requests_handled_(0),
-      idle_timer_id_(0) {}
+      closed_(false), drain_scheduled_(false), awaiting_async_response_(false),
+      request_close_(false), requests_handled_(0), idle_timer_id_(0) {}
 
 HttpSession::~HttpSession() {
     cancel_idle_timeout();
@@ -269,10 +269,15 @@ bool HttpSession::should_close(const HttpRequest& req) const {
 
 void HttpSession::handle_request(const HttpRequest& req) {
     const bool close = should_close(req);
+    request_close_ = close;
     HttpResponse response(close);
+    bool deferred = false;
 
     try {
-        if (request_callback_) {
+        if (async_request_callback_) {
+            deferred =
+                async_request_callback_(req, &response, make_response_sender());
+        } else if (request_callback_) {
             request_callback_(req, &response);
         } else {
             response.set_status_code(HttpResponse::k501NotImplemented);
@@ -285,19 +290,57 @@ void HttpSession::handle_request(const HttpRequest& req) {
         response.set_status_message("Internal Server Error");
         response.set_body("Internal Server Error\n");
         response.set_close_connection(true);
+        deferred = false;
     } catch (...) {
         Log::Error("HTTP request callback threw an unknown exception");
         response.set_status_code(HttpResponse::k500InternalServerError);
         response.set_status_message("Internal Server Error");
         response.set_body("Internal Server Error\n");
         response.set_close_connection(true);
+        deferred = false;
     }
 
     if (close) {
         response.set_close_connection(true);
     }
 
-    const bool must_close = close || response.close_connection();
+    if (deferred) {
+        // The sink is always posted to the owner loop.  Marking the deferral
+        // after the callback returns cannot lose a synchronous sink call.
+        awaiting_async_response_ = true;
+        return;
+    }
+    finish_response(response);
+}
+
+HttpSession::ResponseSender HttpSession::make_response_sender() {
+    std::weak_ptr<HttpSession> weak = weak_from_this();
+    return [weak](HttpResponse response) {
+        if (auto self = weak.lock()) {
+            EventLoop* loop = self->conn_ ? self->conn_->loop() : nullptr;
+            if (loop == nullptr) {
+                return;
+            }
+            loop->queue_in_loop([weak,
+                                 response = std::move(response)]() mutable {
+                if (auto session = weak.lock()) {
+                    session->complete_deferred_response(std::move(response));
+                }
+            });
+        }
+    };
+}
+
+void HttpSession::complete_deferred_response(HttpResponse response) {
+    if (closed_ || closing_ || !awaiting_async_response_) {
+        return;
+    }
+    awaiting_async_response_ = false;
+    finish_response(response);
+}
+
+void HttpSession::finish_response(const HttpResponse& response) {
+    const bool must_close = request_close_ || response.close_connection();
     if (!send_response(response)) {
         return;
     }
@@ -305,7 +348,11 @@ void HttpSession::handle_request(const HttpRequest& req) {
     if (must_close) {
         closing_ = true;
         cancel_idle_timeout();
-        conn_->shutdown();
+        if (conn_ && conn_->connected()) {
+            conn_->shutdown();
+        } else {
+            closed_ = true;
+        }
     }
 }
 

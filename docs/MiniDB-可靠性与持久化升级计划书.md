@@ -1,6 +1,6 @@
 # MiniDB 可靠性与持久化升级计划书
 
-> 文档状态：`R0-R3 Completed / R4-A G1-G3 PASS / Group Commit Not Started`
+> 文档状态：`R0-R3 Completed / R4-A Implemented / G1-G3 PASS / G5-G6 Local PASS / G7 Recorded / G4 Pending Clean HEAD`
 >
 > 编写日期：2026-11-10（Asia/Shanghai）
 >
@@ -10,9 +10,11 @@
 >
 > 最近历史功能验收基线：`9da4b48`（阶段 A-H 技术验收 PASS）
 >
-> 计划性质：R0-R3 已按本文完成实现并通过本地验证；R4-A 已完成 ADR、诊断指标、
-> clean v2 baseline 和独立 G3 batch formation 实验，G1-G3 PASS，实现级 ADR
-> 待写，组提交实现仍未开始；其他 R4 路线仅是证据驱动的可选项。
+> 计划性质：R0-R3 已按本文完成实现并通过本地验证；R4-A 已完成 ADR-005、
+> 诊断指标、clean v2 baseline、独立 G3 batch formation 实验和 ADR-006 实现冻结，
+> G1-G3 PASS，G5/G6 本地通过。组提交已作为 `SYNC` 的内部优化落地；正式 G4
+> 收益证据必须在提交并通过 CI 的 clean HEAD 上采集。其他 R4 路线仍是证据驱动的
+> 可选项。
 >
 > 推进方式：按技术依赖和验收门槛推进，不设置固定总工期或强制周计划。阶段状态、证据链接、已知限制和下一步准入条件随实现同步更新。
 >
@@ -31,6 +33,7 @@
 - [崩溃一致性](crash-consistency.md)
 - [可靠性证据](reliability-evidence.md)
 - [ADR-005：R4-A 组提交候选设计与证据门槛](decisions/005-group-commit.md)
+- [ADR-006：R4-A 组提交实现](decisions/006-group-commit-implementation.md)
 
 ## 目录
 
@@ -116,7 +119,7 @@ R0 重新定位与证据规范
 | 持久化 | RDB v2 全量快照、CRC32C、临时文件、fsync、原子 rename、目录 fsync | 工程质量强，但只有全量快照 |
 | 恢复 | 启动时加载最近一次 RDB；损坏时拒绝发布 | 没有基于 WAL 的崩溃恢复 |
 | 资源边界 | 32 连接、每连接 1.25 MiB 输入/输出预算、64 MiB RDB 上限 | 已有“有界资源”的雏形，应上升为项目命题 |
-| 测试 | 计划立项时历史基线为六配置各 214/214 CTest、HTTP/KV fuzz 各 20,000 runs；当前 R0-R3 为六配置各 305/305、四个 fuzz target 各 20,000 runs | 明显强于多数学生项目 |
+| 测试 | 计划立项时历史基线为六配置各 214/214 CTest；R0-R3 为六配置各 305/305；R4-A 为六配置各 338/338，含 24 个进程用例和四个 20,000-run fuzz target | 已形成可复现的工程证据 |
 | 故障注入 | RDB EINTR、短写、ENOSPC、open/fsync/close/rename/dir-fsync 等 | 可复用为 WAL 崩溃矩阵的基础 |
 | 性能 | HTTP 约 1,782 req/s、KV 约 1,968 req/s，单连接、单 in-flight、closed-loop | 只能作为基线，不能作为容量或生产 SLA 结论 |
 | 主要缺口 | 无 WAL/AOF；无 ack 后崩溃一致性；SAVE stop-the-world；无事务、复制、多进程所有权 | 缺少一个真正硬的存储可靠性闭环 |
@@ -701,8 +704,8 @@ R1 的 checkpoint 仍可以是 stop-the-world；先保证正确性，再根据�
 - 随机 kill 的 seed 和 artifact；
 - 恢复时间与 WAL 大小曲线；
 - checkpoint 停顿数据；
-- 三种持久化级别的对比；
-- 原有测试与新增 WAL/恢复测试合计 305 项，在六种配置下无回退；
+- `SYNC`/`INTERVAL` 两种公开模式与 `SYNC` 内部组提交优化的对比；
+- R1 验收时为 305 项，R4-A 后增至 338 项，并在六种配置下无回退；
 - CI、ASan/UBSan/TSan 和四个 fuzz target 的结果。
 
 ---
@@ -761,7 +764,7 @@ R1 的 checkpoint 仍可以是 stop-the-world；先保证正确性，再根据�
 - 尾部半写可恢复，中间损坏拒绝启动；
 - 快照和 WAL 的重放不重复应用、不漏应用；
 - `SAVE` 失败不会导致 WAL 被提前删除；
-- 原有测试与新增 WAL/恢复测试合计 305 项，在六配置下继续通过；
+- R1 时原有测试与新增 WAL/恢复测试合计 305 项在六配置下通过；R4-A 后扩展到 338 项；
 - 新增 WAL/恢复测试通过 ASan/UBSan。
 
 ### R2：崩溃一致性与恢复模型闭环
@@ -816,7 +819,7 @@ durability/客户端数/负载矩阵，seed 为 `20261111`。原始数据保存�
 - 至少 5 轮可复现实验；
 - 报告包含环境、脚本、原始输出和限制；
 - 不把 closed-loop 结果写成容量结论；
-- 能解释 `SYNC`、`INTERVAL` 的取舍，并说明 `BATCHED` 为什么尚未实现；
+- 能解释 `SYNC`、`INTERVAL` 的取舍，并说明组提交为何作为 `SYNC` 内部优化而不暴露为 `BATCHED`；
 - 能回答“为什么需要 WAL”“为什么还需要 RDB checkpoint”“checkpoint 失败怎么办”。
 
 ### R4：可选进阶
@@ -825,15 +828,7 @@ durability/客户端数/负载矩阵，seed 为 `20261111`。原始数据保存�
 
 **R4-A：组提交**
 
-**实施状态（2026-11-11）：** 已用 [ADR-005](decisions/005-group-commit.md)
-固化候选边界、不可妥协不变量和 G1-G7 证据门槛；已增加成功 append、data
-fsync、`SYNC` 持久化路径计时及固定 fsync 桶，并完成 clean v2 baseline。
-32 客户端 `SYNC` write 的 fsync 占持久化耗时中位数为 99.06%，G1/G2 PASS。
-独立的非生产 G3 batch formation 实验随后从 clean HEAD `5d26f0b` 完成 5 轮：
-2,985 次成功 `SET`、2,985 个 WAL data fsync 窗口、0 错误；每轮 pending
-P50/P90 均为 32，汇总 `>=8` 比例 0.987605，判定 G3 PASS。该证据只说明外部
-请求层面存在 batch 形成机会；writer thread、队列、completion、批量 fsync 和
-`BATCHED` 均尚未实现。下一步仅是实现级 ADR。
+**实施状态（2026-11-11）：** [ADR-005](decisions/005-group-commit.md) 已固化候选边界、不可妥协不变量和 G1-G7 证据门槛；[ADR-006](decisions/006-group-commit-implementation.md) 已冻结 writer/completion 线程模型、资源上限、失败语义、checkpoint barrier 和新增观测契约。实现已落地：专用 WAL writer thread 从连续 LSN 前缀形成有界 batch，一次 data fsync 覆盖整批；owner EventLoop 仍是唯一 admission、Store apply、completion 和协议响应点。HTTP/KV mutation、SAVE、checkpoint 和 shutdown 已异步化，队列/backlog 满时明确拒绝或 fail-stop。G1-G3 PASS；G5/G6 已在本地六配置 338 项测试中通过；G7 由 ADR-006 记录。正式 G4 仍需在提交并跑通 CI 的 clean HEAD 上采集，当前不得宣称性能收益已经成立。
 
 - [x] 写 ADR，定义候选边界、失败矩阵和证据门槛；
 - [x] 增加低开销诊断指标和 `/stats`/`STATS` 契约；
@@ -841,13 +836,16 @@ P50/P90 均为 32，汇总 `>=8` 比例 0.987605，判定 G3 PASS。该证据只
 - [x] G3：独立非生产实验证明一次 fsync 窗口可形成至少 8 条连续待提交记录；
   5 轮、2,985 个窗口、0 错误，汇总 `>=8` 比例 0.987605；artifact
   `bench/results/r4a-batch-formation-20261111.json`；
-- [ ] 专用 WAL writer thread；
-- [ ] 有界队列和 completion；
-- [ ] 一次 fsync 服务多个写；
-- [ ] 保持 ack 后不丢和全局顺序；
-- [x] G1-G3 已通过，具备另写实现级 ADR 的准入；
-- [ ] 实现级 ADR：writer/completion、资源上限、失败矩阵和新增崩溃点；
-- [ ] 需要 TSan、stop/drain 和崩溃矩阵重新验证。
+- [x] 实现级 ADR-006：writer/completion、资源上限、失败矩阵和新增崩溃点；
+- [x] 专用 WAL writer thread 和有界 admission queue；
+- [x] 有界 completion backlog、合并 drain 和 callback 恰好一次；
+- [x] 一次 data fsync 服务多个连续写，不增加固定 sleep；
+- [x] 保持 ack 后不丢、LSN 连续性和全局 apply/completion 顺序；
+- [x] HTTP/KV 异步 mutation、SAVE、checkpoint barrier 和 graceful shutdown；
+- [x] 顶层 `group_commit` 指标、batch-size 桶、queue/backlog 高水位和失败计数；
+- [x] G5/G6 本地验证：六配置各 338 项测试、24 个进程用例、TSan/sanitizer/fuzz/静态分析门禁；
+- [ ] G4：在 clean HEAD 上用相同环境、数据集和至少 5 轮实验验证 32 客户端 write 的中位 QPS 相对 418.018 至少提升 2 倍，并保留 negative evidence；
+- [ ] 将 G4 artifact、限制、digest 和最终 G7 状态写回证据文档并在最终 `main` HEAD 上重跑 CI。
 
 **R4-B：后台/增量 checkpoint**
 
@@ -989,16 +987,22 @@ R1 开始前的文档决策均已落地：
 7. 保持 `-r <rdb_path>`，sidecar 为 `.manifest`、`.wal/`、`.lock`；
 8. R1 已引入单写者锁以及 HTTP/KV 共享的持久化统计。
 
-R4 不自动启动。R4-A 的 v2 基线已判定 G1/G2 PASS，fsync 是 `SYNC` 持久化路径的
-主成本；独立非生产实验已判定 G3 PASS，但该实验只证明外部 batch 形成机会。
-当前必须先另写实现级 ADR，且在 ADR 明确 writer/completion 线程模型、资源
-上限、失败矩阵和新增崩溃点前不进入实现：
+R4-A 已从“可选设计”进入已实现、待正式收益验证的状态。ADR-005 规定的
+G1/G2/G3 已 PASS，ADR-006 已冻结并落地 writer/completion 线程模型、有界资源、
+batch formation、异步协议、checkpoint/shutdown barrier 和失败语义；G5/G6 已有
+本地六配置 338 项测试证据。当前剩余工作是按顺序完成：
 
-- 组提交必须保持 ack 后不丢、全局应用顺序、有界队列和完整 stop/drain；
-- 后台或增量 checkpoint 必须保持 manifest 原子发布语义，不得删除仍被引用的 WAL；
-- MVCC/事务必须作为独立阶段，先定义隔离级别、冲突检测、GC 和恢复模型；
-- 任何 R4 变更都必须重新通过 sanitizer、崩溃矩阵、Fuzz 和资源上限验证。
+1. 将实现与文档同步到 Windows 工作树，提交并推送 `main`；
+2. 在 `main` 上跑完整 GitHub Actions，要求全部 job 通过；
+3. 在通过 CI 的 clean HEAD 上运行正式 G4，不修改阈值、不放宽 ack 持久性；
+4. 计算 artifact bytes/SHA-256，更新 ADR-005、ADR-006、证据文档和项目状态；
+5. 提交 G4 证据并推送，确保最终 `main` HEAD 的 CI 再次全绿；
+6. 删除中间临时产物，但保留可靠性 benchmark artifacts、正式 G4 artifact 和仓库根旧 in-source build 历史产物。
 
+G4 失败时必须保留 negative evidence，并重新评估设计；不得把未达标结果写成收益成立。
+后台/增量 checkpoint、MVCC/事务和多写者仍保持独立阶段，不随 R4-A 自动启动。任何
+后续 R4 变更仍必须保持 manifest 原子发布、ack 后不丢、全局顺序和有界资源，并重新
+通过 sanitizer、崩溃矩阵、fuzz 和资源上限验证。
 ---
 
 ## 13. 变更记录
@@ -1009,3 +1013,4 @@ R4 不自动启动。R4-A 的 v2 基线已判定 G1/G2 PASS，fsync 是 `SYNC` �
 | 2026-11-11 | 0.2 | R0-R3 完成实现与本地验收：305 项测试、四个 fuzz target、18 配置可靠性 benchmark；R4 未启动 |
 | 2026-11-11 | 0.3 | R4-A 完成 ADR-005、timing 指标和 clean v2 baseline；G1/G2 PASS，G3 待验证；组提交实现仍未开始 |
 | 2026-11-11 | 0.4 | R4-A 完成独立非生产 G3 batch formation 实验：5 轮、2,985 个窗口、0 错误，汇总 `>=8` 比例 0.987605，G3 PASS；等待实现级 ADR，组提交仍未实现 |
+| 2026-11-11 | 0.5 | R4-A 实现完成：ADR-006、writer/queue/batch/completion、异步 HTTP/KV、SAVE/checkpoint/shutdown barrier、`group_commit` 指标和本地六配置 338 项测试；G1-G3 PASS、G5/G6 本地 PASS、G7 已记录，G4 待 clean HEAD 采集 |

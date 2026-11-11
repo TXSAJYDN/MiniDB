@@ -91,6 +91,10 @@ InetAddress Socket::local_address() const {
     return InetAddress(addr);
 }
 
+void Socket::close() {
+    sockfd_.close();
+}
+
 bool Socket::shutdown_write() {
     if (::shutdown(sockfd_.get(), SHUT_WR) < 0 && errno != ENOTCONN &&
         errno != EPIPE && errno != ECONNRESET) {

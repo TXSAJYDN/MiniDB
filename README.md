@@ -19,7 +19,8 @@ MiniDB 是可靠性工程原型，**不宣称生产可用**，不宣称 Redis/SQ
 
 ## 核心机制
 
-- 写入先追加 WAL，再按 durability 级别决定何时返回成功；
+- owner EventLoop 负责校验、排序、内存 apply 和协议响应，专用 writer thread 独占 WAL append/fsync；
+- 连续 WAL 记录由 writer 合并为有界 batch，一次 data fsync 覆盖整批；`SYNC` 的响应仍严格晚于覆盖该 LSN 的 fsync；
 - RDB 是全量 checkpoint，不再承担每一次写入的持久化承诺；
 - manifest 原子记录 `checkpoint_lsn` 和必须保留的 WAL segment；
 - 启动时先构建临时恢复镜像，RDB、manifest 和 WAL 全部验证通过后才发布 Store；
@@ -34,7 +35,7 @@ MiniDB 是可靠性工程原型，**不宣称生产可用**，不宣称 Redis/SQ
 | `SYNC`（默认） | WAL append + 文件 fsync 成功，再应用内存并响应 | 在 fsync/设备模型成立时，确认写可跨进程崩溃恢复 | 对已确认写不主动允许丢失 |
 | `INTERVAL` | WAL append 成功并应用内存后响应 | 依赖周期 flush；checkpoint/正常关闭前强制 flush | 最近一个 flush 窗口内的确认写，约 100 ms 量级，受调度和 I/O 影响 |
 
-本项目只实现 `SYNC` 与 `INTERVAL`。`BATCHED` 未实现，属于未启动的 R4 可选项。
+本项目只实现 `SYNC` 与 `INTERVAL`。组提交是 `SYNC` 的内部批处理优化，不是新的公开 durability mode；不存在 `BATCHED` 选项。
 
 这里的“crash-consistent”针对已记录的进程崩溃与重启语义；测试使用故障注入和 `SIGKILL`，**不证明掉电、内核崩溃、设备缓存撒谎或介质损坏下的持久性**。
 
@@ -109,6 +110,9 @@ wal-00000000000000000001.log
 | 恢复扫描记录 | 1,000,000 |
 | 恢复字节 | 512 MiB |
 | RDB 快照 | 64 MiB / 100,000 records |
+| group-commit admission queue | 4,096 entries / 64 MiB |
+| 单个物理 WAL batch | 256 records / 16 MiB |
+| group-commit completion backlog | 4,096 entries / 64 MiB |
 
 WAL 达到 segment 数或字节预算时，写路径会先触发同步 checkpoint；checkpoint 失败则拒绝写，不应无限增长。具体策略见 [ADR-004](docs/decisions/004-wal-resource-policy.md)。
 
@@ -143,6 +147,7 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 - checkpoint 暂停时间；
 - WAL append、rotation、segment 清理和目录 fsync 计数；
 - 成功 append、data fsync 与 `SYNC` 持久化路径的累计/最大耗时，以及固定 fsync 延迟桶；
+- 顶层 `group_commit` 对象：queue/backlog 高水位、拒绝数、batch 数量与大小分布、data fsync 数、writer 各阶段耗时、失败计数和 writer 状态；
 - 启动恢复的 RDB 记录数、扫描/重放记录数、截断字节和遗留 residue；
 - legacy import 与 bootstrap 状态。
 
@@ -152,28 +157,25 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 
 ## 验证状态
 
-当前 R0-R3 已完成实现与本地验收；R4-A 已通过 G1-G3，并停在实现级 ADR 前，
-组提交实现尚未开始：
+R4-A 组提交实现已完成并通过本地质量门禁；正式 G4 收益证据在推送后的 clean HEAD 上采集：
 
-- 六种构建配置的真实 CTest 矩阵；
-- WAL 编解码、manifest、恢复、checkpoint、单写者锁和故障注入单元测试；
-- 19 个进程级用例，覆盖 HTTP/KV 持久化、尾部截断、中间损坏、缺失 segment、manifest 损坏、随机 kill、TTL 和 STATS；
+- Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种构建配置；
+- 每个配置 **338 项 CTest**，包含 24 个 `ProcessIntegrationTest.*` 进程级用例；
+- 组提交 writer 的顺序、batch 上限、queue/backlog full、append/fsync 失败、cleanup barrier、fail-stop 和 callback 恰好一次测试；
+- HTTP/KV 异步 mutation、断开连接安全、流水线响应顺序、SAVE/STATS 和 shutdown 失败退出码测试；
 - HTTP、KV、WAL record、manifest 四个固定 seed fuzz target；
+- clang-format、clang-tidy 和 `git diff --check`；
 - 多 durability、多客户端、写/混合/TTL 的 5 轮可靠性 benchmark；
 - R4-A v2 baseline：18 配置 × 5 轮、414,688 次成功请求、0 错误；32 客户端
   `SYNC` write 的 fsync 占持久化耗时中位数 99.06%，G1/G2 PASS；
-- R4-A G3 独立非生产 batch formation 实验：5 轮、2,985 次成功 `SET`、
-  2,985 个 WAL data fsync 窗口、0 错误；每轮 pending P50/P90 均为 32，汇总
-  `>=8` 比例 **0.987605**，G3 PASS；artifact 为
-  [`bench/results/r4a-batch-formation-20261111.json`](bench/results/r4a-batch-formation-20261111.json)；
-- R4-A timing 字段、固定 fsync 桶和 v2 benchmark 采集契约；
-- clang-format、clang-tidy 和 `git diff --check`。
+- R4-A G3：独立 batch-formation 实验 5 轮、2,985 个 WAL data fsync 窗口、
+  0 错误，汇总 `pending_count >= 8` 比例 **0.987605**，PASS；
+- 正式 G4 的 clean-HEAD 结果、原始 artifact 摘要和限制见
+  [可靠性证据](docs/reliability-evidence.md)。
 
-具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。R0-R3 基线
-`cfbda60` 的远程 GitHub Actions 已 9/9 通过；R4-A 提交的最终状态以推送后的
-GitHub checks 为准。G3 的 pending 计数是外部观测到的批处理机会上界；`strace`
-下的吞吐不能用于评价 G4。下一步实现级 ADR 不是组提交实现，当前没有任何
-writer、queue、batch、completion 或 `BATCHED` 代码路径。
+具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。远程 CI 必须在
+最终 `main` HEAD 上通过；本地门禁不替代 GitHub Actions。G3 的 pending 计数
+是批处理机会上界，不是服务器队列已有记录的证据。
 
 ## 明确的非目标
 
@@ -184,9 +186,8 @@ writer、queue、batch、completion 或 `BATCHED` 代码路径。
 - 不提供 TLS、认证或授权；
 - 不承诺生产 SLA、容量规划或高并发表现；
 - 不覆盖多进程共享数据目录、掉电一致性或设备故障证明；
-- 不实现 `BATCHED`、组提交或后台 checkpoint；R4-A 已完成
-  [ADR-005](docs/decisions/005-group-commit.md)、指标采集和 G3 非生产实验，
-  实现级 ADR 待写，组提交实现仍为 **NOT IMPLEMENTED**。
+- 不提供公开 `BATCHED` durability mode；组提交只作为 `SYNC` 的内部优化存在；
+- R4-A 不包含后台/增量 checkpoint、事务、MVCC 或多写者。
 
 ## 文档
 
@@ -204,4 +205,5 @@ writer、queue、batch、completion 或 `BATCHED` 代码路径。
 - [可复现 benchmark](bench/README.md)
 - [Fuzz targets](fuzz/README.md)
 - [ADR-005：R4-A 组提交候选设计与证据门槛](docs/decisions/005-group-commit.md)
+- [ADR-006：R4-A 组提交实现](docs/decisions/006-group-commit-implementation.md)
 - [架构决策记录](docs/decisions/)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DurabilityPolicy.h"
+#include "GroupCommitWriter.h"
 #include "KvStore.h"
 #include "RdbManager.h"
 #include "RecoveryManager.h"
@@ -10,10 +11,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace minidb {
 
@@ -34,6 +37,31 @@ struct MutationOutcome {
         return status == MutationStatus::kOk;
     }
 };
+
+// Async admission is deliberately distinct from mutation completion.  An
+// accepted request has not been applied or acknowledged yet; its completion
+// runs later on the owner loop.
+enum class MutationAdmissionStatus : std::uint8_t {
+    kAccepted,
+    kInvalidArgument,
+    kIoError,
+    kResourceLimit,
+    kNotReady,
+    kShuttingDown,
+};
+
+struct MutationAdmission {
+    MutationAdmissionStatus status = MutationAdmissionStatus::kNotReady;
+    std::string error;
+
+    bool accepted() const noexcept {
+        return status == MutationAdmissionStatus::kAccepted;
+    }
+};
+
+using MutationCompletion = std::function<void(MutationOutcome)>;
+using CheckpointCompletion =
+    std::function<void(RdbSaveResult, const std::string&)>;
 
 struct PersistenceStats {
     std::uint64_t mutations = 0;
@@ -66,6 +94,7 @@ struct PersistenceSnapshot {
     RecoveryStats recovery;
     WalManagerStats wal;
     PersistenceStats persistence;
+    GroupCommitStats group_commit;
 };
 
 // Owns the single-writer lock and all persistence side effects after startup
@@ -90,17 +119,43 @@ class PersistenceManager {
     // first mutation or checkpoint publishes the initial RDB/manifest/WAL.
     bool open(std::string* error = nullptr);
 
+    // Synchronous mutation APIs are retained for tests and for the period
+    // before group commit starts.  Once start_group_commit() succeeds they
+    // return kNotReady and must not bypass the writer thread.
     MutationOutcome set(const std::string& key, const std::string& value);
     MutationOutcome del(const std::string& key);
     MutationOutcome expire(const std::string& key, std::int64_t ttl_ms);
 
-    // INTERVAL timer hook.  SYNC is a no-op.  The caller runs this on the
-    // owner EventLoop; the manager serializes it with mutations/checkpoints.
-    bool flush_interval(std::string* error = nullptr);
+    // Bootstraps a writable WAL (if needed), then starts the dedicated writer
+    // thread.  The dispatch must enqueue work on the owner EventLoop and must
+    // never run it inline on the writer thread.
+    bool start_group_commit(GroupCommitWriter::OwnerDispatch owner_dispatch,
+                            std::string* error = nullptr);
+    bool group_commit_started() const;
 
-    // SAVE and shutdown both use a stop-the-world checkpoint.  The snapshot
-    // and manifest are published before any old WAL segment is removed.
+    MutationAdmission set_async(const std::string& key, std::string value,
+                                MutationCompletion completion);
+    MutationAdmission del_async(std::string key, MutationCompletion completion);
+    MutationAdmission expire_async(std::string key, std::int64_t ttl_ms,
+                                   MutationCompletion completion);
+
+    // INTERVAL timer hooks.  The synchronous form remains available before
+    // group commit starts and returns false afterwards; the asynchronous form
+    // is serialized through the writer barrier.
+    bool flush_interval(std::string* error = nullptr);
+    bool flush_interval_async(GroupCommitWriter::BarrierCompletion completion,
+                              std::string* error = nullptr);
+
+    // SAVE and shutdown use the same non-blocking checkpoint state machine:
+    // pause admission and the writer, drain/apply, rotate, snapshot, publish
+    // the manifest, cleanup, then resume or stop the writer.  Completion runs
+    // on the owner loop.  A SAVE response must not be sent before it fires.
     RdbSaveResult checkpoint(std::string* error = nullptr);
+    bool checkpoint_async(CheckpointCompletion completion,
+                          std::string* error = nullptr);
+    bool shutdown_async(CheckpointCompletion completion,
+                        std::string* error = nullptr);
+    bool shutdown_complete() const;
 
     DurabilityMode durability_mode() const noexcept {
         return durability_mode_;
@@ -114,6 +169,7 @@ class PersistenceManager {
     std::uint64_t next_lsn() const;
     std::uint64_t wal_bytes() const;
     WalManagerStats wal_stats() const;
+    GroupCommitStats group_commit_stats() const;
     const RecoveryStats& recovery_stats() const noexcept {
         return recovery_stats_;
     }
@@ -129,6 +185,19 @@ class PersistenceManager {
     }
 
   private:
+    struct PendingMutation {
+        std::uint64_t lsn = 0;
+        std::uint64_t started_us = 0;
+        MutationCompletion completion;
+    };
+
+    struct CheckpointOperation {
+        CheckpointCompletion completion;
+        bool shutdown = false;
+        std::uint64_t started_us = 0;
+        std::uint64_t paused_us = 0;
+    };
+
     MutationOutcome set_impl(const std::string& key, const std::string& value);
     MutationOutcome del_impl(const std::string& key);
     MutationOutcome expire_impl(const std::string& key, std::int64_t ttl_ms);
@@ -136,9 +205,21 @@ class PersistenceManager {
                                      const std::string& apply_value,
                                      bool apply_del,
                                      std::int64_t apply_expiry_ms);
+    MutationAdmission admit_async(WalRecord record,
+                                  MutationCompletion completion);
+    MutationAdmission admission_fail(MutationAdmissionStatus status,
+                                     const std::string& error) const;
     MutationOutcome fail(MutationStatus status, const std::string& error);
 
     bool ensure_bootstrapped_locked(std::string* error);
+    bool ensure_group_commit_writer_locked(std::string* error);
+    bool start_checkpoint_locked(CheckpointCompletion completion, bool shutdown,
+                                 std::string* error);
+    void on_checkpoint_paused(bool success, const std::string& error);
+    void on_checkpoint_rotated(const GroupCommitWalBarrierInfo& info);
+    void on_checkpoint_cleanup(bool success, const std::string& error);
+    void finish_checkpoint(RdbSaveResult result, const std::string& error);
+    void on_group_commit_completion(GroupCommitCompletion completion);
     WalResult append_with_checkpoint_retry(const WalRecord& record,
                                            std::string* error);
     RdbSaveResult checkpoint_locked(std::string* error);
@@ -156,10 +237,19 @@ class PersistenceManager {
     std::unique_ptr<SingleWriterLock> writer_lock_;
     RecoveryStats recovery_stats_;
     std::unique_ptr<WalManager> wal_;
+    std::shared_ptr<GroupCommitWriter> group_commit_writer_;
+    GroupCommitWriter::OwnerDispatch owner_dispatch_;
     mutable std::mutex operation_mutex_;
     std::uint64_t last_lsn_ = 0;
     bool opened_ = false;
     bool failed_ = false;
+    bool group_commit_started_ = false;
+    bool accepting_mutations_ = true;
+    bool control_pending_ = false;
+    bool shutdown_requested_ = false;
+    bool shutdown_complete_ = false;
+    std::deque<PendingMutation> pending_mutations_;
+    std::unique_ptr<CheckpointOperation> checkpoint_operation_;
     PersistenceStats stats_;
     std::function<void(const WalRecord&)> after_apply_callback_;
 };

@@ -33,6 +33,9 @@ class Acceptor {
         new_connection_callback_ = cb;
     }
     void listen();
+    // Owner-loop only.  Idempotent; removes the accept watcher and closes the
+    // listening socket without destroying the Acceptor object.
+    void stop();
     bool listening() const {
         return listening_;
     }

@@ -123,8 +123,9 @@ Examples:
 | `INTERVAL` | WAL append succeeded, mutation applied | Flush window is bounded by the 100 ms timer and I/O scheduling | Recently acknowledged writes before the next flush |
 
 `INTERVAL` flushes on a 100 ms owner-loop timer, before every checkpoint, and
-before graceful shutdown. `BATCHED` is not implemented; group commit is an
-unstarted R4 option.
+before graceful shutdown. There is no public `BATCHED` mode: R4-A group
+commit is an internal optimization of `SYNC` with the same acknowledged-write
+guarantee.
 
 Durability semantics cover process crashes and restarts. They do not prove
 power-loss, kernel-crash, firmware-cache, or media-failure durability.
@@ -223,11 +224,14 @@ nonzero on shutdown.
 
 `/stats` and `STATS` expose a coherent snapshot of the durability mode, LSNs,
 WAL bytes and segment count, mutation/fsync/checkpoint counters, checkpoint
-pause time, recovery statistics, and R4-A timing diagnostics. Timing counters
-cover successful operations only; process-lifetime maxima include preload and
-warm-up, and fixed fsync buckets do not provide arbitrary quantiles. They are
-diagnostic endpoints, not an SLO or health-check substitute. See
-[ADR-005](decisions/005-group-commit.md) for the evidence gates.
+pause time, recovery statistics, R4-A timing diagnostics, and the top-level
+`group_commit` queue/batch/completion snapshot. Timing counters cover successful
+operations only; process-lifetime maxima include preload and warm-up, and fixed
+fsync buckets do not provide arbitrary quantiles. They are diagnostic endpoints,
+not an SLO or health-check substitute. See
+[ADR-005](decisions/005-group-commit.md) for the evidence gates and
+[ADR-006](decisions/006-group-commit-implementation.md) for the implementation
+contract.
 
 ## Backup
 

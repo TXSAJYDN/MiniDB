@@ -20,6 +20,7 @@ class EpollOperations;
 class EventLoop {
   public:
     using TimerId = uint64_t;
+    using SignalCallback = std::function<void()>;
 
     EventLoop();
     explicit EventLoop(std::shared_ptr<EpollOperations> poller_operations);
@@ -36,8 +37,12 @@ class EventLoop {
 
     // Installs a signalfd-backed watcher.  The calling thread's mask is
     // updated before signalfd is created, avoiding async-signal-unsafe work
-    // inside a POSIX signal handler.
-    void quit_on_signals(std::initializer_list<int> signals);
+    // inside a POSIX signal handler.  With no callback the first signal quits
+    // immediately.  A callback may start an asynchronous graceful shutdown;
+    // the callback is never entered more than once and the loop keeps running
+    // until that shutdown explicitly calls quit().
+    void quit_on_signals(std::initializer_list<int> signals,
+                         SignalCallback callback = {});
 
     void update_channel(Channel* channel);
     void remove_channel(Channel* channel);
@@ -89,6 +94,8 @@ class EventLoop {
     std::unique_ptr<Channel> signal_channel_;
     sigset_t old_signal_mask_{};
     bool signal_mask_saved_{false};
+    SignalCallback signal_callback_;
+    bool signal_callback_invoked_{false};
 };
 
 } // namespace minidb

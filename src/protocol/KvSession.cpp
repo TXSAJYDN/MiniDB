@@ -136,14 +136,6 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
         send_response(KvProtocol::kError, {std::string(usage)});
         return false;
     };
-    const auto fail_mutation = [&](const MutationOutcome& outcome) {
-        const std::string message =
-            outcome.status == MutationStatus::kInvalidArgument
-                ? outcome.error
-                : std::string("Persistence write failed");
-        send_response(KvProtocol::kError, {message});
-        return true;
-    };
 
     switch (cmd.type) {
     case KvProtocol::kPing:
@@ -158,14 +150,17 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
             return true;
         }
         if (persistence_manager_) {
-            const MutationOutcome outcome =
-                persistence_manager_->set(cmd.args[0], cmd.args[1]);
-            if (!outcome.ok()) {
-                return fail_mutation(outcome);
-            }
-        } else {
-            store_->set(cmd.args[0], cmd.args[1]);
+            std::weak_ptr<KvSession> weak = weak_from_this();
+            const MutationAdmission admission = persistence_manager_->set_async(
+                cmd.args[0], cmd.args[1], [weak](MutationOutcome outcome) {
+                    if (auto self = weak.lock()) {
+                        self->on_mutation_completed(std::move(outcome),
+                                                    KvProtocol::kOk);
+                    }
+                });
+            return begin_async_operation(admission);
         }
+        store_->set(cmd.args[0], cmd.args[1]);
         return send_response(KvProtocol::kOk, {});
 
     case KvProtocol::kGet:
@@ -184,17 +179,19 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
             !validate_key(cmd.args[0], "DEL")) {
             return true;
         } else {
-            bool deleted = false;
             if (persistence_manager_) {
-                const MutationOutcome outcome =
-                    persistence_manager_->del(cmd.args[0]);
-                if (!outcome.ok()) {
-                    return fail_mutation(outcome);
-                }
-                deleted = outcome.changed;
-            } else {
-                deleted = store_->del(cmd.args[0]);
+                std::weak_ptr<KvSession> weak = weak_from_this();
+                const MutationAdmission admission =
+                    persistence_manager_->del_async(
+                        cmd.args[0], [weak](MutationOutcome outcome) {
+                            if (auto self = weak.lock()) {
+                                self->on_mutation_completed(
+                                    std::move(outcome), KvProtocol::kInteger);
+                            }
+                        });
+                return begin_async_operation(admission);
             }
+            const bool deleted = store_->del(cmd.args[0]);
             return send_response(KvProtocol::kInteger, {deleted ? "1" : "0"});
         }
 
@@ -213,14 +210,18 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
             return true;
         }
         if (persistence_manager_) {
-            const MutationOutcome outcome =
-                persistence_manager_->expire(cmd.args[0], ttl_ms);
-            if (!outcome.ok()) {
-                return fail_mutation(outcome);
-            }
-        } else {
-            store_->expire(cmd.args[0], ttl_ms);
+            std::weak_ptr<KvSession> weak = weak_from_this();
+            const MutationAdmission admission =
+                persistence_manager_->expire_async(
+                    cmd.args[0], ttl_ms, [weak](MutationOutcome outcome) {
+                        if (auto self = weak.lock()) {
+                            self->on_mutation_completed(std::move(outcome),
+                                                        KvProtocol::kOk);
+                        }
+                    });
+            return begin_async_operation(admission);
         }
+        store_->expire(cmd.args[0], ttl_ms);
         return send_response(KvProtocol::kOk, {});
     }
 
@@ -242,24 +243,11 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
             return true;
         }
 
-    case KvProtocol::kSave: {
+    case KvProtocol::kSave:
         if (!require_args(0, "SAVE takes no arguments")) {
             return true;
         }
-        if (!save_callback_) {
-            send_response(KvProtocol::kError, {"SAVE is unavailable"});
-            return true;
-        }
-        const RdbSaveResult result = save_callback_();
-        if (result == RdbSaveResult::Ok) {
-            return send_response(KvProtocol::kOk, {});
-        }
-        send_response(KvProtocol::kError,
-                      {result == RdbSaveResult::DurabilityUnconfirmed
-                           ? "RDB durability unconfirmed"
-                           : "Failed to save RDB"});
-        return true;
-    }
+        return handle_save();
 
     case KvProtocol::kStats:
         if (!require_args(0, "STATS takes no arguments")) {
@@ -278,6 +266,116 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
         fail_and_close("Unknown command");
         return false;
     }
+}
+
+bool KvSession::handle_save() {
+    if (persistence_manager_) {
+        std::weak_ptr<KvSession> weak = weak_from_this();
+        std::string error;
+        if (!persistence_manager_->checkpoint_async(
+                [weak](RdbSaveResult result,
+                       const std::string& completion_error) {
+                    if (auto self = weak.lock()) {
+                        self->on_save_completed(result, completion_error);
+                    }
+                },
+                &error)) {
+            Log::Error("SAVE could not start: " + error);
+            send_response(KvProtocol::kError, {"Failed to save RDB"});
+        }
+        return true;
+    }
+
+    if (!save_callback_) {
+        send_response(KvProtocol::kError, {"SAVE is unavailable"});
+        return true;
+    }
+    const RdbSaveResult result = save_callback_();
+    on_save_completed(result, {});
+    return true;
+}
+
+bool KvSession::begin_async_operation(const MutationAdmission& admission) {
+    if (admission.accepted()) {
+        return true;
+    }
+    send_admission_failure(admission);
+    return true;
+}
+
+void KvSession::on_mutation_completed(MutationOutcome outcome,
+                                      KvProtocol::CommandType success_type) {
+    if (closed_) {
+        return;
+    }
+    if (!outcome.ok()) {
+        send_mutation_failure(outcome);
+        return;
+    }
+    if (success_type == KvProtocol::kInteger) {
+        send_response(KvProtocol::kInteger, {outcome.changed ? "1" : "0"});
+        return;
+    }
+    send_response(success_type, {});
+}
+
+void KvSession::on_save_completed(RdbSaveResult result,
+                                  const std::string& error) {
+    if (closed_) {
+        return;
+    }
+    if (result == RdbSaveResult::Ok) {
+        send_response(KvProtocol::kOk, {});
+        return;
+    }
+    if (result == RdbSaveResult::DurabilityUnconfirmed) {
+        send_response(KvProtocol::kError, {"RDB durability unconfirmed"});
+        return;
+    }
+    if (!error.empty()) {
+        Log::Error("SAVE failed: " + error);
+    }
+    send_response(KvProtocol::kError, {"Failed to save RDB"});
+}
+
+void KvSession::send_mutation_failure(const MutationOutcome& outcome) {
+    std::string message = "Persistence write failed";
+    switch (outcome.status) {
+    case MutationStatus::kInvalidArgument:
+        message = outcome.error.empty() ? "Invalid argument" : outcome.error;
+        break;
+    case MutationStatus::kResourceLimit:
+        message = "Persistence resource limit exceeded";
+        break;
+    case MutationStatus::kNotReady:
+        message = "Persistence is not accepting writes";
+        break;
+    case MutationStatus::kIoError:
+    case MutationStatus::kOk:
+        break;
+    }
+    send_response(KvProtocol::kError, {message});
+}
+
+void KvSession::send_admission_failure(const MutationAdmission& admission) {
+    std::string message = "Persistence is not accepting writes";
+    switch (admission.status) {
+    case MutationAdmissionStatus::kInvalidArgument:
+        message =
+            admission.error.empty() ? "Invalid argument" : admission.error;
+        break;
+    case MutationAdmissionStatus::kResourceLimit:
+        message = "Persistence resource limit exceeded";
+        break;
+    case MutationAdmissionStatus::kIoError:
+        message = "Persistence write failed";
+        break;
+    case MutationAdmissionStatus::kNotReady:
+    case MutationAdmissionStatus::kShuttingDown:
+    case MutationAdmissionStatus::kAccepted:
+        break;
+    }
+    send_response(KvProtocol::kError, {message});
 }
 
 bool KvSession::send_response(KvProtocol::CommandType type,

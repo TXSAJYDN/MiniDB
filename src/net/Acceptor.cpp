@@ -1,6 +1,7 @@
 #include "Acceptor.h"
 #include "../base/Log.h"
 #include <cerrno>
+#include <stdexcept>
 #include <cstring>
 #include <fcntl.h>
 #include <string>
@@ -70,9 +71,25 @@ Acceptor::~Acceptor() {
 
 void Acceptor::listen() {
     loop_->assert_in_loop_thread();
+    if (accept_socket_.fd() < 0) {
+        throw std::logic_error("Acceptor cannot listen after stop");
+    }
     listening_ = true;
     accept_socket_.listen();
     accept_channel_.enable_reading();
+}
+
+void Acceptor::stop() {
+    loop_->assert_in_loop_thread();
+    if (retry_timer_id_ != 0) {
+        loop_->cancel_timer(retry_timer_id_);
+        retry_timer_id_ = 0;
+    }
+    listening_ = false;
+    accept_paused_ = false;
+    accept_channel_.disable_all();
+    accept_channel_.remove();
+    accept_socket_.close();
 }
 
 void Acceptor::pause_accepting() {

@@ -5,6 +5,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace minidb {
 namespace {
@@ -40,6 +41,17 @@ void KvServer::start() {
     if (started_) {
         return;
     }
+    if (persistence_manager_ && !persistence_manager_->group_commit_started()) {
+        std::string error;
+        if (!persistence_manager_->start_group_commit(
+                [this](std::function<void()> work) {
+                    loop_->queue_in_loop(std::move(work));
+                },
+                &error)) {
+            throw std::runtime_error(
+                "failed to start the group commit writer: " + error);
+        }
+    }
     scanner_lease_ = kv_store_->acquire_scanner();
     try {
         server_.start();
@@ -64,8 +76,107 @@ void KvServer::stop() {
         loop_->cancel_timer(interval_timer_id_);
         interval_timer_id_ = 0;
     }
+    if (shutdown_retry_timer_id_ != 0) {
+        loop_->cancel_timer(shutdown_retry_timer_id_);
+        shutdown_retry_timer_id_ = 0;
+    }
     scanner_lease_.reset();
     started_ = false;
+}
+
+void KvServer::begin_shutdown(ShutdownCompletion completion) {
+    loop_->assert_in_loop_thread();
+    if (shutdown_complete_) {
+        if (completion) {
+            completion(shutdown_result_, shutdown_error_);
+        }
+        return;
+    }
+    if (completion) {
+        shutdown_completions_.push_back(std::move(completion));
+    }
+    if (shutdown_started_) {
+        return;
+    }
+    shutdown_started_ = true;
+
+    if (interval_timer_id_ != 0) {
+        loop_->cancel_timer(interval_timer_id_);
+        interval_timer_id_ = 0;
+    }
+    scanner_lease_.reset();
+    server_.stop();
+    started_ = false;
+
+    if (!persistence_manager_ ||
+        !persistence_manager_->group_commit_started()) {
+        finish_shutdown(RdbSaveResult::Ok, {});
+        return;
+    }
+    try_start_persistence_shutdown();
+}
+
+void KvServer::try_start_persistence_shutdown() {
+    shutdown_retry_timer_id_ = 0;
+    if (!persistence_manager_ || persistence_shutdown_pending_ ||
+        shutdown_complete_) {
+        return;
+    }
+    std::string error;
+    persistence_shutdown_pending_ = true;
+    if (!persistence_manager_->shutdown_async(
+            [this](RdbSaveResult result, const std::string& completion_error) {
+                persistence_shutdown_pending_ = false;
+                finish_shutdown(result, completion_error);
+            },
+            &error)) {
+        persistence_shutdown_pending_ = false;
+        if (error.find("control operation") != std::string::npos ||
+            error.find("in progress") != std::string::npos) {
+            shutdown_retry_timer_id_ = loop_->run_after(
+                10, [this]() { try_start_persistence_shutdown(); });
+            return;
+        }
+        finish_shutdown(RdbSaveResult::Failed, error);
+    }
+}
+
+void KvServer::finish_shutdown(RdbSaveResult result, const std::string& error) {
+    if (shutdown_complete_) {
+        return;
+    }
+    shutdown_complete_ = true;
+    shutdown_result_ = result;
+    shutdown_error_ = error;
+    if (result == RdbSaveResult::Ok) {
+        std::ostringstream message;
+        message << "Saved " << kv_store_->size()
+                << " keys to the durable checkpoint";
+        Log::Info(message.str());
+    } else if (result == RdbSaveResult::DurabilityUnconfirmed) {
+        Log::Error("Checkpoint was replaced but directory fsync failed; "
+                   "durability is unconfirmed");
+    } else {
+        Log::Error(error.empty() ? "Failed to save the durable checkpoint"
+                                 : "Checkpoint failed: " + error);
+    }
+
+    std::vector<ShutdownCompletion> completions =
+        std::move(shutdown_completions_);
+    shutdown_completions_.clear();
+    for (ShutdownCompletion& callback : completions) {
+        if (!callback) {
+            continue;
+        }
+        try {
+            callback(result, error);
+        } catch (const std::exception& ex) {
+            Log::Error(std::string("shutdown completion threw: ") + ex.what());
+        } catch (...) {
+            Log::Error("shutdown completion threw an unknown exception");
+        }
+    }
+    loop_->quit();
 }
 
 void KvServer::set_kv_store(std::shared_ptr<KvStore> store) {
@@ -152,9 +263,22 @@ void KvServer::flush_interval() {
         return;
     }
     std::string error;
-    if (!persistence_manager_->flush_interval(&error)) {
-        Log::Error("INTERVAL WAL flush failed; stopping fail-closed: " + error);
-        loop_->quit();
+    if (!persistence_manager_->flush_interval_async(
+            [this](bool success, const std::string& flush_error) {
+                if (success) {
+                    return;
+                }
+                Log::Error("INTERVAL WAL flush failed; stopping fail-closed: " +
+                           flush_error);
+                begin_shutdown();
+            },
+            &error)) {
+        // A checkpoint or prior barrier owns the writer; the next timer tick
+        // will retry.  Anything else is a terminal interval-flush failure.
+        if (error.find("control operation") == std::string::npos) {
+            Log::Error("INTERVAL WAL flush could not be scheduled: " + error);
+            begin_shutdown();
+        }
     }
 }
 

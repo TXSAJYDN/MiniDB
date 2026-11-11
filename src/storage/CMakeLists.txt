@@ -7,6 +7,7 @@ add_library(minidb_storage
     CheckpointManifest.cpp
     SingleWriterLock.cpp
     WalManager.cpp
+    GroupCommitWriter.cpp
     WalReplay.cpp
     RecoveryManager.cpp
     PersistenceManager.cpp

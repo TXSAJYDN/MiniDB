@@ -1,6 +1,6 @@
 # ADR-005：R4-A 组提交候选设计与证据门槛
 
-- 状态：Proposed — evidence-gated；G1-G3 PASS，等待实现级 ADR；组提交未实现
+- 状态：Accepted — 由 ADR-006 落实实现；G1-G3 PASS，G4 clean-HEAD 证据待采集，G5/G6 本地通过
 - 日期：2026-11-11
 - 关联：`docs/MiniDB-可靠性与持久化升级计划书.md`、`docs/architecture.md`、`docs/reliability-evidence.md`
 - 决策范围：R4-A 的设计、观测口径和准入条件；不包含组提交实现
@@ -227,7 +227,8 @@ harness SHA-256
 P99 2,716.800 us；客户端延迟 P50 111,990.761 us、P99 133,233.279 us。
 `strace` 下 median QPS 为 283.293，只用于说明采集环境，不能用于评价 G4。
 实验为 WSL2 loopback、closed-loop、单客户端单在途请求的外部观测；pending
-计数是未来批处理机会的上界，不是服务器队列已有记录的证据。G4-G7 尚未开始。
+计数是批处理机会的上界，不是服务器队列已有记录的证据。实现、失败语义和
+资源上限见 [ADR-006](006-group-commit-implementation.md)。
 
 ### G4：收益足够大
 
@@ -283,9 +284,13 @@ P99 2,716.800 us；客户端延迟 P50 111,990.761 us、P99 133,233.279 us。
   SHA-256
   `f68b485204600ba83d88dd04834ee2df08595776af150cdfb164846ae6b4439d`。
   该实验只证明外部请求层面存在 batch 形成机会。
-- **G4-G7：NOT STARTED。** 在另写实现级 ADR 前，不启动 writer、queue、
-  batch、completion 或 `BATCHED` 实现；G4 收益、G5 正确性、G6 资源上限和
-  G7 实现记录均尚无证据。
+- **G4：PENDING CLEAN HEAD。** 组提交 writer/queue/batch/completion 已由
+  [ADR-006](006-group-commit-implementation.md) 实现；正式收益必须在提交并
+  通过 CI 的 clean HEAD 上，用 5 轮 32 客户端 write 实验采集。
+- **G5/G6：LOCAL PASS。** 338 项 CTest、24 个进程用例、故障注入、writer
+  资源上限和 fail-stop 测试通过；最终证据以 clean HEAD 的完整门禁记录为准。
+- **G7：IN PROGRESS。** ADR-006 已记录实现选择、失败矩阵、资源上限和代码
+  落点；完成后补齐 G4 artifact 与最终状态。
 
 ## 明确非目标
 
@@ -308,8 +313,9 @@ P99 2,716.800 us；客户端延迟 P50 111,990.761 us、P99 133,233.279 us。
 
 ## 后果
 
-- R4-A 当前只增加诊断能力、设计门槛和外部非生产实验，主线仍保持简单、可审计
-  的每写一 fsync 路径；G1-G3 已 PASS。
-- 下一步必须另写实现级 ADR；如果 writer/completion、资源上限或失败矩阵无法
-  被清晰定义，项目应停在当前架构，而不是为了“看起来更高级”引入不必要的并发。
-- 如果进入实现，收益必须用同一环境下的可复现实验和完整正确性矩阵证明。
+- R4-A 的实现选择、失败矩阵和资源上限由 ADR-006 冻结；G1-G3 已 PASS，
+  G5/G6 本地通过。
+- 正式 G4 收益仍必须用同一环境、相同数据集和至少 5 轮的可复现实验证明；
+  未达到门槛时不得把实现写成性能收益成立。
+- 任何后续扩展都必须保持现有 ack 持久性语义、LSN 连续性和有界资源，不得为了
+  吞吐放宽正确性。

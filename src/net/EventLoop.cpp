@@ -246,11 +246,13 @@ void EventLoop::cancel_timer(TimerId id) {
     arm_timer();
 }
 
-void EventLoop::quit_on_signals(std::initializer_list<int> signals) {
+void EventLoop::quit_on_signals(std::initializer_list<int> signals,
+                                SignalCallback callback) {
     assert_in_loop_thread();
     if (signal_channel_) {
         return;
     }
+    signal_callback_ = std::move(callback);
     sigset_t mask;
     sigemptyset(&mask);
     for (int signal_number : signals) {
@@ -346,7 +348,25 @@ void EventLoop::handle_signal_read() {
         struct signalfd_siginfo info;
         const ssize_t n = ::read(signal_fd_, &info, sizeof(info));
         if (n == static_cast<ssize_t>(sizeof(info))) {
-            quit();
+            if (!signal_callback_) {
+                quit();
+                continue;
+            }
+            if (signal_callback_invoked_) {
+                continue;
+            }
+            signal_callback_invoked_ = true;
+            try {
+                signal_callback_();
+            } catch (const std::exception& ex) {
+                Log::Error(std::string("signal shutdown callback threw: ") +
+                           ex.what());
+                quit();
+            } catch (...) {
+                Log::Error(
+                    "signal shutdown callback threw an unknown exception");
+                quit();
+            }
             continue;
         }
         if (n < 0 && errno == EINTR) {

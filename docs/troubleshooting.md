@@ -1,9 +1,9 @@
 # Troubleshooting
 
-This guide targets the current R0-R3 reliability implementation: WAL + RDB
-checkpoint + manifest recovery, `SYNC` and `INTERVAL` durability, and the
-single-writer lock. It is diagnostic guidance for a local engineering prototype,
-not a production runbook.
+This guide targets the current R0-R4-A reliability implementation: WAL + RDB
+checkpoint + manifest recovery, `SYNC` and `INTERVAL` durability, the
+single-writer lock, and the bounded group-commit writer. It is diagnostic
+guidance for a local engineering prototype, not a production runbook.
 
 ## First checks
 
@@ -21,7 +21,7 @@ clang++ --version
 ctest --test-dir build/release -N | tail -n 3
 ~~~
 
-The final local acceptance inventory is 305 CTest cases, including 19
+The final local acceptance inventory is 338 CTest cases, including 24
 `ProcessIntegrationTest.*` cases. Always identify the build directory and
 configuration you are actually using; an old or partial build can report a
 different count.
@@ -51,18 +51,19 @@ cmake --build build/debug -j2
 ctest --test-dir build/debug -N | tail -n 3
 ~~~
 
-The current inventory is 305 tests. A lower count usually means an old build
+The current inventory is 338 tests. A lower count usually means an old build
 directory or an incomplete build. The 214 count in
 `docs/A_H_ACCEPTANCE_REPORT.md` is historical pre-WAL evidence and is not the
 current inventory.
 
 ## A process integration test is missing
 
-The current process suite has 19 cases and covers CLI validation, HTTP/KV
+The current process suite has 24 cases and covers CLI validation, HTTP/KV
 persistence, TTL scanner lifecycle, corrupt startup, save failure, crash
 recovery, interval flush, writer-lock conflict, WAL tail truncation, manifest
 corruption, missing WAL segment, middle-of-file WAL corruption, legacy import,
-random kill replay, TTL crash recovery, and the stats contract.
+random kill replay, TTL crash recovery, async mutation ordering, group-commit
+stats, shutdown failure exit codes, and the stats contract.
 
 Run only that suite in Release:
 
@@ -70,7 +71,7 @@ Run only that suite in Release:
 ctest --preset release -R '^ProcessIntegrationTest\.' --output-on-failure
 ~~~
 
-If fewer than 19 are discovered, rebuild the full test target rather than
+If fewer than 24 are discovered, rebuild the full test target rather than
 running `process_integration_test.py` ad hoc outside CTest.
 
 ## TSan fails with unexpected memory mapping
@@ -267,6 +268,27 @@ Observed behavior:
 
 Check the server log, filesystem errors, free space, and the stats JSON. Do not
 clear the error flag in place and continue writing.
+
+## Group-commit admission is full
+
+The writer has fixed admission and completion limits. When admission is full,
+MiniDB rejects the mutation before assigning an LSN: HTTP returns a JSON resource
+limit error (currently status 413) and KV returns `ERROR` with
+`Persistence resource limit exceeded`. A rejected request does not invoke its
+completion callback and is not silently queued.
+
+Inspect the top-level `group_commit` object in `/stats` or KV `STATS`:
+
+- `queue_rejections` identifies admission pressure;
+- `queue_current_entries`, `queue_max_entries`, and their byte counterparts
+  show queue occupancy and high-water marks;
+- `completion_backlog_*` shows owner-loop drain pressure;
+- `writer_failures`, `append_failures`, `fsync_failures`, and
+  `writer_state` distinguish overload from a fail-stop storage error.
+
+Do not raise limits or retry in a tight loop before identifying whether the
+bottleneck is the writer, fsync, the owner loop, or a stalled client. A full
+completion backlog is a fail-stop condition, not ordinary backpressure.
 
 ## Save or checkpoint fails during shutdown
 

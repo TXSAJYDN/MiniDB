@@ -38,6 +38,28 @@ The legacy import path does not write during recovery. The existing RDB is loade
 into a temporary store, and the first persistence write establishes the initial
 manifest and WAL segment.
 
+## Group-commit checkpoint boundary
+
+At runtime, a checkpoint cannot snapshot an LSN that has been written or fsynced
+by the writer but not yet applied by the owner loop. SAVE, interval flush, and
+shutdown therefore use a writer barrier:
+
+1. pause new mutation admission;
+2. let the writer drain every record accepted before the barrier;
+3. return completions to the owner loop and apply them in LSN order;
+4. flush the WAL and rotate the active segment when required;
+5. publish the RDB snapshot and manifest;
+6. clean up old WAL segments;
+7. resume the writer or enter final shutdown.
+
+A barrier failure keeps the writer paused or failed and prevents manifest
+publication. Shutdown failure is reflected in a nonzero process exit code; a
+failed graceful shutdown is not reported as success.
+
+The writer owns WAL append, fsync, rotation, and cleanup after it starts.
+Recovery itself still runs before the writer is created and follows the same
+manifest + LSN validation rules as earlier releases.
+
 ## Normal recovery algorithm
 
 1. Read and validate the manifest.
@@ -143,9 +165,10 @@ The recovery portion of `/stats` and `STATS` reports:
 - `ignored_residue_segments`;
 - `legacy_import`, `needs_bootstrap`, `manifest_present`.
 
-These fields come from one `PersistenceSnapshot` taken under the persistence
-mutex. They describe the recovery that produced the currently running process,
-not a live re-scan of the data directory.
+These fields come from one `PersistenceSnapshot`. Writer queue, completion
+backlog, WAL bytes, and writer state share a coherent snapshot. They describe the
+recovery that produced the currently running process, not a live re-scan of the
+data directory.
 
 ## Related documents
 
@@ -154,3 +177,4 @@ not a live re-scan of the data directory.
 - [Reliability evidence](reliability-evidence.md)
 - [ADR-002](decisions/002-wal-and-crash-consistency.md)
 - [ADR-004](decisions/004-wal-resource-policy.md)
+- [ADR-006](decisions/006-group-commit-implementation.md)

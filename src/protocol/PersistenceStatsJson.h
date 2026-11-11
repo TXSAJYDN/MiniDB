@@ -56,7 +56,59 @@ inline std::string persistence_stats_json(const PersistenceSnapshot& stats) {
         }
         out << stats.wal.data_fsync_latency_buckets[index];
     }
-    out << "]},\"recovery\":{\"rdb_records\":" << stats.recovery.rdb_records
+    out << "]},\"group_commit\":{\"queue_current_entries\":"
+        << stats.group_commit.queue_current_entries
+        << ",\"queue_max_entries\":" << stats.group_commit.queue_max_entries
+        << ",\"queue_current_bytes\":" << stats.group_commit.queue_current_bytes
+        << ",\"queue_max_bytes\":" << stats.group_commit.queue_max_bytes
+        << ",\"queue_rejections\":" << stats.group_commit.queue_rejections
+        << ",\"batches\":" << stats.group_commit.batches
+        << ",\"batch_records\":" << stats.group_commit.batch_records
+        << ",\"batch_bytes\":" << stats.group_commit.batch_bytes
+        << ",\"max_batch_records\":" << stats.group_commit.max_batch_records
+        << ",\"max_batch_bytes\":" << stats.group_commit.max_batch_bytes
+        << ",\"batch_size_bucket_bounds\":[";
+    for (std::size_t index = 0; index < kGroupCommitBatchSizeBounds.size();
+         ++index) {
+        if (index != 0) {
+            out << ',';
+        }
+        out << kGroupCommitBatchSizeBounds[index];
+    }
+    out << "],\"batch_size_bucket_counts\":[";
+    for (std::size_t index = 0;
+         index < stats.group_commit.batch_size_bucket_counts.size(); ++index) {
+        if (index != 0) {
+            out << ',';
+        }
+        out << stats.group_commit.batch_size_bucket_counts[index];
+    }
+    out << "],\"data_fsyncs\":" << stats.group_commit.data_fsyncs
+        << ",\"writer_loop_total_us\":"
+        << stats.group_commit.writer_loop_total_us
+        << ",\"writer_loop_max_us\":" << stats.group_commit.writer_loop_max_us
+        << ",\"submit_to_fsync_total_us\":"
+        << stats.group_commit.submit_to_fsync_total_us
+        << ",\"submit_to_fsync_max_us\":"
+        << stats.group_commit.submit_to_fsync_max_us
+        << ",\"fsync_to_apply_total_us\":"
+        << stats.group_commit.fsync_to_apply_total_us
+        << ",\"fsync_to_apply_max_us\":"
+        << stats.group_commit.fsync_to_apply_max_us
+        << ",\"completion_backlog_current\":"
+        << stats.group_commit.completion_backlog_current
+        << ",\"completion_backlog_max\":"
+        << stats.group_commit.completion_backlog_max
+        << ",\"completion_backlog_current_bytes\":"
+        << stats.group_commit.completion_backlog_current_bytes
+        << ",\"completion_backlog_max_bytes\":"
+        << stats.group_commit.completion_backlog_max_bytes
+        << ",\"writer_failures\":" << stats.group_commit.writer_failures
+        << ",\"append_failures\":" << stats.group_commit.append_failures
+        << ",\"fsync_failures\":" << stats.group_commit.fsync_failures
+        << ",\"writer_state\":\""
+        << group_commit_writer_state_name(stats.group_commit.writer_state)
+        << "\"},\"recovery\":{\"rdb_records\":" << stats.recovery.rdb_records
         << ",\"checkpoint_lsn\":" << stats.recovery.checkpoint_lsn
         << ",\"last_lsn\":" << stats.recovery.last_lsn
         << ",\"next_lsn\":" << stats.recovery.next_lsn

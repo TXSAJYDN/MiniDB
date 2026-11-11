@@ -48,6 +48,21 @@ void TcpServer::start() {
     }
 }
 
+void TcpServer::stop() {
+    loop_->assert_in_loop_thread();
+    acceptor_->stop();
+    started_ = false;
+
+    // Copy first: shutdown() may queue close delivery, but it must never be
+    // called while iterating the live map that close callbacks can erase.
+    ConnectionMap connections = connections_;
+    for (auto& item : connections) {
+        if (item.second) {
+            item.second->shutdown();
+        }
+    }
+}
+
 void TcpServer::new_connection(int sockfd, const InetAddress& peer_addr) {
     loop_->assert_in_loop_thread();
     if (connections_.size() >= kMaxConnections) {

@@ -286,5 +286,121 @@ TEST_F(WalManagerTest, DirectoryFsyncFailureFailsOpenClosed) {
     EXPECT_FALSE(manager.healthy());
 }
 
+TEST_F(WalManagerTest, BatchSyncUsesOneTailFsyncAndAdvancesContiguousLsn) {
+    auto operations = std::make_shared<minidb_test::FaultWalFileOperations>();
+    WalManager manager(wal_dir_, operations);
+    ASSERT_TRUE(manager.open({}, 1));
+    const std::uint64_t fsync_before = manager.stats().data_fsyncs;
+    const std::vector<WalRecord> batch = {MakeRecord(1, "a", "one"),
+                                          MakeRecord(2, "b", "two"),
+                                          MakeRecord(3, "c", "three")};
+    std::string error;
+    ASSERT_EQ(manager.append_batch(batch, DurabilityMode::kSync, &error),
+              WalResult::kOk)
+        << error;
+    EXPECT_EQ(manager.next_lsn(), 4u);
+    EXPECT_EQ(manager.stats().data_fsyncs, fsync_before + 1);
+    EXPECT_EQ(manager.stats().appends, 3u);
+    EXPECT_EQ(manager.stats().bytes_written,
+              WalFormat::encoded_size(batch[0]) +
+                  WalFormat::encoded_size(batch[1]) +
+                  WalFormat::encoded_size(batch[2]));
+    EXPECT_EQ(DataFsyncBucketCount(manager.stats()),
+              manager.stats().data_fsyncs);
+}
+
+TEST_F(WalManagerTest, BatchCanRotateAcrossSegments) {
+    auto operations = std::make_shared<minidb_test::FaultWalFileOperations>();
+    WalLimits limits;
+    limits.max_segment_bytes = 100;
+    limits.max_total_bytes = 4096;
+    limits.max_segments = 4;
+    WalManager manager(wal_dir_, operations, limits);
+    ASSERT_TRUE(manager.open({}, 1));
+    std::vector<WalRecord> batch;
+    for (std::uint64_t lsn = 1; lsn <= 5; ++lsn) {
+        batch.push_back(MakeRecord(lsn, "key", "value"));
+    }
+    std::string error;
+    ASSERT_EQ(manager.append_batch(batch, DurabilityMode::kSync, &error),
+              WalResult::kOk)
+        << error;
+    EXPECT_EQ(manager.next_lsn(), 6u);
+    EXPECT_EQ(manager.segments().size(), 3u);
+    EXPECT_EQ(manager.stats().rotations, 2u);
+    EXPECT_EQ(manager.stats().appends, 5u);
+    EXPECT_EQ(manager.active_segment()->start_lsn, 5u);
+}
+
+TEST_F(WalManagerTest, BatchPrefersTheWholeBatchBeforeWritingWhenTooLarge) {
+    auto operations = std::make_shared<minidb_test::FaultWalFileOperations>();
+    WalLimits limits;
+    limits.max_segment_bytes = 100;
+    limits.max_total_bytes = 80;
+    limits.max_segments = 2;
+    WalManager manager(wal_dir_, operations, limits);
+    ASSERT_TRUE(manager.open({}, 1));
+    const std::uint64_t fsync_before = manager.stats().data_fsyncs;
+    std::string error;
+    const std::vector<WalRecord> batch = {MakeRecord(1, "key", "value"),
+                                          MakeRecord(2, "key", "value")};
+    EXPECT_EQ(manager.append_batch(batch, DurabilityMode::kSync, &error),
+              WalResult::kResourceLimit);
+    EXPECT_TRUE(manager.healthy());
+    EXPECT_EQ(manager.next_lsn(), 1u);
+    EXPECT_EQ(manager.stats().appends, 0u);
+    EXPECT_EQ(manager.stats().data_fsyncs, fsync_before);
+}
+
+TEST_F(WalManagerTest, EmptyAndNonContiguousBatchesFailClosed) {
+    WalManager manager(wal_dir_);
+    ASSERT_TRUE(manager.open({}, 1));
+    std::string error;
+    EXPECT_EQ(manager.append_batch({}, DurabilityMode::kSync, &error),
+              WalResult::kInvalidArgument);
+    EXPECT_TRUE(manager.healthy());
+
+    std::vector<WalRecord> batch = {MakeRecord(1), MakeRecord(3)};
+    EXPECT_EQ(manager.append_batch(batch, DurabilityMode::kSync, &error),
+              WalResult::kIoError);
+    EXPECT_FALSE(manager.healthy());
+    EXPECT_EQ(manager.stats().appends, 0u);
+}
+
+TEST_F(WalManagerTest, BatchPartialWriteAdvancesOnlyCompleteRecords) {
+    auto operations = std::make_shared<minidb_test::FaultWalFileOperations>();
+    WalManager manager(wal_dir_, operations);
+    ASSERT_TRUE(manager.open({}, 1));
+    operations->set_partial_write_then_fail(2, 5, ENOSPC);
+    std::string error;
+    const std::vector<WalRecord> batch = {MakeRecord(1), MakeRecord(2),
+                                          MakeRecord(3)};
+    EXPECT_EQ(manager.append_batch(batch, DurabilityMode::kSync, &error),
+              WalResult::kIoError);
+    EXPECT_FALSE(manager.healthy());
+    EXPECT_EQ(manager.next_lsn(), 2u);
+    EXPECT_EQ(manager.stats().appends, 1u);
+}
+
+TEST_F(WalManagerTest, BatchFsyncFailureDoesNotApplyOrReportSuccess) {
+    auto operations = std::make_shared<minidb_test::FaultWalFileOperations>();
+    WalManager manager(wal_dir_, operations);
+    ASSERT_TRUE(manager.open({}, 1));
+    const std::uint64_t fsync_before = manager.stats().data_fsyncs;
+    operations->set_fail_fsync(EIO);
+    std::string error;
+    const std::vector<WalRecord> batch = {MakeRecord(1), MakeRecord(2),
+                                          MakeRecord(3)};
+    EXPECT_EQ(manager.append_batch(batch, DurabilityMode::kSync, &error),
+              WalResult::kIoError);
+    EXPECT_FALSE(manager.healthy());
+    EXPECT_NE(error.find("fsync"), std::string::npos);
+    EXPECT_EQ(manager.next_lsn(), 4u);
+    EXPECT_EQ(manager.stats().appends, 3u);
+    EXPECT_EQ(manager.stats().data_fsyncs, fsync_before);
+    EXPECT_EQ(DataFsyncBucketCount(manager.stats()),
+              manager.stats().data_fsyncs);
+}
+
 } // namespace
 } // namespace minidb

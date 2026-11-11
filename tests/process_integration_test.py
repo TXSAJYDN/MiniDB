@@ -125,6 +125,94 @@ def read_http_response(port, method, path, body=b"", timeout=5.0):
         return status, headers, payload
 
 
+class HttpSocketReader:
+    def __init__(self, sock, timeout=10.0):
+        self.sock = sock
+        self.timeout = timeout
+        self.buffer = b""
+        self.eof = False
+
+    def _receive_more(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TestError("timed out reading HTTP response")
+        self.sock.settimeout(remaining)
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            self.eof = True
+            return False
+        self.buffer += chunk
+        return True
+
+    def read_response(self, timeout=None):
+        if timeout is None:
+            timeout = self.timeout
+        deadline = time.monotonic() + timeout
+        while b"\r\n\r\n" not in self.buffer:
+            if not self._receive_more(deadline):
+                raise TestError("EOF before HTTP headers completed")
+
+        raw_headers, payload = self.buffer.split(b"\r\n\r\n", 1)
+        lines = raw_headers.decode("iso-8859-1").split("\r\n")
+        status_parts = lines[0].split(" ", 2)
+        check(len(status_parts) >= 2 and status_parts[0].startswith("HTTP/"),
+              f"malformed HTTP status line: {lines[0]!r}")
+        status = int(status_parts[1])
+        headers = {}
+        for line in lines[1:]:
+            name, separator, value = line.partition(":")
+            check(bool(separator), f"malformed HTTP header line: {line!r}")
+            headers.setdefault(name.strip().lower(), value.strip())
+
+        content_length = int(headers.get("content-length", "0"))
+        while len(payload) < content_length:
+            if not self._receive_more(deadline):
+                raise TestError("EOF before HTTP body completed")
+            raw_headers, payload = self.buffer.split(b"\r\n\r\n", 1)
+
+        check(len(payload) >= content_length,
+              f"HTTP body length {len(payload)} < Content-Length {content_length}")
+        body = payload[:content_length]
+        self.buffer = payload[content_length:]
+        return status, headers, body
+
+    def wait_eof(self, timeout=None):
+        if timeout is None:
+            timeout = self.timeout
+        deadline = time.monotonic() + timeout
+        while not self.eof:
+            if self.buffer:
+                self.buffer = b""
+            self._receive_more(deadline)
+        return True
+
+
+def http_request_bytes(port, method, path, body=b"", connection="keep-alive"):
+    request = (
+        f"{method} {path} HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        f"Connection: {connection}\r\n"
+    ).encode("ascii")
+    if method == "POST" or body:
+        request += f"Content-Length: {len(body)}\r\n".encode("ascii")
+    return request + b"\r\n" + body
+
+
+def connect_http(port, timeout=10.0):
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    sock.settimeout(timeout)
+    return sock
+
+
+def reset_socket(sock):
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_LINGER,
+        struct.pack("ii", 1, 0),
+    )
+    sock.close()
+
+
 def kv_encode(command_type, args=()):
     payload = bytes((command_type, len(args)))
     for arg in args:
@@ -749,6 +837,48 @@ def test_save_failure_exit_code():
             server.cleanup()
 
 
+def test_shutdown_failure_exit_code():
+    with tempfile.TemporaryDirectory(
+            prefix="minidb-process-shutdownfail-") as temp_dir:
+        cases = (
+            ("HTTP", "shutdownfail-http.rdb", start_http, True),
+            ("KV", "shutdownfail-kv.rdb", start_kv, False),
+        )
+        original_mode = os.stat(temp_dir).st_mode
+        try:
+            for label, filename, starter, is_http in cases:
+                rdb_path = os.path.join(temp_dir, filename)
+                port = free_loopback_port()
+                server = starter(port, rdb_path, temp_dir, "sync")
+                try:
+                    if is_http:
+                        status, _, payload = read_http_response(
+                            port, "POST", "/kv/shutdownfail-key", b"value")
+                        check(status == 200 and payload == b"OK\n",
+                              f"failed to populate {label} before shutdown test")
+                    else:
+                        command_type, args = kv_request(
+                            port, HTTP_SET, ["shutdownfail-key", b"value"])
+                        check(command_type == 101 and args == [],
+                              f"{label} setup returned "
+                              f"type={command_type}, args={args!r}")
+
+                    os.chmod(temp_dir, 0o500)
+                    return_code = server.terminate_group(signal.SIGTERM)
+                    check(return_code == 1,
+                          f"{label} shutdown failure returned {return_code}, "
+                          f"expected 1:\n{server.log}")
+                    check("failed to publish checkpoint during shutdown"
+                          in server.log.lower(),
+                          f"{label} shutdown failure was not reported:\n"
+                          f"{server.log}")
+                finally:
+                    os.chmod(temp_dir, original_mode)
+                    server.cleanup()
+        finally:
+            os.chmod(temp_dir, original_mode)
+
+
 def test_http_sync_crash_recovery():
     with tempfile.TemporaryDirectory(prefix="minidb-process-http-crash-") as temp_dir:
         rdb_path = os.path.join(temp_dir, "http-sync-crash.rdb")
@@ -1173,6 +1303,219 @@ def test_ttl_crash_recovery():
             final.cleanup()
 
 
+def test_kv_async_protocol():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-kv-async-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "kv-async.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            commands = [
+                (HTTP_SET, [b"kv-pipe", b"first-value"]),
+                (HTTP_GET, [b"kv-pipe"]),
+                (KV_DEL, [b"kv-pipe"]),
+                (HTTP_GET, [b"kv-pipe"]),
+                (HTTP_SET, [b"kv-remain", b"remain-value"]),
+                (KV_SAVE, []),
+                (HTTP_SET, [b"kv-latest", b"after-save"]),
+                (HTTP_PING, []),
+            ]
+            expected = [
+                (101, []),
+                (102, [b"first-value"]),
+                (104, [b"1"]),
+                (103, []),
+                (101, []),
+                (101, []),
+                (101, []),
+                (101, [b"PONG"]),
+            ]
+            with socket.create_connection(("127.0.0.1", port), timeout=10.0) as sock:
+                sock.settimeout(10.0)
+                sock.sendall(b"".join(kv_encode(kind, args)
+                                      for kind, args in commands))
+                for index, (wanted_type, wanted_args) in enumerate(expected):
+                    command_type, args = kv_read_frame(sock)
+                    check(command_type == wanted_type and args == wanted_args,
+                          f"KV pipeline response {index} was "
+                          f"type={command_type}, args={args!r}, expected "
+                          f"type={wanted_type}, args={wanted_args!r}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, args = kv_request(port, HTTP_GET, ["kv-remain"])
+            check(command_type == 102 and args == [b"remain-value"],
+                  f"KV pipeline acknowledged SET was lost: "
+                  f"type={command_type}, args={args!r}")
+            command_type, args = kv_request(port, HTTP_GET, ["kv-latest"])
+            check(command_type == 102 and args == [b"after-save"],
+                  f"KV post-SAVE acknowledged SET was lost: "
+                  f"type={command_type}, args={args!r}")
+            command_type, args = kv_request(port, HTTP_GET, ["kv-pipe"])
+            check(command_type == 103,
+                  f"KV acknowledged DEL was resurrected: "
+                  f"type={command_type}, args={args!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"KV async recovery shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_kv_disconnect_safety():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-kv-reset-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "kv-reset.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            for index in range(4):
+                sock = socket.create_connection(("127.0.0.1", port), timeout=10.0)
+                sock.settimeout(10.0)
+                sock.sendall(kv_encode(
+                    HTTP_SET,
+                    [f"reset-{index}".encode(),
+                     bytes((value * 37 + index) & 0xff for value in range(524288))],
+                ))
+                reset_socket(sock)
+
+            save_sock = socket.create_connection(("127.0.0.1", port), timeout=10.0)
+            save_sock.settimeout(10.0)
+            save_sock.sendall(kv_encode(KV_SAVE))
+            reset_socket(save_sock)
+
+            command_type, args = kv_request(port, HTTP_PING, timeout=10.0)
+            check(command_type == 101 and args == [b"PONG"],
+                  f"KV server failed after peer reset: "
+                  f"type={command_type}, args={args!r}")
+            stats = wait_until(
+                lambda: (lambda current: current if
+                         current["group_commit"]["writer_state"] == "running"
+                         else None)(read_kv_stats(port)),
+                timeout=5.0,
+                message="KV writer did not resume after peer reset",
+            )
+            check(stats["group_commit"]["writer_failures"] == 0,
+                  f"KV writer failed after peer reset: {stats!r}")
+            check(server.terminate_group(signal.SIGTERM) == 0,
+                  f"KV reset-safe shutdown failed:\n{server.log}")
+        finally:
+            server.cleanup()
+
+
+def test_http_async_protocol():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-http-async-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "http-async.rdb")
+        port = free_loopback_port()
+        server = start_http(port, rdb_path, temp_dir, "sync")
+        try:
+            requests = b"".join([
+                http_request_bytes(port, "POST", "/kv/http-pipe", b"http-value"),
+                http_request_bytes(port, "GET", "/kv/http-pipe"),
+                http_request_bytes(port, "DELETE", "/kv/http-pipe"),
+                http_request_bytes(port, "GET", "/kv/http-pipe"),
+                http_request_bytes(port, "POST", "/kv/http-remain", b"remain"),
+                http_request_bytes(port, "POST", "/save"),
+            ])
+            expected = [
+                (200, b"OK\n"),
+                (200, b"http-value"),
+                (200, b"OK\n"),
+                (404, b"404 Not Found\n"),
+                (200, b"OK\n"),
+                (200, None),
+            ]
+            with connect_http(port) as sock:
+                sock.sendall(requests)
+                reader = HttpSocketReader(sock)
+                for index, (wanted_status, wanted_body) in enumerate(expected):
+                    status, headers, body = reader.read_response()
+                    check(status == wanted_status,
+                          f"HTTP pipeline response {index} status was {status}, "
+                          f"expected {wanted_status}: {body!r}")
+                    if wanted_body is not None:
+                        check(body == wanted_body,
+                              f"HTTP pipeline response {index} body was "
+                              f"{body!r}, expected {wanted_body!r}")
+                    else:
+                        check(headers.get("content-type") == "application/json",
+                              f"HTTP SAVE response content type was "
+                              f"{headers.get('content-type')!r}")
+                        check(json.loads(body.decode("utf-8"))["status"] == "ok",
+                              f"HTTP SAVE response was {body!r}")
+
+            with connect_http(port) as close_sock:
+                close_sock.sendall(http_request_bytes(
+                    port, "POST", "/kv/http-close", b"close-value",
+                    connection="close"))
+                close_reader = HttpSocketReader(close_sock)
+                status, _, body = close_reader.read_response()
+                check(status == 200 and body == b"OK\n",
+                      f"HTTP Connection: close POST returned "
+                      f"status={status}, body={body!r}")
+                check(close_reader.wait_eof(),
+                      "HTTP Connection: close response did not reach EOF")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_http(port, rdb_path, temp_dir, "sync")
+        try:
+            status, _, payload = read_http_response(port, "GET", "/kv/http-remain")
+            check(status == 200 and payload == b"remain",
+                  f"HTTP pipeline acknowledged POST was lost: "
+                  f"status={status}, body={payload!r}")
+            status, _, payload = read_http_response(port, "GET", "/kv/http-close")
+            check(status == 200 and payload == b"close-value",
+                  f"HTTP Connection: close acknowledged POST was lost: "
+                  f"status={status}, body={payload!r}")
+            status, _, payload = read_http_response(port, "GET", "/kv/http-pipe")
+            check(status == 404,
+                  f"HTTP acknowledged DELETE was resurrected: "
+                  f"status={status}, body={payload!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"HTTP async recovery shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_http_disconnect_safety():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-http-reset-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "http-reset.rdb")
+        port = free_loopback_port()
+        server = start_http(port, rdb_path, temp_dir, "sync")
+        try:
+            for index in range(4):
+                sock = connect_http(port)
+                sock.sendall(http_request_bytes(
+                    port, "POST", f"/kv/reset-{index}",
+                    bytes((value * 19 + index) & 0xff for value in range(262144))))
+                reset_socket(sock)
+
+            save_sock = connect_http(port)
+            save_sock.sendall(http_request_bytes(port, "POST", "/save"))
+            reset_socket(save_sock)
+
+            status, _, payload = read_http_response(port, "GET", "/health",
+                                                    timeout=10.0)
+            check(status == 200 and payload == b"OK\n",
+                  f"HTTP server failed after peer reset: "
+                  f"status={status}, body={payload!r}")
+            stats = wait_until(
+                lambda: (lambda current: current if
+                         current["group_commit"]["writer_state"] == "running"
+                         else None)(read_http_stats(port)),
+                timeout=5.0,
+                message="HTTP writer did not resume after peer reset",
+            )
+            check(stats["group_commit"]["writer_failures"] == 0,
+                  f"HTTP writer failed after peer reset: {stats!r}")
+            check(server.terminate_group(signal.SIGTERM) == 0,
+                  f"HTTP reset-safe shutdown failed:\n{server.log}")
+        finally:
+            server.cleanup()
+
+
 def test_stats_contract():
     with tempfile.TemporaryDirectory(prefix="minidb-process-stats-") as temp_dir:
         http_rdb = os.path.join(temp_dir, "stats-http.rdb")
@@ -1251,6 +1594,7 @@ CASES = {
     "TtlScannerLifecycle": test_ttl_scanner_lifecycle_and_restart,
     "CorruptRdbStartup": test_corrupt_rdb_startup_fails_without_overwrite,
     "SaveFailureExit": test_save_failure_exit_code,
+    "ShutdownFailureExit": test_shutdown_failure_exit_code,
     "HttpSyncCrashRecovery": test_http_sync_crash_recovery,
     "KvSyncCrashRecovery": test_kv_sync_crash_recovery,
     "IntervalFlushRecovery": test_interval_flush_recovery,
@@ -1263,6 +1607,10 @@ CASES = {
     "RandomKillSeed": test_random_kill_seed,
     "TtlCrashRecovery": test_ttl_crash_recovery,
     "StatsContract": test_stats_contract,
+    "KvAsyncProtocol": test_kv_async_protocol,
+    "KvDisconnectSafety": test_kv_disconnect_safety,
+    "HttpAsyncProtocol": test_http_async_protocol,
+    "HttpDisconnectSafety": test_http_disconnect_safety,
 }
 
 

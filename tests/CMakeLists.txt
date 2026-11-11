@@ -33,6 +33,7 @@ add_executable(storage_test
     RdbManagerP0Test.cpp
     WalFormatTest.cpp
     WalManagerTest.cpp
+    GroupCommitWriterTest.cpp
     CheckpointManifestTest.cpp
     RecoveryManagerTest.cpp
     PersistenceManagerTest.cpp
@@ -149,6 +150,7 @@ add_executable(net_unit_test
     ChannelTest.cpp
     PollerTest.cpp
     TcpConnectionTest.cpp
+    TcpServerTest.cpp
 )
 
 target_link_libraries(net_unit_test
@@ -181,6 +183,7 @@ set(MINIDB_PROCESS_CASES
     TtlScannerLifecycle
     CorruptRdbStartup
     SaveFailureExit
+    ShutdownFailureExit
     HttpSyncCrashRecovery
     KvSyncCrashRecovery
     IntervalFlushRecovery
@@ -193,6 +196,10 @@ set(MINIDB_PROCESS_CASES
     RandomKillSeed
     TtlCrashRecovery
     StatsContract
+    KvAsyncProtocol
+    KvDisconnectSafety
+    HttpAsyncProtocol
+    HttpDisconnectSafety
 )
 foreach(process_case IN LISTS MINIDB_PROCESS_CASES)
     add_test(

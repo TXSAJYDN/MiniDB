@@ -75,13 +75,18 @@ overwrite the R3 artifact. The v2 schema adds:
 - explicit timing semantics and R4-A evidence metadata.
 
 The counters are diagnostic instruments for
-[ADR-005](../docs/decisions/005-group-commit.md), not a production SLO. They do
-not implement group commit, a writer thread, a queue, batching, or `BATCHED`.
-`max` fields are process-lifetime maxima and include preload/warm-up; mean
-fields use measured-window deltas. Fixed buckets bound cardinality but do not
-provide per-request traces or arbitrary quantiles.
+[ADR-005](../docs/decisions/005-group-commit.md), not a production SLO. The
+retained v2 baseline was collected before the group-commit writer was
+implemented, so it measures the single-mutation `SYNC` path. The current
+production path uses the bounded writer described by
+[ADR-006](../docs/decisions/006-group-commit-implementation.md); it still
+exposes only `SYNC` and `INTERVAL`, not a public `BATCHED` mode. `max` fields
+are process-lifetime maxima and include preload/warm-up; mean fields use
+measured-window deltas. Fixed buckets bound cardinality but do not provide
+per-request traces or arbitrary quantiles.
 
-The retained R4-A baseline was collected at clean commit `964ba84`:
+The retained R4-A instrumentation baseline was collected at clean commit
+`964ba84`, before group commit was implemented:
 
 - 310,067 bytes, SHA-256 `55bcad4ead05fcba26e44cecf17e71df6ffd7dba17e54a128398c5b65820fe84`;
 - 18 configurations x 5 rounds, 414,688 successful requests, 0 errors,

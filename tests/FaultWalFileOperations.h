@@ -20,8 +20,8 @@ namespace minidb_test {
 // A deterministic POSIX-backed fault seam shared by WAL, manifest and RDB
 // code.  Tests can fail individual operations, force EINTR/short writes, or
 // stop a forked child at an exact durable-publish step and SIGKILL it.
-class FaultWalFileOperations final : public minidb::WalFileOperations,
-                                     public minidb::RdbFileOperations {
+class FaultWalFileOperations : public minidb::WalFileOperations,
+                               public minidb::RdbFileOperations {
   public:
     enum class FileKind {
         kUnknown,
@@ -271,6 +271,9 @@ class FaultWalFileOperations final : public minidb::WalFileOperations,
     void set_fail_unlink(int error) {
         fail_unlink_ = true;
         unlink_errno_ = error;
+    }
+    void clear_fail_unlink() {
+        fail_unlink_ = false;
     }
     void set_fail_truncate(int error) {
         fail_truncate_ = true;

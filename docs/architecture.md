@@ -24,19 +24,24 @@ rejected by an advisory `flock` on `<rdb_path>.lock`.
 
 ## Design invariants
 
-1. One owner EventLoop serializes command execution and persistence calls.
-2. A mutation is appended to the WAL before it is applied to the in-memory
+1. One owner EventLoop is the only mutation admission, in-memory apply,
+   completion, and protocol-response point.
+2. A dedicated writer thread exclusively owns WAL append, fsync, rotation, and
+   cleanup once group commit starts.
+3. A mutation is appended to the WAL before it is applied to the in-memory
    store and before success is reported.
-3. `SYNC` reports success only after a successful WAL file `fsync`.
-4. `INTERVAL` reports success after append and relies on a 100 ms timer,
+4. `SYNC` reports success only after the physical WAL batch covering its LSN
+   has completed the data `fsync`.
+5. `INTERVAL` reports success after append and relies on a 100 ms timer,
    checkpoint, or graceful shutdown to flush.
-5. RDB is a checkpoint, not the per-write durability mechanism.
-6. A checkpoint publishes the snapshot, then the manifest, then removes old WAL
+6. RDB is a checkpoint, not the per-write durability mechanism.
+7. A checkpoint publishes the snapshot, then the manifest, then removes old WAL
    segments, in that order.
-7. Recovery builds a temporary store and publishes it only after the RDB,
+8. A manifest never covers an LSN that the owner has not yet applied.
+9. Recovery builds a temporary store and publishes it only after the RDB,
    manifest, and WAL chain all validate.
-8. Resource use is bounded by explicit connection, record, segment, recovery,
-   and snapshot limits.
+10. Resource use is bounded by explicit connection, record, segment, recovery,
+    snapshot, admission-queue, batch, and completion limits.
 
 ## Process and thread model
 
@@ -50,20 +55,33 @@ store mutex as commands, removes expired entries, and does not touch socket
 callbacks. It is paused and joined during checkpoint and shutdown so snapshot
 publication cannot overlap a background mutation.
 
-The persistence manager owns one mutex that serializes mutations, interval
-flushes, checkpoints, and diagnostic snapshots. A slow filesystem operation
-such as a checkpoint blocks the owner loop; there is no worker pool and no
-background checkpoint. This is a deliberate R0-R3 boundary.
+The persistence manager coordinates one dedicated `GroupCommitWriter` thread for
+server write paths. The owner loop allocates strictly increasing LSNs, validates
+mutations, submits admission entries, and is the only thread that applies store
+mutations and invokes protocol completions. The writer consumes a contiguous LSN
+prefix, encodes a physical batch, appends it to the WAL, and performs one data
+fsync for the batch tail. It never touches `KvStore`, sessions, sockets, or user
+callbacks.
 
-R4-A currently adds diagnostic instrumentation and an external, non-production
-G3 batch-formation experiment. It records successful WAL `write_all()`, WAL
-data-fsync, and `SYNC` persistence-path timings with fixed-memory counters and
-fixed latency buckets, then observes client/fsync overlap without changing the
-server write path. It does not add a writer thread, queue, completion path, or
-batched durability mode; the owner-loop and single-writer model above is
-unchanged. G1-G3 have passed; an implementation-level ADR is still required
-before any write-path change. The evidence gates and candidate boundaries are
-recorded in [ADR-005](decisions/005-group-commit.md).
+Completion results return through one coalesced owner-loop drain callback. A
+backlog entry is not turned into an individual cross-thread callback. Accepted
+requests retain exactly-once completion semantics on success, append failure,
+fsync failure, queue limit, writer stop, and shutdown. The writer is not allowed
+to run callbacks inline.
+
+Admission queue, physical batch, and completion backlog are bounded:
+
+| Resource | Hard limit |
+|---|---:|
+| admission queue | 4,096 entries / 64 MiB |
+| physical batch | 256 records / 16 MiB |
+| completion backlog | 4,096 entries / 64 MiB |
+
+SAVE, checkpoint, interval flush, and shutdown issue writer barriers. Checkpoint
+pauses admission, drains and applies all accepted records before rotation,
+snapshot, manifest publication, and cleanup. A manifest therefore never includes
+an LSN that has not been applied. Shutdown failure is propagated to a nonzero
+process exit code.
 
 ## Component map
 
@@ -352,10 +370,13 @@ The local evidence suite covers:
   writer-lock conflict, and shutdown-save failure behavior;
 - sanitizer, clang-format, clang-tidy, four fixed-seed fuzz targets, and the
   reliability benchmark;
-- R4-A timing counters, fixed fsync buckets, and protocol contract checks in
-  both HTTP and KV paths;
-- the external, non-production G3 batch-formation experiment and its frozen
-  gate checks.
+- group-commit writer ordering, batch limits, queue/backlog limits, append and
+  fsync failure, cleanup barriers, fail-stop, and exactly-once completion;
+- HTTP and KV asynchronous mutation flows, client-disconnect safety, pipelined
+  response ordering, SAVE/checkpoint barriers, and shutdown failure exits;
+- R4-A timing counters, fixed fsync buckets, the top-level `group_commit`
+  contract, and protocol checks in both HTTP and KV paths;
+- the external G3 batch-formation experiment and its frozen gate checks.
 
 The acceptance matrix runs Debug, Release, ASan, UBSan, ASan+UBSan, and TSan
 from separate build directories. Passing it is local reproducibility evidence,
@@ -367,11 +388,10 @@ not a substitute for a public CI run or a production qualification.
 - Replication, sharding, clustering, consensus, or transactions.
 - HTTP/2, WebSocket, chunked requests, or Expect/100-continue.
 - Multi-process sharing of one data directory.
-- Group-commit implementation, batched durability, or background/incremental
-  checkpoint. R4-A currently consists of
-  [ADR-005](decisions/005-group-commit.md), diagnostic instrumentation, and an
-  external non-production G3 experiment; the implementation-level ADR is still
-  pending and no writer/queue/batch code exists.
+- A public `BATCHED` durability mode. Group commit is an internal `SYNC`
+  optimization; its implementation contract is in
+  [ADR-006](decisions/006-group-commit-implementation.md).
+- Background/incremental checkpoint, transactions, MVCC, or multiple writers.
 - Power-loss, kernel-crash, firmware-cache, or media-failure proofs.
 - Production SLAs, capacity claims, or arbitrary client scaling.
 
@@ -380,3 +400,4 @@ These exclusions are part of the contract, not hidden implementation gaps.
 ## Related decisions
 
 - [ADR-005: R4-A group-commit candidate design and evidence gates](decisions/005-group-commit.md)
+- [ADR-006: R4-A group-commit implementation](decisions/006-group-commit-implementation.md)

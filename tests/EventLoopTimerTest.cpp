@@ -3,9 +3,12 @@
 #include "../src/net/EventLoop.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <stdexcept>
+#include <pthread.h>
 
 namespace minidb {
 namespace {
@@ -76,6 +79,48 @@ TEST(EventLoopTimerTest, CallbackExceptionDoesNotStopTheLoop) {
     loop.loop();
 
     EXPECT_TRUE(continued);
+}
+
+TEST(EventLoopTimerTest, SignalCallbackIsInvokedOnceAndLoopKeepsRunning) {
+    EventLoop loop;
+    int callbacks = 0;
+    bool completed = false;
+
+    loop.quit_on_signals({SIGUSR1}, [&]() {
+        ++callbacks;
+        // A graceful shutdown callback is expected to decide when to quit.
+    });
+    loop.run_after(10, []() {
+        raise(SIGUSR1);
+        raise(SIGUSR1);
+    });
+    loop.run_after(60, [&]() {
+        completed = true;
+        loop.quit();
+    });
+    loop.loop();
+
+    EXPECT_TRUE(completed);
+    EXPECT_EQ(callbacks, 1);
+}
+
+TEST(EventLoopTimerTest, SignalWithoutCallbackQuitsImmediately) {
+    EventLoop loop;
+    loop.quit_on_signals({SIGUSR1});
+    loop.run_after(10, []() { raise(SIGUSR1); });
+    loop.run_after(500, [&]() { loop.quit(); });
+    loop.loop();
+}
+
+TEST(EventLoopTimerTest, SignalMaskIsRestoredAfterEventLoopDestruction) {
+    {
+        EventLoop loop;
+        loop.quit_on_signals({SIGUSR1});
+    }
+
+    sigset_t current;
+    ASSERT_EQ(pthread_sigmask(SIG_SETMASK, nullptr, &current), 0);
+    EXPECT_EQ(sigismember(&current, SIGUSR1), 0);
 }
 
 TEST(EventLoopTimerTest, TimerCallbackMayScheduleAnotherTimer) {

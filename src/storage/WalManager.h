@@ -15,8 +15,23 @@ namespace minidb {
 
 enum class WalResult : std::uint8_t {
     kOk,
+    kInvalidArgument,
     kIoError,
     kResourceLimit,
+};
+
+// The result code is intentionally coarse for callers that only need
+// success/failure.  The kind retains the exact fail-stop stage so group
+// commit can distinguish admission/resource failures from physical write and
+// fsync failures without parsing human-readable error strings.
+enum class WalFailureKind : std::uint8_t {
+    kNone,
+    kInvalidArgument,
+    kResourceLimit,
+    kWrite,
+    kFsync,
+    kRotation,
+    kState,
 };
 
 // Fixed latency buckets for successful WAL data-fsync observations.  The
@@ -71,6 +86,14 @@ class WalManager {
 
     WalResult append(const WalRecord& record, DurabilityMode mode,
                      std::string* error = nullptr);
+
+    // Appends a non-empty contiguous LSN batch.  The caller supplies the
+    // exact next LSN for every record.  A SYNC batch performs one final data
+    // fsync after the last record; segment rotation may add its own fsyncs.
+    // The manager advances next_lsn() only for records whose complete wire
+    // image was written.  Any write/fsync error is fail-stop.
+    WalResult append_batch(const std::vector<WalRecord>& records,
+                           DurabilityMode mode, std::string* error = nullptr);
     bool flush(std::string* error = nullptr);
     bool rotate(std::uint64_t next_start_lsn, std::string* error = nullptr);
 
@@ -101,6 +124,9 @@ class WalManager {
     WalManagerStats stats() const noexcept {
         return stats_;
     }
+    WalFailureKind last_failure_kind() const noexcept {
+        return last_failure_kind_;
+    }
     const WalLimits& limits() const noexcept {
         return limits_;
     }
@@ -123,6 +149,7 @@ class WalManager {
     bool opened_ = false;
     bool healthy_ = true;
     bool dirty_ = false;
+    WalFailureKind last_failure_kind_ = WalFailureKind::kNone;
     WalManagerStats stats_;
 };
 

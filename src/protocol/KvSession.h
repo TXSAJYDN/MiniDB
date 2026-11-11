@@ -46,6 +46,13 @@ class KvSession : public std::enable_shared_from_this<KvSession> {
     void schedule_drain();
     void drain();
     bool handle_command(const KvProtocol::Command& cmd);
+    bool handle_save();
+    bool begin_async_operation(const MutationAdmission& admission);
+    void on_mutation_completed(MutationOutcome outcome,
+                               KvProtocol::CommandType success_type);
+    void on_save_completed(RdbSaveResult result, const std::string& error);
+    void send_mutation_failure(const MutationOutcome& outcome);
+    void send_admission_failure(const MutationAdmission& admission);
     bool validate_key(const std::string& key, const char* command);
     bool send_response(KvProtocol::CommandType type,
                        const std::vector<std::string>& args);

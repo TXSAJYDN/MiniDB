@@ -370,6 +370,86 @@ def _timing_metrics(stats_before, stats_after):
     }
 
 
+def _group_commit_metrics(stats_before, stats_after, mode):
+    try:
+        before = stats_before["group_commit"]
+        after = stats_after["group_commit"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError(
+            "STATS is missing group_commit metrics; rebuild the KV server") from error
+
+    counters = (
+        "queue_rejections", "batches", "batch_records", "batch_bytes",
+        "data_fsyncs", "writer_loop_total_us", "submit_to_fsync_total_us",
+        "fsync_to_apply_total_us", "writer_failures", "append_failures",
+        "fsync_failures",
+    )
+    deltas = {}
+    for name in counters:
+        if name not in before or name not in after:
+            raise RuntimeError(f"group_commit.{name} is missing")
+        old = before[name]
+        new = after[name]
+        if type(old) is not int or type(new) is not int or old < 0 or new < old:
+            raise RuntimeError(
+                f"group_commit.{name} is not monotonic: {old!r} -> {new!r}")
+        deltas[name] = new - old
+
+    bounds_before = before.get("batch_size_bucket_bounds")
+    bounds = after.get("batch_size_bucket_bounds")
+    counts_before = before.get("batch_size_bucket_counts")
+    counts_after = after.get("batch_size_bucket_counts")
+    if bounds_before != bounds:
+        raise RuntimeError("group_commit batch bucket bounds changed during a round")
+    if (not isinstance(bounds, list) or not bounds or
+            any(type(value) is not int or value <= 0 for value in bounds) or
+            any(right <= left for left, right in zip(bounds, bounds[1:]))):
+        raise RuntimeError("group_commit batch bucket bounds are invalid")
+    expected_count = len(bounds) + 1
+    for label, counts in (("before", counts_before), ("after", counts_after)):
+        if (not isinstance(counts, list) or len(counts) != expected_count or
+                any(type(value) is not int or value < 0 for value in counts)):
+            raise RuntimeError(
+                f"group_commit batch bucket counts are invalid {label}: {counts!r}")
+    bucket_counts = [_delta(new, old)
+                     for old, new in zip(counts_before, counts_after)]
+    if sum(bucket_counts) != deltas["batches"]:
+        raise RuntimeError(
+            "group_commit batch buckets do not sum to the batch delta")
+    if mode == "sync" and deltas["data_fsyncs"] != deltas["batches"]:
+        raise RuntimeError(
+            "SYNC group_commit data_fsyncs do not match batch count")
+
+    if deltas["batches"]:
+        records_per_batch = _ratio(
+            deltas["batch_records"], deltas["batches"])
+        bytes_per_batch = _ratio(deltas["batch_bytes"], deltas["batches"])
+        fsyncs_per_batch = _ratio(
+            deltas["data_fsyncs"], deltas["batches"])
+    else:
+        records_per_batch = None
+        bytes_per_batch = None
+        fsyncs_per_batch = None
+
+    return {
+        **deltas,
+        "records_per_batch_mean": records_per_batch,
+        "bytes_per_batch_mean": bytes_per_batch,
+        "data_fsyncs_per_batch_mean": fsyncs_per_batch,
+        "max_batch_records_observed": after["max_batch_records"],
+        "max_batch_bytes_observed": after["max_batch_bytes"],
+        "queue_max_entries_observed": after["queue_max_entries"],
+        "queue_max_bytes_observed": after["queue_max_bytes"],
+        "completion_backlog_max_observed":
+            after["completion_backlog_max"],
+        "completion_backlog_max_bytes_observed":
+            after["completion_backlog_max_bytes"],
+        "batch_size_bucket_bounds": bounds,
+        "batch_size_bucket_counts": bucket_counts,
+        "writer_state": after["writer_state"],
+    }
+
+
 def kill_hard(server):
     if server.proc.poll() is None:
         os.killpg(server.proc.pid, signal.SIGKILL)
@@ -461,6 +541,8 @@ def run_round(kv_binary, durability_mode, client_count, workload, dataset,
             stats_after["persistence"]["interval_flushes"],
             stats_before["persistence"]["interval_flushes"])
         timing = _timing_metrics(stats_before, stats_after)
+        group_commit = _group_commit_metrics(
+            stats_before, stats_after, durability_mode)
         write_amplification = (
             wal_bytes / mutation_bytes if mutation_bytes else 0.0)
         clock_ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
@@ -491,6 +573,7 @@ def run_round(kv_binary, durability_mode, client_count, workload, dataset,
             "write_amplification": round(write_amplification, 6),
             "wal_bytes_at_kill": stats_after["wal_bytes"],
             "timing": timing,
+            "group_commit": group_commit,
         }
 
         if durability_mode == "interval":
@@ -574,6 +657,7 @@ def aggregate_configuration(mode, client_count, workload, rounds):
             "wal_bytes": item["wal_bytes"],
             "wal_data_fsyncs": item["wal_data_fsyncs"],
             "timing": item["timing"],
+            "group_commit": item["group_commit"],
             "write_amplification": item["write_amplification"],
             "checkpoint_save_us": item["checkpoint_save_us"],
             "checkpoint_pause_us": item["checkpoint_pause_us"],
@@ -629,6 +713,23 @@ def aggregate_configuration(mode, client_count, workload, rounds):
             [item["timing"]["data_fsync_share_of_sync_mutation"]
              for item in rounds]),
         "fsync_latency_buckets_pooled": _pool_buckets(rounds),
+        "group_commit_batches_median": _median(
+            [item["group_commit"]["batches"] for item in rounds]),
+        "group_commit_batch_records_median": _median(
+            [item["group_commit"]["batch_records"] for item in rounds]),
+        "group_commit_records_per_batch_mean_median": _median_optional(
+            [item["group_commit"]["records_per_batch_mean"]
+             for item in rounds]),
+        "group_commit_data_fsyncs_per_batch_mean_median": _median_optional(
+            [item["group_commit"]["data_fsyncs_per_batch_mean"]
+             for item in rounds]),
+        "group_commit_max_batch_records_max": max(
+            item["group_commit"]["max_batch_records_observed"]
+            for item in rounds),
+        "group_commit_queue_rejections_total": sum(
+            item["group_commit"]["queue_rejections"] for item in rounds),
+        "group_commit_writer_failures_total": sum(
+            item["group_commit"]["writer_failures"] for item in rounds),
         "write_amplification_median": _median(
             [item["write_amplification"] for item in rounds]),
         "checkpoint_save_us_median": _median(
@@ -775,8 +876,11 @@ def main():
                 "STATS deltas measured with std::chrono::steady_clock; successes only",
         },
         "r4a_evidence": {
-            "status": "baseline instrumentation only; group commit is not implemented",
-            "adr": "docs/decisions/005-group-commit.md",
+            "status": "R4-A group commit implemented; v2 diagnostic timing retained",
+            "adrs": [
+                "docs/decisions/005-group-commit.md",
+                "docs/decisions/006-group-commit-implementation.md",
+            ],
             "timing_semantics": {
                 "wal_append": "write_all only; excludes encoding, rotation, and fsync",
                 "wal_data_fsync": "all successful WAL data fsyncs, including empty-segment creation",
@@ -799,14 +903,14 @@ def main():
             "Closed-loop clients with one outstanding command each; this is not open-loop saturation capacity.",
             "The Python standard-library client competes for CPU and contributes to measured latency.",
             "The 32-client configuration reaches the server's hard connection cap; it is not evidence for more than 32 clients.",
-            "SYNC includes one WAL data fsync per successful mutation on the owner event loop.",
+            "SYNC batches may amortize one WAL data fsync across multiple mutations; every ack still waits for the data fsync covering its LSN.",
             "INTERVAL acknowledges after append and relies on a 100 ms timer or checkpoint/shutdown flush.",
             "Recovery is measured at one quiescent crash point after each round, not across every possible crash point.",
             "The compact artifact intentionally omits raw latency samples; per-round percentiles and variation are retained.",
             "Timing counters are successful-operation cumulative values from steady_clock; they are diagnostic, not a production latency SLO.",
             "Observed max timing fields are process-lifetime maxima including preload/warm-up; mean timing fields use measured-window deltas.",
             "Fixed fsync buckets bound memory and cardinality but do not provide per-request traces or arbitrary quantiles.",
-            "This v2 artifact collects evidence for R4-A evaluation; it does not demonstrate that group commit is implemented or beneficial.",
+            "This v2 artifact records the current implementation and its diagnostic counters; performance benefit is established only by a matching-environment G4 run, not by instrumentation alone.",
         ],
         "configurations": configurations,
         "elapsed_wall_seconds": round(time.monotonic() - total_started, 3),

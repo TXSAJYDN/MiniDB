@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <deque>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -212,6 +213,19 @@ TEST_F(AcceptorTest, AcceptedFdIsClosedWhenNoCallbackIsInstalled) {
 
     EXPECT_EQ(
         std::count(fake_->closed_fds.begin(), fake_->closed_fds.end(), 41), 1);
+}
+
+TEST_F(AcceptorTest, StopClosesListenerAndRestartIsRejected) {
+    fake_->idle_fds.push_back(70);
+    Acceptor acceptor(&loop_, InetAddress(0, true), fake_, 60000);
+    acceptor.listen();
+    ASSERT_TRUE(acceptor.listening());
+
+    acceptor.stop();
+    EXPECT_FALSE(acceptor.listening());
+    acceptor.stop();
+    EXPECT_FALSE(acceptor.listening());
+    EXPECT_THROW(acceptor.listen(), std::logic_error);
 }
 
 TEST_F(AcceptorTest, UnexpectedAcceptErrorStopsOnlyCurrentDrain) {

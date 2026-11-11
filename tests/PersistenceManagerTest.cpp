@@ -8,10 +8,16 @@
 #include "RdbTestUtil.h"
 
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -44,6 +50,48 @@ std::size_t segment_count(const std::string& wal_dir) {
     EXPECT_TRUE(list_wal_segments(wal_dir, &segments, &error)) << error;
     return segments.size();
 }
+
+class OwnerPump {
+  public:
+    GroupCommitWriter::OwnerDispatch dispatcher() {
+        return [this](std::function<void()> callback) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                callbacks_.push_back(std::move(callback));
+            }
+            condition_.notify_one();
+        };
+    }
+
+    bool RunUntil(
+        const std::function<bool()>& predicate,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::deque<std::function<void()>> callbacks;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    callbacks.swap(callbacks_);
+                }
+                for (auto& callback : callbacks) {
+                    callback();
+                }
+            }
+            if (predicate()) {
+                return true;
+            }
+            std::unique_lock<std::mutex> lock(mutex_);
+            condition_.wait_for(lock, std::chrono::milliseconds(10));
+        }
+        return predicate();
+    }
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<std::function<void()>> callbacks_;
+};
 
 TEST(PersistenceManagerTest, SyncAcknowledgedMutationSurvivesManagerRestart) {
     DatabasePaths paths("minidb_persistence_sync_");
@@ -424,6 +472,290 @@ TEST(PersistenceManagerTest, SnapshotReportsOneCoherentPersistencePoint) {
               snapshot.persistence.sync_mutation_max_us);
     EXPECT_GE(snapshot.wal.append_total_us, snapshot.wal.append_max_us);
     EXPECT_GE(snapshot.wal.data_fsync_total_us, snapshot.wal.data_fsync_max_us);
+}
+
+TEST(PersistenceManagerTest,
+     GroupCommitAppliesAsyncMutationsInOrderAndShutsDown) {
+    DatabasePaths paths("minidb_persistence_async_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    EXPECT_EQ(manager.set("bypass", "no").status, MutationStatus::kNotReady);
+    EXPECT_FALSE(manager.flush_interval(&error));
+    EXPECT_EQ(manager.checkpoint(&error), RdbSaveResult::Failed);
+
+    std::vector<std::string> order;
+    std::vector<MutationOutcome> outcomes;
+    auto record = [&](const std::string& name) {
+        return [&order, &outcomes, name](MutationOutcome outcome) {
+            order.push_back(name);
+            outcomes.push_back(std::move(outcome));
+        };
+    };
+    ASSERT_TRUE(manager.set_async("a", "1", record("set-a")).accepted());
+    ASSERT_TRUE(manager.set_async("b", "2", record("set-b")).accepted());
+    ASSERT_TRUE(manager.del_async("a", record("del-a")).accepted());
+    ASSERT_TRUE(manager.expire_async("b", 1000, record("expire-b")).accepted());
+
+    ASSERT_TRUE(pump.RunUntil([&]() { return outcomes.size() == 4; }));
+    ASSERT_EQ(order.size(), 4u);
+    EXPECT_EQ(order[0], "set-a");
+    EXPECT_EQ(order[1], "set-b");
+    EXPECT_EQ(order[2], "del-a");
+    EXPECT_EQ(order[3], "expire-b");
+    for (const MutationOutcome& outcome : outcomes) {
+        EXPECT_TRUE(outcome.ok()) << outcome.error;
+        EXPECT_TRUE(outcome.changed);
+    }
+    EXPECT_FALSE(store->get("a").has_value());
+    EXPECT_EQ(store->get("b"), std::optional<std::string>("2"));
+    EXPECT_EQ(store->ttl_info("b").state, KvStore::TtlState::kExpiring);
+
+    const PersistenceSnapshot applied = manager.snapshot();
+    EXPECT_EQ(applied.last_lsn, 4u);
+    EXPECT_EQ(applied.next_lsn, 5u);
+    EXPECT_EQ(applied.persistence.mutations, 4u);
+    EXPECT_EQ(applied.persistence.sync_mutations, 4u);
+    EXPECT_EQ(applied.group_commit.writer_state,
+              GroupCommitWriterState::kRunning);
+    EXPECT_GE(applied.group_commit.batch_records, 4u);
+
+    bool shutdown_done = false;
+    RdbSaveResult shutdown_result = RdbSaveResult::Failed;
+    std::string shutdown_error;
+    ASSERT_TRUE(manager.shutdown_async(
+        [&](RdbSaveResult result, const std::string& completion_error) {
+            shutdown_result = result;
+            shutdown_error = completion_error;
+            shutdown_done = true;
+        },
+        &error))
+        << error;
+    ASSERT_TRUE(pump.RunUntil([&]() { return shutdown_done; }));
+    EXPECT_EQ(shutdown_result, RdbSaveResult::Ok) << shutdown_error;
+    EXPECT_TRUE(manager.shutdown_complete());
+    EXPECT_EQ(manager.group_commit_stats().writer_state,
+              GroupCommitWriterState::kStopped);
+    EXPECT_EQ(manager.set_async("late", "value", record("late")).status,
+              MutationAdmissionStatus::kShuttingDown);
+}
+
+TEST(PersistenceManagerTest,
+     AsyncCheckpointDrainsAppliesAndResumesAtTheManifestBoundary) {
+    DatabasePaths paths("minidb_persistence_async_checkpoint_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    std::size_t mutation_completions = 0;
+    ASSERT_TRUE(manager
+                    .set_async("one", "1",
+                               [&](MutationOutcome outcome) {
+                                   EXPECT_TRUE(outcome.ok());
+                                   ++mutation_completions;
+                               })
+                    .accepted());
+    ASSERT_TRUE(manager
+                    .set_async("two", "2",
+                               [&](MutationOutcome outcome) {
+                                   EXPECT_TRUE(outcome.ok());
+                                   ++mutation_completions;
+                               })
+                    .accepted());
+    ASSERT_TRUE(manager
+                    .set_async("three", "3",
+                               [&](MutationOutcome outcome) {
+                                   EXPECT_TRUE(outcome.ok());
+                                   ++mutation_completions;
+                               })
+                    .accepted());
+
+    bool checkpoint_done = false;
+    bool observed_all_applied = false;
+    RdbSaveResult checkpoint_result = RdbSaveResult::Failed;
+    std::string checkpoint_error;
+    ASSERT_TRUE(manager.checkpoint_async(
+        [&](RdbSaveResult result, const std::string& completion_error) {
+            checkpoint_result = result;
+            checkpoint_error = completion_error;
+            observed_all_applied =
+                store->get("one") == std::optional<std::string>("1") &&
+                store->get("two") == std::optional<std::string>("2") &&
+                store->get("three") == std::optional<std::string>("3");
+            checkpoint_done = true;
+        },
+        &error))
+        << error;
+
+    ASSERT_TRUE(pump.RunUntil([&]() { return checkpoint_done; }));
+    EXPECT_EQ(checkpoint_result, RdbSaveResult::Ok) << checkpoint_error;
+    EXPECT_TRUE(observed_all_applied);
+    EXPECT_EQ(mutation_completions, 3u);
+    EXPECT_EQ(manager.snapshot().persistence.checkpoints, 1u);
+    EXPECT_EQ(manager.snapshot().last_lsn, 3u);
+    EXPECT_EQ(manager.group_commit_stats().writer_state,
+              GroupCommitWriterState::kRunning);
+
+    CheckpointManifest manifest;
+    ASSERT_EQ(load_manifest(paths.manifest, &manifest, &error),
+              ManifestLoadStatus::kOk)
+        << error;
+    EXPECT_EQ(manifest.checkpoint_lsn, 3u);
+    ASSERT_EQ(manifest.retained_segment_starts.size(), 1u);
+    EXPECT_EQ(manifest.retained_segment_starts.front(), 4u);
+
+    bool after_done = false;
+    ASSERT_TRUE(manager
+                    .set_async("after", "tail",
+                               [&](MutationOutcome outcome) {
+                                   EXPECT_TRUE(outcome.ok()) << outcome.error;
+                                   after_done = true;
+                               })
+                    .accepted());
+    ASSERT_TRUE(pump.RunUntil([&]() { return after_done; }));
+    EXPECT_EQ(store->get("after"), std::optional<std::string>("tail"));
+    EXPECT_EQ(manager.snapshot().last_lsn, 4u);
+
+    bool shutdown_done = false;
+    ASSERT_TRUE(manager.shutdown_async(
+        [&](RdbSaveResult result, const std::string& shutdown_error) {
+            EXPECT_EQ(result, RdbSaveResult::Ok) << shutdown_error;
+            shutdown_done = true;
+        },
+        &error))
+        << error;
+    ASSERT_TRUE(pump.RunUntil([&]() { return shutdown_done; }));
+}
+
+TEST(PersistenceManagerTest,
+     CleanupFailureKeepsWriterPausedAndTheNextCheckpointRetries) {
+    DatabasePaths paths("minidb_persistence_cleanup_retry_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto operations = std::make_shared<minidb_test::FaultWalFileOperations>();
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync,
+                               operations, operations);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    bool mutation_done = false;
+    ASSERT_TRUE(manager
+                    .set_async("kept", "value",
+                               [&](MutationOutcome outcome) {
+                                   EXPECT_TRUE(outcome.ok()) << outcome.error;
+                                   mutation_done = true;
+                               })
+                    .accepted());
+    ASSERT_TRUE(pump.RunUntil([&]() { return mutation_done; }));
+
+    operations->set_fail_unlink(EXDEV);
+    bool first_done = false;
+    RdbSaveResult first_result = RdbSaveResult::Failed;
+    std::string first_error;
+    ASSERT_TRUE(manager.checkpoint_async(
+        [&](RdbSaveResult result, const std::string& completion_error) {
+            first_result = result;
+            first_error = completion_error;
+            first_done = true;
+        },
+        &error))
+        << error;
+    ASSERT_TRUE(pump.RunUntil([&]() { return first_done; }));
+    EXPECT_EQ(first_result, RdbSaveResult::Ok) << first_error;
+    EXPECT_EQ(manager.group_commit_stats().writer_state,
+              GroupCommitWriterState::kPaused);
+    EXPECT_EQ(manager.snapshot().persistence.checkpoints, 1u);
+    EXPECT_EQ(manager.set_async("blocked", "value", {}).status,
+              MutationAdmissionStatus::kNotReady);
+
+    operations->clear_fail_unlink();
+    bool second_done = false;
+    RdbSaveResult second_result = RdbSaveResult::Failed;
+    std::string second_error;
+    ASSERT_TRUE(manager.checkpoint_async(
+        [&](RdbSaveResult result, const std::string& completion_error) {
+            second_result = result;
+            second_error = completion_error;
+            second_done = true;
+        },
+        &error))
+        << error;
+    ASSERT_TRUE(pump.RunUntil([&]() { return second_done; }));
+    EXPECT_EQ(second_result, RdbSaveResult::Ok) << second_error;
+    EXPECT_EQ(manager.snapshot().persistence.checkpoints, 2u);
+    EXPECT_EQ(manager.group_commit_stats().writer_state,
+              GroupCommitWriterState::kRunning);
+
+    bool resumed_done = false;
+    ASSERT_TRUE(manager
+                    .set_async("resumed", "yes",
+                               [&](MutationOutcome outcome) {
+                                   EXPECT_TRUE(outcome.ok()) << outcome.error;
+                                   resumed_done = true;
+                               })
+                    .accepted());
+    ASSERT_TRUE(pump.RunUntil([&]() { return resumed_done; }));
+    EXPECT_EQ(store->get("resumed"), std::optional<std::string>("yes"));
+
+    bool shutdown_done = false;
+    ASSERT_TRUE(manager.shutdown_async(
+        [&](RdbSaveResult result, const std::string& shutdown_error) {
+            EXPECT_EQ(result, RdbSaveResult::Ok) << shutdown_error;
+            shutdown_done = true;
+        },
+        &error))
+        << error;
+    ASSERT_TRUE(pump.RunUntil([&]() { return shutdown_done; }));
+}
+
+TEST(PersistenceManagerTest,
+     WriterFailureCompletesTheAcceptedMutationAndFailsClosed) {
+    DatabasePaths paths("minidb_persistence_writer_failure_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto operations = std::make_shared<minidb_test::FaultWalFileOperations>();
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync,
+                               operations, operations);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    operations->set_fail_fsync(ENOSPC);
+    bool completion_done = false;
+    MutationOutcome completed;
+    ASSERT_TRUE(manager
+                    .set_async("fails", "value",
+                               [&](MutationOutcome outcome) {
+                                   completed = std::move(outcome);
+                                   completion_done = true;
+                               })
+                    .accepted());
+    ASSERT_TRUE(pump.RunUntil([&]() { return completion_done; }));
+    EXPECT_EQ(completed.status, MutationStatus::kIoError);
+    EXPECT_TRUE(manager.failed());
+    EXPECT_EQ(manager.group_commit_stats().writer_state,
+              GroupCommitWriterState::kFailed);
+    EXPECT_EQ(manager.group_commit_stats().writer_failures, 1u);
+    EXPECT_GE(manager.group_commit_stats().fsync_failures, 1u);
+    EXPECT_EQ(store->get("fails").has_value(), false);
+    EXPECT_EQ(manager.set_async("after", "value", {}).status,
+              MutationAdmissionStatus::kIoError);
 }
 
 } // namespace

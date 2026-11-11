@@ -74,13 +74,14 @@ format of the response.
 
 | Mode | Response timing | Acknowledged-write boundary |
 |---|---|---|
-| `SYNC` | After WAL append, WAL data fsync, and in-memory apply all succeed | Under the tested file/device model, every acknowledged mutation is recoverable after a process crash |
+| `SYNC` | After the WAL batch covering the record completes data fsync, then in-memory apply succeeds | Under the tested file/device model, every acknowledged mutation is recoverable after a process crash |
 | `INTERVAL` | After WAL append and in-memory apply succeed | WAL data is flushed by a 100 ms owner-loop timer, before a checkpoint, and before graceful shutdown; recently acknowledged mutations may be lost |
 
 `INTERVAL` is not a promise that every acknowledged write survives a process
-crash. `BATCHED` is not implemented; group commit is an unstarted R4 option.
-Durability claims cover process crashes and restarts, not power loss, kernel
-crashes, firmware cache violations, or media failure.
+crash. Group commit is an internal `SYNC` optimization, not a public
+`BATCHED` durability mode. Durability claims cover process crashes and
+restarts, not power loss, kernel crashes, firmware cache violations, or media
+failure.
 
 If a WAL append or required fsync fails, the persistence layer enters
 fail-stop. The operation returns `ERROR`, later mutations also fail, and the
@@ -134,19 +135,24 @@ Returns an `INTEGER` argument:
 
 ## `SAVE`
 
-Runs the same stop-the-world checkpoint path as HTTP `POST /save`. It performs:
+Runs the same asynchronous checkpoint state machine as HTTP `POST /save`:
 
-1. WAL flush and fsync;
-2. WAL segment rotation when required;
-3. RDB snapshot write, fsync, close, atomic rename, and parent-directory fsync;
-4. manifest atomic publication and directory fsync;
-5. best-effort cleanup of WAL segments no longer referenced by the manifest.
+1. pause mutation admission and issue a writer pause barrier;
+2. drain accepted records, return completions to the owner loop, and apply them
+   in LSN order;
+3. WAL flush and fsync;
+4. WAL segment rotation when required;
+5. RDB snapshot write, fsync, close, atomic rename, and parent-directory fsync;
+6. manifest atomic publication and directory fsync;
+7. best-effort cleanup of WAL segments no longer referenced by the manifest.
 
-`OK` means the checkpoint and manifest were durably published. A rename that
-succeeded followed by a directory-fsync failure is reported as `ERROR` with
+The `OK` response is deferred until the state machine completes and means the
+checkpoint and manifest were durably published. A rename that succeeded
+followed by a directory-fsync failure is reported as `ERROR` with
 `RDB durability unconfirmed`; the new path may already be visible. The process
-enters fail-stop rather than publishing an unsafe manifest. A `SAVE` blocks the
-owner loop while it runs and is not a lightweight backup operation.
+enters fail-stop rather than publishing an unsafe manifest. `SAVE` does not
+block the writer on a fixed sleep, but snapshot serialization and file I/O stage
+work still runs on the owner loop.
 
 ## `STATS`
 
@@ -191,6 +197,35 @@ shape as the HTTP `/stats` response and is produced from one coherent
     ],
     "fsync_latency_bucket_counts": [20, 10, 5, 3, 2, 1, 1, 0, 0, 0, 0, 0]
   },
+  "group_commit": {
+    "queue_current_entries": 0,
+    "queue_max_entries": 18,
+    "queue_current_bytes": 0,
+    "queue_max_bytes": 4608,
+    "queue_rejections": 0,
+    "batches": 12,
+    "batch_records": 42,
+    "batch_bytes": 21504,
+    "max_batch_records": 8,
+    "max_batch_bytes": 4096,
+    "batch_size_bucket_bounds": [1, 2, 4, 8, 16, 32, 64, 128],
+    "batch_size_bucket_counts": [2, 2, 2, 6, 0, 0, 0, 0, 0],
+    "data_fsyncs": 12,
+    "writer_loop_total_us": 36000,
+    "writer_loop_max_us": 4200,
+    "submit_to_fsync_total_us": 30000,
+    "submit_to_fsync_max_us": 3900,
+    "fsync_to_apply_total_us": 9000,
+    "fsync_to_apply_max_us": 1200,
+    "completion_backlog_current": 0,
+    "completion_backlog_max": 8,
+    "completion_backlog_current_bytes": 0,
+    "completion_backlog_max_bytes": 4096,
+    "writer_failures": 0,
+    "append_failures": 0,
+    "fsync_failures": 0,
+    "writer_state": "running"
+  },
   "recovery": {
     "rdb_records": 0,
     "checkpoint_lsn": 0,
@@ -222,6 +257,12 @@ mutations; it excludes network parsing and response serialization. `total`
 fields support window means, while `max` fields are process-lifetime maxima
 that include preload/warm-up. The fixed buckets partition `wal.data_fsyncs`;
 they provide bounded cardinality, not arbitrary quantiles or per-request traces.
+
+The top-level `group_commit` object reports admission queue entries/bytes and
+rejections, successful batch counts and size distribution, physical data fsyncs,
+writer/completion timings, completion backlog high-water marks, failure counters,
+and `writer_state`. Batch-size bucket bounds are `1,2,4,8,16,32,64,128`; the
+ninth count is the `129..256` overflow bucket.
 
 ## Response commands
 

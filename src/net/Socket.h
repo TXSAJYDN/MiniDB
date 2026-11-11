@@ -21,6 +21,7 @@ class Socket {
     bool set_keep_alive(bool on);
     bool set_tcp_no_delay(bool on);
     bool shutdown_write();
+    void close();
     InetAddress local_address() const;
     static Socket create_tcp_socket();
 

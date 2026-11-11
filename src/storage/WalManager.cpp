@@ -173,86 +173,175 @@ bool WalManager::open(const std::vector<WalSegmentInfo>& existing_segments,
 
 WalResult WalManager::append(const WalRecord& record, DurabilityMode mode,
                              std::string* error) {
+    return append_batch(std::vector<WalRecord>{record}, mode, error);
+}
+
+WalResult WalManager::append_batch(const std::vector<WalRecord>& records,
+                                   DurabilityMode mode, std::string* error) {
+    last_failure_kind_ = WalFailureKind::kNone;
+    if (records.empty()) {
+        last_failure_kind_ = WalFailureKind::kInvalidArgument;
+        set_error(error, "WAL batch must not be empty");
+        return WalResult::kInvalidArgument;
+    }
     if (!opened_ || !healthy_ || active_fd_ < 0) {
+        last_failure_kind_ = WalFailureKind::kState;
         set_error(error, "WAL manager is not writable");
         return WalResult::kIoError;
     }
-    if (record.lsn != next_lsn_) {
-        set_error(error, "WAL record LSN is not the next expected LSN");
-        fail("non-contiguous LSN supplied to WAL manager");
-        return WalResult::kIoError;
-    }
-    if (record.lsn == std::numeric_limits<std::uint64_t>::max()) {
-        set_error(error, "WAL LSN space is exhausted");
-        fail("WAL LSN overflow");
-        return WalResult::kResourceLimit;
-    }
 
-    const std::vector<std::uint8_t> encoded = WalFormat::encode(record, error);
-    if (encoded.empty()) {
-        healthy_ = false;
-        return WalResult::kIoError;
-    }
-    if (encoded.size() > limits_.max_segment_bytes) {
-        set_error(error, "WAL record exceeds segment size limit");
-        return WalResult::kResourceLimit;
-    }
-
-    WalSegmentInfo* active = segments_.empty() ? nullptr : &segments_.back();
-    if (active == nullptr) {
-        set_error(error, "WAL manager has no active segment");
-        fail("missing active WAL segment");
-        return WalResult::kIoError;
-    }
-    if (active->size == 0 && active->start_lsn != record.lsn) {
-        set_error(error,
-                  "empty WAL segment does not match the first record LSN");
-        fail("WAL segment start LSN mismatch");
-        return WalResult::kIoError;
-    }
-    if (active->size > 0 && static_cast<std::uint64_t>(encoded.size()) >
-                                limits_.max_segment_bytes - active->size) {
-        if (!rotate(next_lsn_, error)) {
-            return healthy_ ? WalResult::kResourceLimit : WalResult::kIoError;
+    // Validate and encode the complete batch before touching the WAL.  This
+    // makes malformed input a clean admission failure and gives resource
+    // checks an exact byte count.  A record that was already accepted by the
+    // persistence layer but cannot be encoded is a caller invariant failure,
+    // so the manager still fails closed.
+    std::vector<std::vector<std::uint8_t>> encoded;
+    encoded.reserve(records.size());
+    std::uint64_t expected_lsn = next_lsn_;
+    std::uint64_t batch_bytes = 0;
+    for (const WalRecord& record : records) {
+        if (record.lsn != expected_lsn) {
+            last_failure_kind_ = WalFailureKind::kInvalidArgument;
+            set_error(error, "WAL batch LSNs are not contiguous");
+            fail("non-contiguous LSN supplied to WAL manager");
+            return WalResult::kIoError;
         }
-        active = &segments_.back();
+        if (record.lsn == std::numeric_limits<std::uint64_t>::max()) {
+            last_failure_kind_ = WalFailureKind::kResourceLimit;
+            set_error(error, "WAL LSN space is exhausted");
+            fail("WAL LSN overflow");
+            return WalResult::kResourceLimit;
+        }
+        std::vector<std::uint8_t> bytes = WalFormat::encode(record, error);
+        if (bytes.empty()) {
+            last_failure_kind_ = WalFailureKind::kInvalidArgument;
+            healthy_ = false;
+            return WalResult::kIoError;
+        }
+        if (bytes.size() > limits_.max_segment_bytes) {
+            last_failure_kind_ = WalFailureKind::kResourceLimit;
+            set_error(error, "WAL record exceeds segment size limit");
+            return WalResult::kResourceLimit;
+        }
+        if (!checked_add(batch_bytes, bytes.size(), &batch_bytes)) {
+            last_failure_kind_ = WalFailureKind::kResourceLimit;
+            set_error(error, "WAL batch byte count overflows");
+            return WalResult::kResourceLimit;
+        }
+        encoded.push_back(std::move(bytes));
+        ++expected_lsn;
     }
 
-    if (segments_.size() > limits_.max_segments) {
-        set_error(error, "WAL segment count would exceed the limit");
+    // Reject impossible resource requests before writing anything.  Rotation
+    // can free no space by itself, so total_bytes_ is a lower bound and the
+    // current segment layout determines the minimum segment count.
+    if (batch_bytes > limits_.max_total_bytes - total_bytes_) {
+        last_failure_kind_ = WalFailureKind::kResourceLimit;
+        set_error(error, "WAL total byte limit would be exceeded by batch");
         return WalResult::kResourceLimit;
     }
-    std::uint64_t new_total = 0;
-    if (!checked_add(total_bytes_, encoded.size(), &new_total) ||
-        new_total > limits_.max_total_bytes) {
-        set_error(error, "WAL total byte limit would be exceeded");
-        return WalResult::kResourceLimit;
+    std::size_t simulated_segments = segments_.size();
+    std::uint64_t simulated_active_size =
+        segments_.empty() ? 0 : segments_.back().size;
+    std::uint64_t simulated_active_start =
+        segments_.empty() ? 0 : segments_.back().start_lsn;
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+        const std::size_t bytes = encoded[i].size();
+        if (simulated_active_size > 0 &&
+            static_cast<std::uint64_t>(bytes) >
+                limits_.max_segment_bytes - simulated_active_size) {
+            ++simulated_segments;
+            simulated_active_size = 0;
+            simulated_active_start = records[i].lsn;
+            if (simulated_segments > limits_.max_segments) {
+                last_failure_kind_ = WalFailureKind::kResourceLimit;
+                set_error(error,
+                          "WAL batch would exceed the segment count limit");
+                return WalResult::kResourceLimit;
+            }
+        }
+        if (simulated_active_size == 0 &&
+            simulated_active_start != records[i].lsn) {
+            last_failure_kind_ = WalFailureKind::kState;
+            set_error(error,
+                      "empty WAL segment does not match the first batch LSN");
+            fail("WAL segment start LSN mismatch");
+            return WalResult::kIoError;
+        }
+        simulated_active_size += bytes;
     }
 
-    const std::uint64_t append_started_us = steady_now_us();
-    if (!write_all(operations_.get(), active_fd_, encoded.data(),
-                   encoded.size(), error)) {
-        fail("WAL append failed");
-        return WalResult::kIoError;
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+        const WalRecord& record = records[i];
+        const std::vector<std::uint8_t>& bytes = encoded[i];
+
+        WalSegmentInfo* active =
+            segments_.empty() ? nullptr : &segments_.back();
+        if (active == nullptr) {
+            last_failure_kind_ = WalFailureKind::kState;
+            set_error(error, "WAL manager has no active segment");
+            fail("missing active WAL segment");
+            return WalResult::kIoError;
+        }
+        if (active->size == 0 && active->start_lsn != record.lsn) {
+            last_failure_kind_ = WalFailureKind::kState;
+            set_error(error,
+                      "empty WAL segment does not match the first record LSN");
+            fail("WAL segment start LSN mismatch");
+            return WalResult::kIoError;
+        }
+        if (active->size > 0 && static_cast<std::uint64_t>(bytes.size()) >
+                                    limits_.max_segment_bytes - active->size) {
+            if (!rotate(record.lsn, error)) {
+                if (last_failure_kind_ == WalFailureKind::kNone) {
+                    last_failure_kind_ = healthy_
+                                             ? WalFailureKind::kResourceLimit
+                                             : WalFailureKind::kRotation;
+                }
+                return healthy_ ? WalResult::kResourceLimit
+                                : WalResult::kIoError;
+            }
+            active = &segments_.back();
+        }
+
+        if (bytes.size() > limits_.max_total_bytes - total_bytes_) {
+            last_failure_kind_ = WalFailureKind::kResourceLimit;
+            set_error(error, "WAL total byte limit would be exceeded");
+            return WalResult::kResourceLimit;
+        }
+
+        const std::uint64_t append_started_us = steady_now_us();
+        if (!write_all(operations_.get(), active_fd_, bytes.data(),
+                       bytes.size(), error)) {
+            last_failure_kind_ = WalFailureKind::kWrite;
+            fail("WAL append failed");
+            return WalResult::kIoError;
+        }
+        const std::uint64_t append_elapsed_us =
+            steady_now_us() - append_started_us;
+        active->size += bytes.size();
+        total_bytes_ += bytes.size();
+        ++stats_.appends;
+        add_saturated(&stats_.bytes_written, bytes.size());
+        observe_timing(append_elapsed_us, &stats_.append_total_us,
+                       &stats_.append_max_us);
+        dirty_ = true;
+        ++next_lsn_;
     }
-    const std::uint64_t append_elapsed_us = steady_now_us() - append_started_us;
-    active->size += encoded.size();
-    total_bytes_ = new_total;
-    ++stats_.appends;
-    stats_.bytes_written += encoded.size();
-    observe_timing(append_elapsed_us, &stats_.append_total_us,
-                   &stats_.append_max_us);
-    dirty_ = true;
-    next_lsn_++;
 
     if (mode == DurabilityMode::kSync && !flush(error)) {
+        if (last_failure_kind_ == WalFailureKind::kNone) {
+            last_failure_kind_ = WalFailureKind::kFsync;
+        }
         return WalResult::kIoError;
     }
     return WalResult::kOk;
 }
 
 bool WalManager::flush(std::string* error) {
+    last_failure_kind_ = WalFailureKind::kNone;
     if (!healthy_ || !opened_ || active_fd_ < 0) {
+        last_failure_kind_ = WalFailureKind::kState;
         set_error(error,
                   healthy_ ? "WAL manager is not open" : "WAL manager failed");
         return false;
@@ -261,6 +350,7 @@ bool WalManager::flush(std::string* error) {
         return true;
     }
     if (!data_sync(active_fd_)) {
+        last_failure_kind_ = WalFailureKind::kFsync;
         set_error(error,
                   "WAL fsync failed: " + std::string(std::strerror(errno)));
         fail("WAL fsync failed");
@@ -271,15 +361,19 @@ bool WalManager::flush(std::string* error) {
 }
 
 bool WalManager::rotate(std::uint64_t next_start_lsn, std::string* error) {
+    last_failure_kind_ = WalFailureKind::kNone;
     if (!healthy_ || !opened_ || active_fd_ < 0) {
+        last_failure_kind_ = WalFailureKind::kState;
         set_error(error, "WAL manager is not writable");
         return false;
     }
     if (next_start_lsn != next_lsn_) {
+        last_failure_kind_ = WalFailureKind::kInvalidArgument;
         set_error(error, "WAL rotation LSN is not the next LSN");
         return false;
     }
     if (segments_.size() >= limits_.max_segments) {
+        last_failure_kind_ = WalFailureKind::kResourceLimit;
         set_error(error, "WAL segment rotation would exceed the limit");
         return false;
     }
@@ -289,16 +383,19 @@ bool WalManager::rotate(std::uint64_t next_start_lsn, std::string* error) {
 
     if (operations_->close_fd(active_fd_) < 0) {
         active_fd_ = -1;
+        last_failure_kind_ = WalFailureKind::kRotation;
         set_error(error, "failed to close WAL segment during rotation");
         fail("WAL segment close failed");
         return false;
     }
     active_fd_ = -1;
     if (!create_empty_segment(next_start_lsn, error)) {
+        last_failure_kind_ = WalFailureKind::kRotation;
         fail("failed to create rotated WAL segment");
         return false;
     }
     if (!open_active_segment(error)) {
+        last_failure_kind_ = WalFailureKind::kRotation;
         fail("rotated WAL segment could not be reopened");
         return false;
     }

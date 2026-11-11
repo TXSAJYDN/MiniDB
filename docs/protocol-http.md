@@ -115,7 +115,7 @@ The query string is retained in the parsed request but is not used for routing.
 | GET | `/health` | Returns `OK\n` with 200 |
 | GET | `/stats` | Returns persistence statistics JSON with 200 |
 | POST | `/echo` | Returns the exact request body as `application/octet-stream` |
-| POST | `/save` | Synchronously publishes a durable checkpoint and returns JSON status |
+| POST | `/save` | Starts the durable checkpoint state machine and defers the response until publication completes |
 | GET | `/kv/<key>` | Returns the raw value or 404 |
 | POST | `/kv/<key>` | Stores the exact body as the value and returns 200 |
 | DELETE | `/kv/<key>` | Deletes a live key or returns 404 |
@@ -135,22 +135,28 @@ method on an unknown path returns 404. A valid extension method returns 501.
 
 ## `/save` semantics
 
-`POST /save` performs a stop-the-world checkpoint:
+`POST /save` starts the asynchronous checkpoint state machine:
 
-1. flush and fsync the WAL;
-2. rotate the active segment if it contains records;
-3. write, fsync, rename, and directory-fsync the RDB snapshot;
-4. atomically publish the checkpoint manifest;
-5. remove obsolete WAL segments and fsync the WAL directory.
+1. pause new mutation admission and issue a writer pause barrier;
+2. drain accepted WAL records, return completions to the owner loop, and apply
+   them in LSN order;
+3. pause the TTL scanner, flush and fsync the WAL;
+4. rotate the active segment if it contains records;
+5. write, fsync, rename, and directory-fsync the RDB snapshot;
+6. atomically publish the checkpoint manifest;
+7. remove obsolete WAL segments and fsync the WAL directory;
+8. resume the writer, or enter final shutdown.
 
-A 200 response means the checkpoint succeeded through manifest publication.
-A failure returns 500 and does not claim durability. A directory-fsync failure
-after rename may leave the new snapshot visible while durability is
-unconfirmed; the server reports that condition and enters fail-stop rather than
-publishing an unsafe manifest.
+The HTTP response is deferred until the whole state machine completes. A 200
+response means the checkpoint succeeded through manifest publication. A failure
+returns 500 and does not claim durability. A directory-fsync failure after
+rename may leave the new snapshot visible while durability is unconfirmed; the
+server reports that condition and enters fail-stop rather than publishing an
+unsafe manifest.
 
-`/save` is not a lightweight backup command. It can pause request handling for
-the duration of snapshot serialization, file I/O, fsyncs, and cleanup.
+`/save` is not a lightweight backup command. Snapshot serialization, file I/O,
+fsyncs, and cleanup still occupy the owner loop in checkpoint stages, while
+concurrent mutations are not admitted.
 
 ## `/stats` response
 
@@ -193,6 +199,35 @@ the duration of snapshot serialization, file I/O, fsyncs, and cleanup.
     ],
     "fsync_latency_bucket_counts": [20, 10, 5, 3, 2, 1, 1, 0, 0, 0, 0, 0]
   },
+  "group_commit": {
+    "queue_current_entries": 0,
+    "queue_max_entries": 18,
+    "queue_current_bytes": 0,
+    "queue_max_bytes": 4608,
+    "queue_rejections": 0,
+    "batches": 12,
+    "batch_records": 42,
+    "batch_bytes": 21504,
+    "max_batch_records": 8,
+    "max_batch_bytes": 4096,
+    "batch_size_bucket_bounds": [1, 2, 4, 8, 16, 32, 64, 128],
+    "batch_size_bucket_counts": [2, 2, 2, 6, 0, 0, 0, 0, 0],
+    "data_fsyncs": 12,
+    "writer_loop_total_us": 36000,
+    "writer_loop_max_us": 4200,
+    "submit_to_fsync_total_us": 30000,
+    "submit_to_fsync_max_us": 3900,
+    "fsync_to_apply_total_us": 9000,
+    "fsync_to_apply_max_us": 1200,
+    "completion_backlog_current": 0,
+    "completion_backlog_max": 8,
+    "completion_backlog_current_bytes": 0,
+    "completion_backlog_max_bytes": 4096,
+    "writer_failures": 0,
+    "append_failures": 0,
+    "fsync_failures": 0,
+    "writer_state": "running"
+  },
   "recovery": {
     "rdb_records": 0,
     "checkpoint_lsn": 0,
@@ -211,10 +246,11 @@ the duration of snapshot serialization, file I/O, fsyncs, and cleanup.
 }
 ~~~
 
-All fields come from one `PersistenceSnapshot` taken under the persistence
-mutex. Counters are cumulative for the current process unless their names
-explicitly describe recovery state. The endpoint is diagnostic, not a
-replacement for `/health` or a liveness probe.
+All fields come from one `PersistenceSnapshot`. Queue, completion backlog, WAL
+bytes, and writer state are captured as one coherent writer snapshot. Counters
+are cumulative for the current process unless their names explicitly describe
+recovery state. The endpoint is diagnostic, not a replacement for `/health` or
+a liveness probe.
 
 `timing` records successful operations only. `wal_append_*` covers
 `write_all()` without record encoding, rotation, or fsync. `wal_data_fsync_*`
@@ -225,6 +261,17 @@ mutations; it excludes network parsing and response serialization. `total`
 fields support window means, while `max` fields are process-lifetime maxima
 that include preload/warm-up. The fixed buckets partition `wal.data_fsyncs`;
 they provide bounded cardinality, not arbitrary quantiles or per-request traces.
+
+The top-level `group_commit` object reports:
+
+- current/max admission queue entries and bytes, plus queue rejections;
+- successful batches, records, encoded bytes, maximum batch size, and size
+  buckets (bounds `1,2,4,8,16,32,64,128`; index 8 is `129..256` overflow);
+- physical WAL data fsyncs and writer-loop, submit-to-fsync, and fsync-to-apply
+  timings;
+- completion backlog high-water marks;
+- `writer_failures`, `append_failures`, `fsync_failures`, and `writer_state`
+  (`disabled`, `running`, `paused`, `draining`, `stopped`, or `failed`).
 
 If the persistence manager was never opened, `/stats` returns 503 with the
 plain-text body `Persistence is not open\n`. Once a manager exists and has

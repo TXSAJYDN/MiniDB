@@ -13,17 +13,38 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace minidb {
 class EventLoop;
 
 class HttpServer {
   public:
+    using ShutdownCompletion =
+        std::function<void(RdbSaveResult, const std::string&)>;
+
     HttpServer(EventLoop* loop, const InetAddress& listen_addr,
                const std::string& rdb_path = "",
                DurabilityMode durability_mode = DurabilityMode::kSync);
     ~HttpServer();
     void start();
+    // Owner-loop only and idempotent. Stops accepting new connections,
+    // drains accepted persistence mutations, publishes the final checkpoint,
+    // stops the writer, invokes completion, then quits the owner loop.
+    // All callbacks run on the owner loop.
+    void begin_shutdown(ShutdownCompletion completion = {});
+    bool shutdown_started() const {
+        return shutdown_started_;
+    }
+    bool shutdown_complete() const {
+        return shutdown_complete_;
+    }
+    RdbSaveResult shutdown_result() const {
+        return shutdown_result_;
+    }
+    const std::string& shutdown_error() const {
+        return shutdown_error_;
+    }
     // Stops this server's TTL scanner lease.  Idempotent, and safe to call
     // from the destructor or after EventLoop::loop() returns before a final
     // synchronous RDB save.
@@ -52,10 +73,14 @@ class HttpServer {
   private:
     void on_connection(const TcpConnectionPtr& conn);
     void on_message(const TcpConnectionPtr& conn, Buffer* buf);
-    void on_request(const HttpRequest& req, HttpResponse* resp);
-    void handle_kv(const HttpRequest& req, HttpResponse* resp);
+    bool on_request(const HttpRequest& req, HttpResponse* resp,
+                    const HttpSession::ResponseSender& sender);
+    bool handle_kv(const HttpRequest& req, HttpResponse* resp,
+                   const HttpSession::ResponseSender& sender);
     void method_not_allowed(const char* allow, HttpResponse* resp);
     void flush_interval();
+    void try_start_persistence_shutdown();
+    void finish_shutdown(RdbSaveResult result, const std::string& error);
 
     EventLoop* loop_;
     std::shared_ptr<KvStore> kv_store_;
@@ -66,6 +91,13 @@ class HttpServer {
     std::uint64_t interval_timer_id_ = 0;
     KvStore::ScannerLease scanner_lease_;
     bool started_ = false;
+    bool shutdown_started_ = false;
+    bool shutdown_complete_ = false;
+    bool persistence_shutdown_pending_ = false;
+    RdbSaveResult shutdown_result_ = RdbSaveResult::Failed;
+    std::string shutdown_error_;
+    std::vector<ShutdownCompletion> shutdown_completions_;
+    std::uint64_t shutdown_retry_timer_id_ = 0;
     std::chrono::milliseconds idle_timeout_{30000};
     std::map<std::string, std::shared_ptr<HttpSession>> sessions_;
     // Destroy the server (and invoke close callbacks) before callback

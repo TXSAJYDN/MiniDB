@@ -22,6 +22,9 @@ class TcpServer {
     TcpServer& operator=(const TcpServer&) = delete;
 
     void start();
+    // Owner-loop only.  Stops accepting new descriptors and gracefully closes
+    // every live connection after its queued output drains.
+    void stop();
     void set_connection_callback(const ConnectionCallback& cb) {
         connection_callback_ = cb;
     }

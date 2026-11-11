@@ -23,11 +23,12 @@ MiniDB 选择少量、可验证的模式，而不是提供一组名称好听但�
 `INTERVAL` 的 timer 周期是 100 ms，由 owner EventLoop 的 timerfd 驱动。实际丢失
 窗口受调度、I/O 和事件循环停顿影响，不能理解为一个精确的 100 ms 承诺。
 
-`BATCHED` 未实现。[ADR-005](005-group-commit.md) 已把 R4-A 定义为
-evidence-gated 的组提交设计、诊断指标和准入条件；当前已完成 ADR、baseline
-instrumentation 和外部非生产 G3 batch formation 实验，G1-G3 PASS。实现级 ADR
-仍待编写，writer thread、有界队列、批量 fsync 和 completion 顺序均未实现；
-只有实现级 ADR 和 G4-G7 后续验证完成，才能讨论该模式。
+不新增公开 `BATCHED` 模式。R4-A 把组提交实现为 `SYNC` 的内部优化：
+[ADR-005](005-group-commit.md) 定义证据门槛，[ADR-006](006-group-commit-implementation.md)
+冻结并落实 writer thread、有界队列、批量 data fsync、合并 completion 和
+checkpoint/shutdown barrier。G1-G3 PASS，G5/G6 已在本地 338 项测试中通过；
+G4 收益证据仍待 clean HEAD 采集。无论组提交是否形成 batch，`SYNC` 的成功响应
+都不得早于覆盖该 LSN 的 data fsync，因此 ack 持久性语义没有放宽。
 
 ## fsync 失败语义
 

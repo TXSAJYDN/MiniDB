@@ -2,10 +2,10 @@
 
 ## Scope
 
-This document records the local R0-R3 evidence, the R4-A instrumentation
-baseline, and the R4-A G3 batch-formation experiment for MiniDB's
-crash-consistent persistence work. It is deliberately a statement about a
-tested engineering prototype, not a production qualification.
+This document records the R0-R3 baseline, the R4-A instrumentation and G3
+batch-formation experiments, and the implemented group-commit validation for
+MiniDB's crash-consistent persistence work. It is deliberately a statement
+about a tested engineering prototype, not a production qualification.
 
 The evidence covers:
 
@@ -13,8 +13,10 @@ The evidence covers:
 - deterministic crash points and process-level crash recovery;
 - sanitizer, fuzz, format, and static-analysis gates;
 - durability-mode performance, checkpoint pause, recovery time, and RSS;
-- R4-A diagnostic timing fields and fixed WAL data-fsync buckets;
-- an external, non-production batch-formation opportunity experiment;
+- R4-A diagnostic timing fields, fixed WAL data-fsync buckets, and the
+  top-level group-commit metrics contract;
+- an external batch-formation opportunity experiment and the implemented,
+  bounded group-commit writer;
 - explicit limits and non-claims.
 
 ## Source and environment
@@ -37,19 +39,19 @@ is about that baseline commit, not a claim about every later commit.
 
 ## Test matrix
 
-The final local matrix for R0-R3 plus R4-A instrumentation runs each
-configuration from its own CMake preset:
+The local matrix for R4-A runs each configuration from its own CMake build
+directory:
 
 | Configuration | CTest |
 |---|---:|
-| Debug | 305/305 |
-| Release | 305/305 |
-| ASan | 305/305 |
-| UBSan | 305/305 |
-| ASan + UBSan | 305/305 |
-| TSan (`setarch x86_64 -R`) | 305/305 |
+| Debug | 338/338 |
+| Release | 338/338 |
+| ASan | 338/338 |
+| UBSan | 338/338 |
+| ASan + UBSan | 338/338 |
+| TSan (`setarch x86_64 -R`) | 338/338 |
 
-Each configuration includes the 19 `ProcessIntegrationTest.*` cases:
+Each configuration includes the 24 `ProcessIntegrationTest.*` cases:
 
 ~~~text
 CliContract
@@ -59,6 +61,7 @@ KvPersistence
 TtlScannerLifecycle
 CorruptRdbStartup
 SaveFailureExit
+ShutdownFailureExit
 HttpSyncCrashRecovery
 KvSyncCrashRecovery
 IntervalFlushRecovery
@@ -71,6 +74,10 @@ LegacyImport
 RandomKillSeed
 TtlCrashRecovery
 StatsContract
+KvAsyncProtocol
+KvDisconnectSafety
+HttpAsyncProtocol
+HttpDisconnectSafety
 ~~~
 
 The unit and integration inventory also includes:
@@ -80,8 +87,13 @@ The unit and integration inventory also includes:
 - checkpoint manifest round-trip, truncation, ordering, and atomic publication;
 - recovery selection, manifest-missing cases, tail truncation, middle
   corruption, LSN continuity, legacy import, and TTL replay;
-- persistence manager `SYNC`/`INTERVAL`, checkpoint retry, fail-stop, and
-  single-writer lock;
+- persistence manager `SYNC`/`INTERVAL`, asynchronous admission/completion,
+  checkpoint retry, fail-stop, writer snapshots, and single-writer lock;
+- group-commit writer ordering, 256-record/16-MiB batch limits, queue and
+  completion backlog entry/byte limits, exactly-once callbacks, append/fsync
+  failure, cleanup barriers, and writer stop/drain;
+- HTTP/KV asynchronous mutation and disconnect no-op behavior, pipelined
+  response ordering, SAVE/checkpoint barriers, and shutdown failure exit codes;
 - C01-C14 deterministic crash points.
 
 This is local reproducibility evidence. It is not a substitute for a public CI
@@ -105,9 +117,10 @@ and covered by a durable regression test before the run is accepted again.
 
 ## R4-A instrumentation baseline
 
-R4-A is evidence-gated. This phase adds instrumentation, not group-commit
-implementation. The write path still performs one WAL data fsync per successful
-`SYNC` mutation on the owner event loop.
+R4-A was evidence-gated. The v2 baseline below was collected before group
+commit existed; it remains the frozen comparison point. The implemented server
+now routes mutations through the bounded `GroupCommitWriter` and preserves the
+documented durability modes.
 
 The v2 benchmark records successful-operation timings from
 `std::chrono::steady_clock`:
@@ -187,12 +200,19 @@ latency sample retained by the compact artifact.
   requests was **0.987605**, above the frozen thresholds. This is evidence of
   an external batch-formation opportunity, not of a server queue or group
   commit.
-- **G4-G7 NOT STARTED.** No writer, queue, batch, completion, or `BATCHED`
-  mode exists. The next permitted step is a separate implementation-level ADR;
-  it is not authorization to merge group commit into the production write path.
+- **G4: PENDING CLEAN HEAD.** The writer, queue, batch, completion, barrier,
+  and asynchronous protocol paths are implemented in
+  [ADR-006](decisions/006-group-commit-implementation.md). Formal benefit
+  evidence must be collected in 5 rounds on a committed clean HEAD after CI.
+- **G5/G6: LOCAL PASS.** The six-configuration 338-test matrix, 24 process
+  cases, group-commit fault tests, and bounded-resource assertions pass locally.
+- **G7: IN PROGRESS.** ADR-006 records the implementation contract and failure
+  matrix; final status and G4 artifact are added after the clean-HEAD run.
 
-See [ADR-005](decisions/005-group-commit.md) for the candidate boundaries and
-remaining gates.
+See [ADR-005](decisions/005-group-commit.md) for candidate boundaries and
+[ADR-006](decisions/006-group-commit-implementation.md) for the implementation.
+The absence of a public `BATCHED` mode is intentional: group commit is an
+internal `SYNC` optimization.
 
 ## R4-A G3 batch-formation experiment
 
@@ -250,9 +270,9 @@ and P99 2,716.800 us; client latency was P50 111,990.761 us and P99
 
 The median traced throughput was 283.293 ops/s. Because tracing overhead is
 present and the clients are closed-loop, this value is not a G4 performance
-result. The experiment does not prove that a future queue contains those
-requests, that a writer can batch them without overhead, or that G4-G7 will
-pass.
+result. The experiment does not prove that the production admission queue contains
+those exact requests, that writer/completion overhead is negligible, or that
+the G4 throughput gate passes.
 
 ## R3 reliability benchmark
 
@@ -342,11 +362,9 @@ Total successful requests: 340,240. Total errors: 0. Wall-clock collection time:
 - multi-node, replicated, transactional, or multi-writer operation;
 - any Redis or SQL compatibility;
 - a production SLA;
-- group-commit implementation or performance benefit;
-- that external pending overlap proves a future server queue can batch those
-  requests without changing durability, ordering, or resource bounds;
-- that every later commit inherited the baseline CI result without its own
-  checks.
+- a completed G4 benefit claim until the clean-HEAD artifact and final CI exist;
+- that external pending overlap alone proves group-commit correctness or speed;
+- that every later commit inherited an earlier CI result without its own checks.
 
 ## Reproduction notes
 
@@ -386,4 +404,5 @@ negative evidence; it is not converted into a PASS by changing thresholds.
 - [Deployment and operation](deployment.md)
 - [Benchmark methodology](../bench/README.md)
 - [ADR-005: R4-A group-commit candidate design and evidence gates](decisions/005-group-commit.md)
+- [ADR-006: R4-A group-commit implementation](decisions/006-group-commit-implementation.md)
 - [Fuzz targets](../fuzz/README.md)

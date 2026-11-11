@@ -36,11 +36,16 @@ int main(int argc, char* argv[]) {
     }
 
     EventLoop loop;
-    loop.quit_on_signals({SIGINT, SIGTERM});
     InetAddress listen_addr(options.port);
     const std::string rdb_path =
         options.rdb_path.empty() ? "minidb.rdb" : options.rdb_path;
     KvServer server(&loop, listen_addr, rdb_path, options.durability_mode);
+
+    // Block termination signals before any persistence or scanner thread is
+    // created.  Those threads inherit this mask; signalfd owns the only
+    // unblocked path and wakes the owner loop for a graceful shutdown.
+    loop.quit_on_signals({SIGINT, SIGTERM},
+                         [&server]() { server.begin_shutdown(); });
 
     if (!server.load_rdb()) {
         std::cerr << "Fatal: failed to open the persistence image; check the "
@@ -54,16 +59,23 @@ int main(int argc, char* argv[]) {
     std::cout << "Durability mode: "
               << durability_mode_name(options.durability_mode) << "\n";
     server.start();
+
+    // SIGINT/SIGTERM start a non-blocking owner-loop shutdown.  The loop keeps
+    // running until the writer has drained, the final checkpoint is durable,
+    // and all persistence threads have been joined.
     loop.loop();
 
-    // Join the scanner before the final checkpoint.  save_rdb() itself is
-    // linearizable, but explicit shutdown ordering keeps the exit path
-    // deterministic and avoids any background work during persistence.
-    server.stop();
-    const RdbSaveResult save_result = server.save_rdb();
-    if (save_result != RdbSaveResult::Ok) {
+    if (!server.shutdown_complete()) {
+        std::cerr << "Fatal: event loop exited before graceful shutdown\n";
+        return 1;
+    }
+    if (server.shutdown_result() != RdbSaveResult::Ok) {
         std::cerr << "Fatal: failed to publish checkpoint during shutdown"
-                  << (save_result == RdbSaveResult::DurabilityUnconfirmed
+                  << (!server.shutdown_error().empty()
+                          ? ": " + server.shutdown_error()
+                          : "")
+                  << (server.shutdown_result() ==
+                              RdbSaveResult::DurabilityUnconfirmed
                           ? " (snapshot replaced, durability unconfirmed)"
                           : "")
                   << "\n";

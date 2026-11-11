@@ -113,7 +113,10 @@ prefix cleanup.
    `TXN` record each consume exactly one LSN and are passed to
    `KvStore::apply_committed_status` exactly once.
 9. Validate recovery record and byte limits.
-10. Publish the temporary store with `KvStore::swap` only after all steps pass.
+10. Scan the reserved Agent namespace and validate its marker and every `MDAR`
+    record; rebuild Agent indexes and counts and require every tool to have a
+    parent session.
+11. Publish the temporary store with `KvStore::swap` only after all steps pass.
 
 ## Tail truncation
 
@@ -175,6 +178,38 @@ manifest retains every live WAL segment needed to replay committed transaction
 records after that boundary. Rollback, conflict, BEGIN, and read-only COMMIT
 produce no WAL record, so restart cannot introduce an uncommitted write.
 
+## Agent state validation and replay
+
+Agent state is ordinary committed KV state in the reserved namespace
+`\x00minidb-agent-v1\x00`; it has no separate RDB, WAL, manifest, or format
+version. Replay therefore happens through the normal RDB/WAL path above. Before
+the process listens, recovery then performs these additional checks:
+
+1. scan committed state under the reserved prefix;
+2. verify the namespace marker exists exactly once and has the expected format;
+3. strictly decode every `MDAR` record, including magic, version, type, status,
+   revision, reserved bytes, lengths, payload, and trailing bytes;
+4. rebuild session, tool, generic, and idempotency indexes plus all counters and
+   logical-byte totals;
+5. require every tool to reference an existing parent session and enforce the
+   per-session, global-count, and 64 MiB logical-byte limits;
+6. leave `RUNNING` tools and live/expired leases exactly as committed; startup
+   does not auto-complete, requeue, release, or fence them;
+7. allow logically expired sessions/tools/leases to remain physically present
+   until normal queries hide them and GC removes them by `kTxn`.
+
+An absent marker in a non-empty reserved namespace, a corrupted marker, an
+illegal record, a duplicate index key, an orphan tool, or a resource-count
+mismatch is a fatal startup error. Recovery never skips an unknown Agent record
+and never treats corrupt state as empty.
+
+Agent GC uses internal `kTxn` records, not client idempotency records. An
+idempotency expiry is one candidate; a terminal or logically expired session is
+one candidate group containing the session and all of its tools. The group is
+removed atomically by one `kTxn`, so recovery cannot observe a deleted session
+with surviving orphan tools. GC is uncommitted and retryable before commit; if
+the process dies after commit, the entire group is absent after replay.
+
 ## Why old manifests can be valid
 
 Snapshot publication and manifest publication are separate atomic operations.
@@ -204,6 +239,10 @@ semantic effect.
 | MTXN operations per transaction | 256 |
 | MTXN payload per transaction | 1 MiB |
 | Global version entries | 1,000,000 |
+| Agent sessions / tools | 1,024 / 8,192 |
+| Tools per Agent session | 128 |
+| Agent generic / idempotency records | 16,384 / 8,192 |
+| Agent record / logical bytes | 64 KiB / 64 MiB |
 | WAL segment | 16 MiB |
 | Total WAL bytes | 256 MiB |
 | Segments | 128 |
@@ -228,6 +267,10 @@ nonzero, does not listen, and does not publish a partial store.
 | v1 transaction record | nonzero exit |
 | MTXN payload invalid or duplicate key | nonzero exit; no partial transaction |
 | Version budget exceeded during replay | nonzero exit; no partial store |
+| Agent marker missing/corrupt or reserved namespace collision | nonzero exit |
+| Invalid Agent record, duplicate index key, or orphan tool | nonzero exit |
+| Agent resource count or logical-byte limit exceeded | nonzero exit |
+| Expired Agent lease/session | replay succeeds; state remains logically hidden until GC |
 | WAL tail partial outer record | truncate + fsync, then start |
 | Missing referenced segment | nonzero exit |
 | LSN gap or duplicate | nonzero exit |
@@ -249,6 +292,12 @@ The recovery portion of `/stats` and `STATS` reports:
 - `ignored_residue_segments`;
 - `legacy_import`, `needs_bootstrap`, `manifest_present`.
 
+The same snapshot contains the top-level `agent` object with session/tool state
+counts, generic/idempotency counts, logical bytes and high-water mark,
+idempotency replay/conflict and revision-mismatch counters, lease/fence
+counters, and GC runs/candidates/deletes/failures/timing. It describes the
+recovered process state, not a live re-scan of the data directory.
+
 These fields come from one `PersistenceSnapshot`. Writer queue, completion
 backlog, WAL bytes, and writer state share a coherent snapshot. They describe the
 recovery that produced the currently running process, not a live re-scan of the
@@ -262,3 +311,4 @@ data directory.
 - [ADR-002](decisions/002-wal-and-crash-consistency.md)
 - [ADR-004](decisions/004-wal-resource-policy.md)
 - [ADR-006](decisions/006-group-commit-implementation.md)
+- [ADR-009: Agent durable state backend](decisions/009-agent-state-backend.md)

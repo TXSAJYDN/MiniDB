@@ -7,7 +7,8 @@ MiniDB 是一个使用 C++20 实现的**面向有界资源的单机 crash-consis
 它通过两个独立前端访问同一类存储引擎：
 
 - 严格但范围有限的 HTTP/1.1 子集；
-- 二进制安全的 TCP KV 协议，支持 CRUD、TTL、SAVE、STATS，以及 Snapshot Isolation 多 key 事务。
+- 二进制安全的 TCP KV 协议，支持 CRUD、TTL、SAVE、STATS、Snapshot Isolation 多 key 事务，以及 `AGENT=12` 持久状态后端；
+- HTTP 不暴露 Agent API，Agent 状态只能通过与普通 KV 相同的二进制协议访问。
 
 项目当前的核心问题不是“再实现一个 Redis”，而是验证一条完整持久化闭环：
 
@@ -29,7 +30,10 @@ MiniDB 是可靠性工程原型，**不宣称生产可用**，不宣称 Redis/SQ
 - TTL 在 WAL 中保存绝对 Unix 毫秒 deadline，重启不会重新延长 TTL；
 - `<rdb_path>.lock` 使用非阻塞 `flock`，阻止两个服务进程同时写同一数据目录；
 - KV 协议提供 `BEGIN/COMMIT/ROLLBACK`，采用 Snapshot Isolation + first-committer-wins，一次提交是一条原子 WAL 记录；
-- 活跃事务的私有写集不进 live store、checkpoint 或 manifest，断连/关机时回滚。
+- 活跃事务的私有写集不进 live store、checkpoint 或 manifest，断连/关机时回滚；
+- Agent 的 session、tool、lease、generic record 和 idempotency 结果使用保留命名空间与版本化记录，复用同一 WAL、RDB、checkpoint 和 manifest；
+- Agent mutation 与其幂等结果在同一个 `kTxn`、同一个 LSN 原子提交，重试相同请求不会重复 bump revision；
+- session lease 使用单调 fence 和严格 CAS，崩溃后的接管不会复活旧 worker 的写入。
 
 ## Durability 语义
 
@@ -80,6 +84,26 @@ HTTP 和 KV 服务不应同时指向同一个 RDB 路径。单写者锁会拒绝
 
 收到 `SIGINT` 或 `SIGTERM` 后，服务会停止接收请求、flush INTERVAL WAL，并执行最终 checkpoint。正常关闭退出码为 0 才表示最终 checkpoint 成功。
 
+### Agent 持久状态后端
+
+Agent API 只存在于二进制 KV 协议中：命令码 `AGENT=12`，包含 15 个
+session/tool/lease/generic 子命令。它不新增 HTTP 路由，HTTP 的 `/kv` 也不能读写
+Agent 保留命名空间。
+
+- 状态包括 session 生命周期、tool claim/complete/requeue、session lease、
+  idempotency 和普通 `RECORD_CAS`；
+- 写请求必须携带 1..128 字节 idempotency key，成功响应或确定性业务拒绝返回
+  一个 `MDOR` 封套；相同 key 的相同请求重放只返回原结果，不新增 WAL/LSN；
+- lease 由严格递增 fence 保护，旧 fence 的 claim/complete/renew/requeue 返回
+  `FENCED`；过期 lease 不能通过 renew 复活；
+- 启动时验证 namespace marker 和所有 `MDAR` 记录、重建索引并检查孤儿 tool；
+  非法记录使启动 fail-stop，不会被当作空状态跳过；
+- 周期 GC 只通过内部 `kTxn` 删除到期 idempotency、终态/过期 session 及其全部
+  tool；session 与 tool 的删除在同一事务中完成。
+
+完整命令、参数、响应状态、资源上限和恢复语义见
+[ADR-009](docs/decisions/009-agent-state-backend.md) 与 [KV 协议](docs/protocol-kv.md)。
+
 ## 持久化布局
 
 给定 `-r /var/lib/minidb/minidb.rdb`：
@@ -119,6 +143,12 @@ wal-00000000000000000001.log
 | 活跃显式事务 | 64 |
 | 单事务写 key / payload | 256 keys / 1 MiB |
 | 全局版本条目 | 1,000,000 |
+| Agent session / tool / generic / idempotency 记录 | 1,024 / 8,192 / 16,384 / 8,192 |
+| 每 session 的 tool | 128 |
+| Agent 单条记录（MDAR 封套） | 64 KiB |
+| Agent logical bytes（key+value） | 64 MiB |
+| Agent name / tool_name | 128 / 256 字节 |
+| Agent session TTL / lease TTL | 1 分钟..30 天 / 1 秒..1 小时 |
 
 WAL 达到 segment 数或字节预算时，写路径会先触发同步 checkpoint；checkpoint 失败则拒绝写，不应无限增长。具体策略见 [ADR-004](docs/decisions/004-wal-resource-policy.md)。
 
@@ -132,7 +162,9 @@ WAL 达到 segment 数或字节预算时，写路径会先触发同步 checkpoin
 4. 按 LSN 扫描并校验 manifest 引用的 WAL segment；
 5. 只重放 `LSN > checkpoint_lsn` 的记录；
 6. 仅在尾部不完整时截断到最后合法前缀并 fsync；
-7. 完整成功后发布 Store 并开始监听。
+7. 扫描 Agent 保留命名空间，验证 marker 和全部 `MDAR`，重建 session/tool/
+   idempotency/generic 索引并检查孤儿 tool；非法记录拒绝启动；
+8. 完整成功后发布 Store 并开始监听。
 
 以下情况会非零退出且不监听：
 
@@ -140,6 +172,7 @@ WAL 达到 segment 数或字节预算时，写路径会先触发同步 checkpoin
 - manifest 引用的 RDB 或 WAL segment 缺失；
 - WAL 中间损坏、重复 LSN、LSN 不连续或 segment 范围不一致；
 - 恢复资源超过记录数/字节上限；
+- Agent marker 缺失/损坏、`MDAR` 非法、tool 父 session 缺失或 Agent 资源计数越界；
 - 另一个进程持有写者锁。
 
 恢复失败不会修改损坏现场，也不会发布部分 Store。只有 WAL 尾部半写是允许截断的情形。
@@ -155,6 +188,7 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 - 成功 append、data fsync 与 `SYNC` 持久化路径的累计/最大耗时，以及固定 fsync 延迟桶；
 - 顶层 `group_commit` 对象：queue/backlog 高水位、拒绝数、batch 数量与大小分布、data fsync 数、writer 各阶段耗时、失败计数和 writer 状态；
 - 顶层 `transactions` 对象：活跃/提交/冲突/回滚计数、版本高水位、snapshot lag、事务 WAL 记录与字节数、提交和 GC 耗时；
+- 顶层 `agent` 对象：session/tool 计数与状态、generic/idempotency 条数、logical bytes、replay/conflict/revision mismatch、lease/fence 和 GC 指标；
 - 启动恢复的 RDB 记录数、扫描/重放记录数、截断字节和遗留 residue；
 - legacy import 与 bootstrap 状态。
 
@@ -164,15 +198,18 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 
 ## 验证状态
 
-R4-A 组提交、R4-B 后台全量 checkpoint 和 R4-C Snapshot Isolation 事务已实现，本地质量门禁及对应证据已完成：
+R4-A 组提交、R4-B 后台全量 checkpoint、R4-C Snapshot Isolation 事务和 R4-D
+Agent 持久状态后端均已实现，本地质量门禁及对应证据已完成：
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种构建配置；
-- 每个配置 **395 项 CTest**，包含 26 个 `ProcessIntegrationTest.*` 进程级用例；
+- 每个配置 **440 项 CTest**，包含 31 个 `ProcessIntegrationTest.*` 进程级用例；
 - 组提交 writer 的顺序、batch 上限、queue/backlog full、append/fsync 失败、cleanup barrier、fail-stop 和 callback 恰好一次测试；
 - 后台 checkpoint 状态机、完整 live segment 保留、cleanup 失败重试、manager 析构回调安全，以及 rename 后/manifest 前崩溃恢复测试；
 - HTTP/KV 异步 mutation、断开连接安全、流水线响应顺序、SAVE/STATS 和 shutdown 失败退出码测试；
 - 事务快照读、read-your-writes、first-committer-wins、pending commit 冲突窗口、只读提交、断连回滚、原子 `kTxn` 恢复、TTL/GC、资源上限和事务 stats 契约测试；
-- HTTP、KV、WAL record、manifest 四个固定 seed fuzz target；
+- Agent codec、保留命名空间、revision/CAS、幂等重放、lease/fence 接管、tool 状态机、GC、恢复 fail-stop 和 stats 契约测试；
+- Agent 进程级用例覆盖幂等崩溃恢复、lease takeover、RUNNING tool 恢复、命名空间碰撞和 stats；
+- HTTP、KV、WAL record、manifest、Agent record codec、Agent protocol 六个固定 seed fuzz target；
 - clang-format、clang-tidy 和 `git diff --check`；
 - 多 durability、多客户端、写/混合/TTL 的 5 轮可靠性 benchmark；
 - R4-A v2 baseline：18 配置 × 5 轮、414,688 次成功请求、0 错误；32 客户端
@@ -195,9 +232,9 @@ checkpoint probe 的 5 轮 SAVE 全部成功，checkpoint failure 为 0，checkp
 backpressure `ERROR 100`，不是已确认写丢失；详细限制、逐项延迟和 artifact digest
 见 [可靠性证据](docs/reliability-evidence.md)。
 
-具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。R4-B 文档提交
-仍必须在自身 `main` HEAD 上通过完整 9/9 GitHub Actions；本地门禁不替代远程 CI。
-G3 的 pending 计数是批处理机会上界，不是服务器队列已有记录的证据。
+具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。每个发布结论只引用
+对应 `main` HEAD 自身的 9/9 GitHub Actions；本地门禁不替代远程 CI。G3 的 pending
+计数是批处理机会上界，不是服务器队列已有记录的证据。
 
 ## 明确的非目标
 
@@ -210,7 +247,9 @@ G3 的 pending 计数是批处理机会上界，不是服务器队列已有记�
 - 不覆盖多进程共享数据目录、掉电一致性或设备故障证明；
 - 不提供公开 `BATCHED` durability mode；组提交只作为 `SYNC` 的内部优化存在；
 - 不提供自动周期 checkpoint 或增量/COW checkpoint；显式 SAVE/shutdown 使用后台全量快照；
-- 不提供多写者。
+- 不提供多写者；
+- Agent API 不暴露为 HTTP，不提供多节点 lease、Raft、跨节点会话迁移或外部工具副作用 exactly-once；
+- Agent generic record 不提供删除、TTL 或遍历。
 
 ## 文档
 
@@ -230,4 +269,6 @@ G3 的 pending 计数是批处理机会上界，不是服务器队列已有记�
 - [ADR-005：R4-A 组提交候选设计与证据门槛](docs/decisions/005-group-commit.md)
 - [ADR-006：R4-A 组提交实现](docs/decisions/006-group-commit-implementation.md)
 - [ADR-007：R4-B 后台全量 checkpoint](docs/decisions/007-background-checkpoint.md)
+- [ADR-008：R4-C MVCC 与快照隔离事务](docs/decisions/008-mvcc-transactions.md)
+- [ADR-009：R4-D AI Agent 持久状态后端](docs/decisions/009-agent-state-backend.md)
 - [架构决策记录](docs/decisions/)

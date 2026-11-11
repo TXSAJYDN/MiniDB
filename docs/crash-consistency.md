@@ -102,6 +102,35 @@ conflict handling, stats shape, and recovery after a committed transaction
 record. Unit tests cover malformed MTXN payloads, duplicate keys, atomic replay,
 snapshot visibility, TTL selection, and version-budget behavior.
 
+## Agent persistence crash semantics
+
+R4-D adds a durable state machine for Agent sessions, tools, leases, generic
+records, and idempotency. The required crash properties are:
+
+- a successful Agent mutation, every state change in its internal `kTxn`, and
+  its idempotency record become visible at one LSN or not at all;
+- a retry with the same idempotency key and canonical request returns the
+  original `MDOR` after restart without writing WAL or bumping a revision;
+- a deterministic business rejection writes no state and no idempotency record;
+- an accepted mutation completes even if the client disconnects; the callback
+  is a safe no-op when its session is gone;
+- a crash after a tool enters `RUNNING` leaves that tool `RUNNING` after recovery;
+  startup does not guess whether the external side effect happened;
+- a live or expired lease is preserved exactly by replay. Expired leases are
+  logically unusable and may be replaced only through the documented fence
+  rules; recovery never resurrects an expired lease;
+- GC commits whole candidate groups. A terminal/expired session and all of its
+  tools are deleted by one `kTxn`; a crash cannot leave a committed session
+  deletion with orphaned tools;
+- a malformed marker or `MDAR`, orphan tool, or inconsistent Agent resource count
+  is fatal at startup and never silently skipped.
+
+Agent state is included in the ordinary RDB capture, WAL chain, manifest
+boundary, and MVCC checkpoint machinery. There is no independent Agent
+checkpoint or second recovery protocol. The current process suite covers
+idempotency replay across restart, lease takeover with stale-fence rejection,
+`RUNNING` tool recovery, reserved-namespace collision, and Agent stats.
+
 ## Checkpoint ordering under crash
 
 R4-B uses two admission cuts and a background worker:
@@ -168,16 +197,21 @@ The deterministic crash points are implemented in
 - random fixed-seed `SIGKILL`;
 - TTL crash recovery;
 - explicit transaction contract, disconnect rollback, and committed `kTxn`
-  recovery.
+  recovery;
+- Agent idempotency crash recovery, lease takeover, `RUNNING` tool recovery,
+  reserved-namespace collision, and stats contract.
 
-Four fuzz targets exercise the HTTP parser, KV frame parser, WAL record codec,
-and checkpoint manifest codec:
+Six fuzz targets exercise the HTTP parser, KV frame parser, WAL record codec,
+checkpoint manifest codec, Agent record/response codec, and stateful Agent
+protocol transitions:
 
 ~~~text
 minidb_http_parser_fuzz
 minidb_kv_protocol_fuzz
 minidb_wal_record_fuzz
 minidb_checkpoint_manifest_fuzz
+minidb_agent_record_codec_fuzz
+minidb_agent_protocol_fuzz
 ~~~
 
 The current fixed seed is `20261111`, with 20,000 runs per target. A non-empty

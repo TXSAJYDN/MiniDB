@@ -1,12 +1,12 @@
 # MiniDB 项目状态
 
-- 更新时间：2026-11-11（Asia/Shanghai）
+- 更新时间：2026-11-12（Asia/Shanghai）
 - 当前定位：**面向有界资源的单机 crash-consistent KV 存储服务**
 - 权威开发工作树：`/home/win11/projects/miniDB`（WSL2 Ubuntu 24.04）
 - Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
-- 当前阶段：**R0-R3、R4-A、R4-B 和 R4-C 已完成；下一步是 R4-D，先以 ADR-009 冻结设计**
-- 当前测试清单：**395 项 CTest**（以 R4-C 的六配置本地验证矩阵为准）
+- 当前阶段：**R0-R3、R4-A、R4-B、R4-C 和 R4-D 已实现；R4-D 本地门禁完成，等待最终证据提交自身的 9/9 CI 发布验收**
+- 当前测试清单：**440 项 CTest**（R4-D 六配置本地验证矩阵）；31 个进程级用例、六个固定 seed fuzz target
 
 ## 1. 当前结论
 
@@ -32,8 +32,11 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 - R4-B checkpoint admission/capture/serialize/write/fsync/manifest/cleanup 分段指标及 `background_checkpoint_state`；
 - Snapshot Isolation + first-committer-wins 显式事务，per-key 版本链、私有写集和单条 `kTxn` 原子提交；
 - 事务活跃/版本/提交/冲突/GC 诊断指标及 `BEGIN/COMMIT/ROLLBACK` 协议；
+- 二进制 KV `AGENT=12` 持久状态后端，包含 session、tool、lease/fence、generic record 和 idempotency；
+- Agent mutation 与幂等结果在同一 `kTxn`、同一 LSN 原子提交，重放不新增 WAL/LSN；
+- Agent 保留命名空间、启动 marker/记录校验、只读恢复、周期 GC、资源上限和 `agent` stats；
 - C01-C14 崩溃点、固定 seed 随机 `kill -9`、尾部/中间损坏和故障注入测试；
-- HTTP、KV、WAL record、checkpoint manifest 四个 fuzz target；
+- HTTP、KV、WAL record、checkpoint manifest、Agent record codec 和 Agent protocol 六个 fuzz target；
 - 18 种配置的 durability/客户端/负载可靠性 benchmark。
 
 当前不宣称生产级、高并发、Redis/SQL 兼容或生产 SLA。这里的
@@ -52,6 +55,7 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 | R4-A 组提交 | DONE; G1-G7 PASS | ADR-006、writer/queue/batch/completion、异步协议、SAVE/shutdown barrier、338 项测试、完整质量门禁和正式 G4（5 轮，median QPS 2,858.989） |
 | R4-B 后台全量 checkpoint | DONE | ADR-007、两阶段 barrier、独立 snapshot capture、后台 RDB I/O、完整 live segment manifest、348 项测试和正式 artifact |
 | R4-C MVCC/事务 | DONE | ADR-008、版本链、Snapshot Isolation、first-committer-wins、单记录 `kTxn`、GC/TTL、事务协议和恢复；395 项测试 |
+| R4-D Agent 持久状态后端 | DONE（本地实现与门禁）；发布验收待最终证据提交 9/9 CI | ADR-009、`AGENT=12`、MDAR/MDOR、幂等/CAS/lease/fence、session/tool/generic/GC、恢复和 stats；440 项测试、31 个进程用例、六个 fuzz target |
 
 ## 3. 新定位与范围
 
@@ -76,7 +80,9 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 - 生产 SLA、容量规划或高并发宣传；
 - 公开 `BATCHED` durability mode；组提交仅作为 `SYNC` 的内部优化；
 - 自动周期 checkpoint、增量/COW checkpoint、多写者；R4-B 仅提供显式 SAVE/shutdown 的后台全量快照；
-- HTTP 跨请求事务、分布式事务、多写者。
+- HTTP 跨请求事务、分布式事务、多写者；
+- Agent HTTP API、多节点 lease、Raft/共识、跨节点会话迁移或外部工具副作用 exactly-once；
+- Agent generic record 的删除、TTL、遍历、分页列表或跨 session 查询。
 
 ## 4. 持久化语义
 
@@ -149,18 +155,25 @@ manifest + 旧 WAL 仍是权威恢复输入。
 | 活跃显式事务 | 64 |
 | 单事务写 key / payload | 256 keys / 1 MiB |
 | 全局版本条目 | 1,000,000 |
+| Agent session / tool / generic / idempotency 记录 | 1,024 / 8,192 / 16,384 / 8,192 |
+| 每 session 的 tool | 128 |
+| Agent 单条记录（MDAR 封套） | 64 KiB |
+| Agent logical bytes（key+value） | 64 MiB |
+| Agent name / tool_name | 128 / 256 字节 |
+| Agent session TTL / lease TTL | 1 分钟..30 天 / 1 秒..1 小时 |
 
 ## 6. 当前验证状态
 
-R4-A 组提交、R4-B 后台 checkpoint 与 R4-C MVCC 事务的本地质量门禁包括：
+R4-A 组提交、R4-B 后台 checkpoint、R4-C MVCC 事务与 R4-D Agent 状态后端的本地质量门禁包括：
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种配置；
-- 每个配置 **395 项 CTest**；
-- **26 个 `ProcessIntegrationTest.*` 进程级用例**，含后台 checkpoint、RDB rename 后/manifest 前崩溃、HTTP/KV 异步协议、事务契约、客户端断开和 shutdown 失败退出码；
+- 每个配置 **440 项 CTest**；
+- **31 个 `ProcessIntegrationTest.*` 进程级用例**，含后台 checkpoint、RDB rename 后/manifest 前崩溃、HTTP/KV 异步协议、事务契约、客户端断开、shutdown 失败退出码，以及 Agent 幂等崩溃恢复、lease takeover、RUNNING tool 恢复、namespace 碰撞和 stats 契约；
 - 后台 checkpoint 状态机、独立快照 capture、完整 live segment 保留、cleanup 失败重试和析构回调安全测试；
 - 版本链、Snapshot Isolation、read-your-writes、first-committer-wins、pending commit 冲突窗口、只读提交、断连回滚、原子 `kTxn` 恢复、TTL/GC 和资源上限测试；
-- HTTP、KV、WAL record、checkpoint manifest 四个 fuzz target，各 20,000 runs，seed `20261111`；
-- `transactions` JSON 契约和 HTTP/KV 双协议事务测试；
+- Agent MDAR/MDOR codec、保留命名空间、revision/CAS、幂等重放/冲突、session/tool 状态机、lease TTL/fence、GC、启动 fail-stop 和资源边界测试；
+- HTTP、KV、WAL record、checkpoint manifest、Agent record codec、Agent protocol 六个 fuzz target，各 20,000 runs，seed `20261111`；
+- `transactions` 与 `agent` JSON 契约和 HTTP/KV 双协议统计测试；
 - clang-format dry-run、clang-tidy、`git diff --check`；
 - 18 配置 × 5 轮 R3 可靠性 benchmark，seed `20261111`；
 - R4-A 的 `/stats`/`STATS` timing 契约、fsync 桶分区和 v2 可靠性 benchmark；
@@ -174,8 +187,9 @@ R4-A 组提交、R4-B 后台 checkpoint 与 R4-C MVCC 事务的本地质量门�
   次成功、0 错误，平均 6.70 records/batch，queue rejection 与 writer failure
   均为 0，判定 PASS；
 - 远程 CI：R0-R3 基线 `cfbda60` 的 GitHub Actions 9/9 通过；R4-A 实现提交
-  `a06d7c2` 的 GitHub Actions run `43006353520` 同样 9/9 通过；R4-B 证据提交
-  发布后必须在其自身 commit 上重新全绿，最终状态以该 commit 的 checks 为准；
+  `a06d7c2` 的 GitHub Actions run `43006353520` 同样 9/9 通过；历史阶段只引用
+  对应 `main` HEAD 的检查。R4-D 当前实现尚未作为最终证据提交推送，发布结论
+  必须等待该证据提交自身的 GitHub Actions 9/9；
 - R4-B 正式 benchmark 在 clean HEAD `fbfd6a6` 上采集：主 benchmark 5 轮、32
   clients、`SYNC`、100% write，34,916/34,916 成功、0 错误，median QPS
   3,526.336；checkpoint probe 5 轮 SAVE 全部成功、0 checkpoint failure，总耗时
@@ -266,6 +280,10 @@ R4-A v2 clean baseline 则为 4.63x。吞吐和延迟改善伴随更高的 clien
 - 相对 clean v2 baseline，G4 的 server CPU 从 6.256% 升至 24.383%（单核），
   server RSS 峰值增加 224 KiB，恢复中位数从 0.022041 s 升至 0.044825 s；
   WAL 写放大保持 1.527778。收益不能脱离这些代价单独宣传。
+- Agent API 只存在于单个 KV 连接内，不提供 HTTP、跨请求事务或多节点 lease；
+  lease 依赖客户端正确传播 fence，无法保证外部工具副作用 exactly-once。
+- Agent generic record 不支持删除、TTL 或遍历；64 MiB 是逻辑 key+value 预算，
+  不包含 allocator、索引和其他运行时 overhead。
 - 许可证仍由所有者决定；仓库未创建 `LICENSE`/`COPYING`。
 
 ## 8. 文档入口
@@ -288,18 +306,21 @@ R4-A v2 clean baseline 则为 4.63x。吞吐和延迟改善伴随更高的 clien
 - [ADR-005：R4-A 组提交候选设计与证据门槛](decisions/005-group-commit.md)
 - [ADR-006：R4-A 组提交实现](decisions/006-group-commit-implementation.md)
 - [ADR-007：R4-B 后台全量 checkpoint](decisions/007-background-checkpoint.md)
+- [ADR-008：R4-C MVCC 与快照隔离事务](decisions/008-mvcc-transactions.md)
+- [ADR-009：R4-D AI Agent 持久状态后端](decisions/009-agent-state-backend.md)
 
 ## 9. 后续工作
 
-R4-A、R4-B 和 R4-C 已关闭：实现、本地门禁、文档和发布门禁均已闭环。
+R4-A、R4-B、R4-C 和 R4-D 的实现与本地门禁已闭环；R4-D 的最终证据提交仍处于
+发布验收阶段。
 
-1. R4-D（AI Agent 持久状态后端）是下一阶段：先写并单独提交 ADR-009，冻结
-   幂等键、lease、CAS/version、会话/工具调用状态恢复、有界资源和崩溃语义；
-2. ADR-009 必须在该提交自身的 `main` HEAD 上取得 GitHub Actions 9/9，之后才
-   允许修改实现代码；
-3. R4-D 实现必须重新通过 TSan、崩溃矩阵、fuzz、静态分析和资源上限验证，不能
-   牺牲“确认写不丢、恢复失败不发布部分 Store”的语义；
-4. 许可证保持最后处理，不在 ADR-009 或 R4-D 实现中修改 `LICENSE`/`COPYING`。
+1. 提交并推送 R4-D 文档与验证证据，确认该 `main` HEAD 自身的 GitHub Actions
+   9/9；在此之前不把 R4-D 写成已发布验收；
+2. R4-D 已实现并验证的内容包括 `AGENT=12`、MDAR/MDOR、幂等/CAS、lease/fence、
+   session/tool/generic 状态机、同 `kTxn` 原子提交、GC、恢复 fail-stop 和
+   `agent` stats，不能以新的无界状态或第二套持久化格式扩展；
+3. 最终证据同步后，再处理许可证和后续独立 ADR；许可证继续保持最后处理，不在
+   R4-D 提交中修改 `LICENSE`/`COPYING`。
 
-> 注：最终 R4-C 证据提交以自身 `main` HEAD 的 checks 为准，不能继承实现提交
-> `d659a66` 或任何更早提交的结果。
+> 注：每个发布结论只引用对应 `main` HEAD 自身的 checks，不能继承实现提交或任何
+> 更早提交的结果。

@@ -1,9 +1,10 @@
 # Troubleshooting
 
-This guide targets the current R0-R4-C reliability implementation: WAL + RDB
+This guide targets the current R0-R4-D reliability implementation: WAL + RDB
 checkpoint + manifest recovery, `SYNC` and `INTERVAL` durability, the
-single-writer lock, and the bounded group-commit writer. It is diagnostic
-guidance for a local engineering prototype, not a production runbook.
+single-writer lock, bounded group commit, snapshot-isolation transactions, and
+the durable Agent state backend. It is diagnostic guidance for a local
+engineering prototype, not a production runbook.
 
 ## First checks
 
@@ -21,7 +22,7 @@ clang++ --version
 ctest --test-dir build/release -N | tail -n 3
 ~~~
 
-The final local acceptance inventory is 395 CTest cases, including 26
+The final local acceptance inventory is 440 CTest cases, including 31
 `ProcessIntegrationTest.*` cases. Always identify the build directory and
 configuration you are actually using; an old or partial build can report a
 different count.
@@ -281,6 +282,67 @@ An accepted `COMMIT` still finishes if the client disconnects. An uncommitted
 transaction is rolled back on disconnect, session destruction, or shutdown, and
 none of its private writes are included in an RDB checkpoint.
 
+## AGENT returns IDEMPOTENCY_CONFLICT
+
+`IDEMPOTENCY_CONFLICT` is an application-level `MDOR` status carried inside a
+normal `VALUE` response. The idempotency key already belongs to a different
+canonical request. No new state was written.
+
+- To replay the original successful operation byte-for-byte, resend the exact
+  original subcommand and argument bytes with the same key.
+- To perform a genuinely different operation, use a new idempotency key.
+- Wait for the idempotency TTL before reusing the key for different content; the
+  default TTL is 24 hours and the maximum is 7 days.
+- Do not retry a changed request with the old key in a tight loop.
+
+A transport `CONFLICT=105` is different: it can occur when concurrent operations
+race on an idempotency key during admission. Retry the same canonical request
+with the same key; the retry should return the stored `MDOR` if the other
+operation committed.
+
+## AGENT returns LEASE_HELD, LEASE_EXPIRED, or FENCED
+
+These are deterministic `MDOR` application statuses, not connection failures.
+
+- `LEASE_HELD`: another owner holds a non-expired lease. Do not force a takeover;
+  wait for expiry or coordinate with the current owner.
+- `LEASE_EXPIRED`: renewal of an already expired lease is forbidden. Acquire a
+  new lease and use the resulting higher fence for subsequent tool operations.
+- `FENCED`: the supplied fence is lower than the target current last fence. An
+  old worker must stop. Re-read the session/tool, obtain the current fence from
+  a valid acquisition, and retry only if the current owner policy permits it.
+- `VERSION_MISMATCH`: re-read the record and retry with its current revision;
+  do not increment expected values blindly.
+
+Recovery intentionally leaves `RUNNING` tools and expired leases unchanged. A
+new worker takes over through a new lease/fence; startup never rewrites the old
+worker's state.
+
+## AGENT reserved namespace is rejected by ordinary KV
+
+Any key beginning with `\x00minidb-agent-v1\x00` is reserved. Ordinary
+binary-KV and HTTP reads/writes reject it, including operations inside explicit
+transactions. Use `AGENT=12` with the documented subcommands; there is no HTTP
+Agent API and no supported way to access Agent records as ordinary KV keys.
+
+If startup reports a missing/corrupt Agent marker, invalid `MDAR`, namespace
+collision, orphan tool, or Agent resource-count mismatch, preserve the complete
+RDB/manifest/WAL set for diagnosis. Do not delete the marker or individual Agent
+records to force startup: that would turn recoverable corruption into silent
+state loss.
+
+## AGENT inside an explicit transaction returns ERROR
+
+`AGENT` cannot be mixed with a `BEGIN` transaction. The error is intentional and
+leaves the existing transaction active and unchanged. Finish it with `COMMIT`
+or `ROLLBACK`, then issue the Agent command on the same connection.
+
+If an Agent write returns `ERROR` for parameter, resource, shutdown, or I/O
+reasons, distinguish a parse/validation failure from persistence fail-stop using
+the error text and `agent`/group-commit stats. Invalid parameters do not write
+WAL. Persistence I/O failure may mark the process fail-stop and requires repair
+and restart.
+
 ## Persistence entered fail-stop
 
 `SYNC` requires a WAL append and file fsync before a mutation is acknowledged.
@@ -422,13 +484,15 @@ TTL is not exposed through the HTTP route table; use the KV protocol.
 
 ## Fuzz run produces an artifact
 
-Four fixed-seed Clang libFuzzer targets are part of the acceptance smoke:
+Six fixed-seed Clang libFuzzer targets are part of the acceptance smoke:
 
 ~~~text
 minidb_http_parser_fuzz
 minidb_kv_protocol_fuzz
 minidb_wal_record_fuzz
 minidb_checkpoint_manifest_fuzz
+minidb_agent_record_codec_fuzz
+minidb_agent_protocol_fuzz
 ~~~
 
 Each target runs 20,000 runs with seed `20261111`. A non-empty artifact
@@ -439,7 +503,7 @@ find /tmp/minidb-fuzz-artifacts -maxdepth 1 -type f -print
 ~~~
 
 Minimize with `-minimize_crash=1`, add the input to the matching corpus, add a
-durable regression test, and rerun all four targets. The acceptance run is
+durable regression test, and rerun all six targets. The acceptance run is
 clean only when every target exits 0, no ASan/UBSan diagnostic appears, and the
 artifact directory remains empty.
 

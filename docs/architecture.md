@@ -5,7 +5,8 @@
 MiniDB is a **crash-consistent single-node key/value store for bounded-resource
 environments**. It owns its event loop, non-blocking TCP layer, HTTP and binary
 protocol parsers, TTL store, WAL, RDB checkpoint format, checkpoint manifest,
-and startup recovery path.
+and startup recovery path. The binary protocol also contains a durable Agent
+state backend built on the same committed KV, WAL, and checkpoint machinery.
 
 The project is a reliability engineering prototype, not a production database.
 It does not claim SQL or Redis compatibility, high concurrency, replication,
@@ -18,8 +19,9 @@ Two independent server processes expose the same storage engine:
 
 - **minidb_http_server** exposes health, echo, save, stats, and key/value routes
   over a deliberately strict HTTP/1.1 subset.
-- **minidb_kv_server** exposes CRUD, TTL, save, and stats commands over a
-  binary-safe framed TCP protocol.
+- **minidb_kv_server** exposes CRUD, TTL, save, stats, explicit transactions,
+  and `AGENT=12` durable Agent-state commands over a binary-safe framed TCP
+  protocol. HTTP intentionally exposes no Agent route.
 
 Both processes link the same network and storage libraries. They do not share
 memory and must use distinct persistence base paths. A second process is
@@ -59,6 +61,15 @@ rejected by an advisory `flock` on `<rdb_path>.lock`.
 14. Version GC preserves every version required by an active snapshot and the
     latest committed version; it fails closed at the version budget rather than
     violating snapshot visibility.
+15. Agent records live only under the reserved `\x00minidb-agent-v1\x00`
+    namespace. Ordinary KV and HTTP entry points reject that prefix before any
+    read or write, so internal state cannot leak through the public KV surface.
+16. An Agent mutation and its idempotency result are applied by one internal
+    `kTxn` at one LSN. A replay returns the stored `MDOR` without allocating an
+    LSN or bumping a revision.
+17. Agent recovery validates the namespace marker and every `MDAR` before the
+    process listens. Unknown, malformed, conflicting, or orphaned Agent state
+    is fail-stop rather than silently skipped.
 
 ## Process and thread model
 
@@ -114,8 +125,8 @@ been applied. Shutdown failure is propagated to a nonzero process exit code.
 |---|---|---|
 | Base | src/base | RAII descriptors, Buffer, clocks, error values, logging |
 | Network | src/net | eventfd/timerfd/signalfd EventLoop, level-triggered epoll, Acceptor, TcpConnection, TcpServer |
-| Protocol | src/protocol | HTTP parser/session/routes and binary KV framing/session |
-| Storage | src/storage | thread-safe MVCC KvStore, transaction table/conflict admission, RDB checkpoint, WAL, manifest, recovery, single-writer lock |
+| Protocol | src/protocol | HTTP parser/session/routes, binary KV framing/session, `AGENT=12` argument/response handling |
+| Storage | src/storage | MVCC KvStore, transaction table/conflict admission, Agent record/state store and GC, RDB checkpoint, WAL, manifest, recovery, single-writer lock |
 | Applications | app | CLI parsing, startup validation, signal-driven graceful shutdown |
 
 The dependency direction is approximately:
@@ -221,6 +232,8 @@ connection. The KV protocol has no idle timeout.
 5. `BEGIN`, `COMMIT`, and `ROLLBACK` use the owner-loop transaction table.
    Inside a transaction, SET/GET/DEL/EXPIRE/TTL read or stage private writes;
    COMMIT performs conflict admission before submitting one `kTxn` record.
+   `AGENT` is rejected inside an explicit transaction without changing that
+   transaction.
 6. The response is encoded in the same frame layout and queued through
    TcpConnection.
 7. The connection remains usable for command-level errors; framing corruption
@@ -235,6 +248,37 @@ implicit one-operation transaction.
 
 One command is in flight per connection. Pipelined frames remain buffered and
 are resumed from write completion, not recursive callbacks.
+
+## Agent state backend
+
+The Agent backend is a typed state layer over committed KV records, not a second
+storage engine:
+
+- the reserved namespace holds a marker plus versioned `MDAR` records and
+  idempotency entries;
+- the owner-loop `AgentStateStore` indexes session lifecycle, parent/child tool
+  state, lease deadlines, last fences, generic records, and idempotency hashes;
+  indexes are rebuilt from committed records at startup;
+- each mutation is converted into a bounded internal `kTxn` containing the
+  state changes and idempotency record. The normal group-commit writer assigns
+  the LSN and the owner loop applies both changes atomically;
+- deterministic business rejections return an `MDOR` in a transport `VALUE`
+  frame and do not write WAL. Protocol/parameter/resource/I/O failures use
+  `ERROR`; a persistence admission race can use `CONFLICT=105` and should be
+  retried with the same idempotency key;
+- leases use monotonic live deadlines and durable epoch-millisecond expiry,
+  strict revision/CAS checks, and a monotonically increasing fence. Recovery
+  does not auto-release a lease or rewrite a RUNNING tool;
+- a roughly one-second owner-loop timer runs bounded Agent GC. Each candidate
+  group is deleted by an internal `kTxn`; a terminal/expired session and all of
+  its tools are removed together.
+
+Agent records are included in ordinary RDB snapshots, WAL replay, manifest LSN
+boundaries, checkpoint publication, and MVCC version GC. There is no separate
+Agent file, format version, or HTTP API. The stable `agent` object in `/stats`
+and KV `STATS` reports counts, logical bytes, replay/conflict/fence counters, and
+GC timing. Full wire semantics are in [protocol-kv.md](protocol-kv.md) and
+[ADR-009](decisions/009-agent-state-backend.md).
 
 ## Storage and TTL semantics
 
@@ -408,6 +452,11 @@ The exact default bounds are:
 | Recovery scanned records | 1,000,000 |
 | Recovery scanned bytes | 512 MiB |
 | RDB snapshot | 64 MiB / 100,000 records |
+| Agent sessions / tools | 1,024 / 8,192 |
+| Tools per Agent session | 128 |
+| Agent generic / idempotency records | 16,384 / 8,192 |
+| Agent record / logical bytes | 64 KiB / 64 MiB |
+| Agent names / tool names | 128 B / 256 B |
 
 ## Testing strategy
 
@@ -428,7 +477,7 @@ The local evidence suite covers:
   tails, middle corruption, missing segments, and TTL recovery;
 - process-level CLI, default path, restart persistence, corrupt startup,
   writer-lock conflict, and shutdown-save failure behavior;
-- sanitizer, clang-format, clang-tidy, four fixed-seed fuzz targets, and the
+- sanitizer, clang-format, clang-tidy, six fixed-seed fuzz targets, and the
   reliability benchmark;
 - group-commit writer ordering, batch limits, queue/backlog limits, append and
   fsync failure, cleanup barriers, fail-stop, and exactly-once completion;
@@ -441,7 +490,11 @@ The local evidence suite covers:
   first-committer-wins conflicts, pending-commit conflict windows, read-only
   commits, transaction protocol framing, disconnect rollback, atomic `kTxn`
   recovery, TTL/snapshot selection, version GC, resource limits, and the
-  top-level `transactions` stats contract.
+  top-level `transactions` stats contract;
+- Agent record/MDOR codecs, strict revision/CAS, idempotency replay and
+  conflicts, reserved-namespace isolation, lease expiry/fencing, tool state
+  transitions, namespace recovery fail-stop, bounded GC, checkpoint/WAL replay,
+  process-level crash recovery, and the top-level `agent` stats contract.
 
 The acceptance matrix runs Debug, Release, ASan, UBSan, ASan+UBSan, and TSan
 from separate build directories. Passing it is local reproducibility evidence,
@@ -463,6 +516,9 @@ not a substitute for a public CI run or a production qualification.
 - Background/incremental checkpoint or automatic periodic checkpoint.
 - Power-loss, kernel-crash, firmware-cache, or media-failure proofs.
 - Production SLAs, capacity claims, or arbitrary client scaling.
+- HTTP Agent routes, multi-node leases, consensus, cross-node session migration,
+  or exactly-once external tool side effects.
+- Generic Agent record deletion, TTL, or enumeration.
 
 These exclusions are part of the contract, not hidden implementation gaps.
 
@@ -472,3 +528,4 @@ These exclusions are part of the contract, not hidden implementation gaps.
 - [ADR-006: R4-A group-commit implementation](decisions/006-group-commit-implementation.md)
 - [ADR-007: R4-B background full checkpoint](decisions/007-background-checkpoint.md)
 - [ADR-008: R4-C MVCC and snapshot-isolation transactions](decisions/008-mvcc-transactions.md)
+- [ADR-009: R4-D durable Agent state backend](decisions/009-agent-state-backend.md)

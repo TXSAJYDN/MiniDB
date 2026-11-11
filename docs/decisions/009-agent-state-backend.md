@@ -1,10 +1,11 @@
 # ADR-009：R4-D AI Agent 持久状态后端
 
-- 状态：**Proposed** — 仅冻结设计；R4-D 实现尚未开始
+- 状态：**Proposed — implementation complete; final CI acceptance pending**
 - 日期：2026-11-12
+- 实现状态：2026-11-12 完成本地实现与门禁；最终证据提交自身 9/9 通过后才转为 Accepted
 - 关联：`docs/MiniDB-可靠性与持久化升级计划书.md`、ADR-002、ADR-003、ADR-004、ADR-006、ADR-007、ADR-008、`docs/wal-format.md`、`docs/recovery.md`、`docs/protocol-kv.md`
 - 决策范围：R4-D 的持久布局、revision/CAS、幂等、session/tool 状态机、lease/fencing、二进制 KV 协议、资源上限、GC、checkpoint、恢复、失败语义、观测和验收门槛
-- 准入条件：本 ADR 必须先以 docs-only 提交进入 `main`，并取得该提交自身的 9/9 GitHub Actions 通过；在此之前不得提交 R4-D 实现
+- 准入条件：ADR 以 docs-only 提交进入 `main` 并完成准入检查；实现已按该顺序完成。最终证据提交仍需取得自身 9/9 GitHub Actions，之后才能把状态改为 Accepted
 
 ## 背景
 
@@ -833,26 +834,26 @@ runner 预装的固定工具链，并取得 `500d67d` 自身的 9/9。包含本�
 
 ### 16.2 实现测试
 
-必须新增并通过：
+实现完成后已新增并通过以下测试；最终远程验收仍以证据提交自身的 CI 为准：
 
-- codec：所有 truncation、magic/version/type/status/reserved、长度溢出、尾随
+- [x] codec：所有 truncation、magic/version/type/status/reserved、长度溢出、尾随
   bytes、非规范 payload 和 64 KiB 边界；
-- namespace：marker 创建、缺失 marker、碰撞、损坏 marker、启动 fail-stop；
-- revision：create/CAS/update、UINT64 边界、并发同目标冲突；
-- idempotency：replay 不新增 LSN、不同 canonical request 冲突、TTL、崩溃后
+- [x] namespace：marker 创建、缺失 marker、碰撞、损坏 marker、启动 fail-stop；
+- [x] revision：create/CAS/update、UINT64 边界、并发同目标冲突；
+- [x] idempotency：replay 不新增 LSN、不同 canonical request 冲突、TTL、崩溃后
   replay、并发同 key 只提交一次；
-- session：非法状态转换、终态不可变、TTL、purge 前置条件和 tool 原子删除；
-- lease：过期、fence 严格递增、旧 fence 拒绝、renew/release CAS 和时钟跳变；
-- tool：claim/complete/requeue、RUNNING 崩溃后仍可见、新 fence 接管、
+- [x] session：非法状态转换、终态不可变、TTL、purge 前置条件和 tool 原子删除；
+- [x] lease：过期、fence 严格递增、旧 fence 拒绝、renew/release CAS 和时钟跳变；
+- [x] tool：claim/complete/requeue、RUNNING 崩溃后仍可见、新 fence 接管、
   父 session 终态有效取消；
-- generic：创建、CAS、边界和容量；
-- protocol：AGENT code 12、子命令参数、MDOR、显式事务拒绝、断连安全；
-- recovery：RDB/WAL/checkpoint 混合恢复、坏记录 fail-stop、无孤儿 tool；
-- resource：所有条数、字段和 64 MiB 上限的精确边界；
-- process integration：至少覆盖 idempotency replay、lease takeover、RUNNING
-  tool 崩溃恢复和 namespace 碰撞；
-- fuzz：新增 MDAR/MDOR codec 和 AGENT 协议 fuzz target，现有四个 target 不退化；
-- observability：HTTP 和 KV stats 的 Agent 字段契约。
+- [x] generic：创建、CAS、边界和容量；
+- [x] protocol：AGENT code 12、子命令参数、MDOR、显式事务拒绝、断连安全；
+- [x] recovery：RDB/WAL/checkpoint 混合恢复、坏记录 fail-stop、无孤儿 tool；
+- [x] resource：所有条数、字段和 64 MiB 上限的精确边界；
+- [x] process integration：idempotency replay、lease takeover、RUNNING tool
+  崩溃恢复和 namespace 碰撞；
+- [x] fuzz：新增 MDAR/MDOR codec 和 AGENT 协议 fuzz target，现有四个 target 不退化；
+- [x] observability：HTTP 和 KV stats 的 Agent 字段契约。
 
 ### 16.3 质量门禁
 
@@ -873,20 +874,27 @@ runner 预装的固定工具链，并取得 `500d67d` 自身的 9/9。包含本�
 - `python3 -m py_compile tests/process_integration_test.py`；
 - 最终实现提交自身的 9/9 GitHub Actions。
 
+2026-11-12 本地实现记录：六个配置各 **440/440 CTest**，**31 个
+`ProcessIntegrationTest.*` 进程用例**，六个固定 seed 的 20,000-run fuzz target
+全部通过；Agent 进程用例为 `AgentIdempotencyCrashRecovery`、`AgentLeaseTakeover`、`AgentCrashRecovery`、`AgentNamespaceCollision` 和 `AgentStatsContract`。
+最终证据提交的 GitHub Actions 9/9 尚未执行，不能用本记录替代远程 CI。
+
 历史测试数量必须按新配置实际采集；不得把 R4-A 的 338/24、R4-B 的 348/25 或
 R4-C 的既有数字机械复制为 R4-D 证据。
 
 ## 17. 实施顺序
 
-1. **AgentRecordCodec**：key 编码、MDAR/MDOR 封套、严格解码、边界和 fuzz。
-2. **AgentStateStore**：namespace marker、session/tool/idempotency/record 索引、
+实现已完成，以下步骤均已完成：
+
+1. [x] **AgentRecordCodec**：key 编码、MDAR/MDOR 封套、严格解码、边界和 fuzz。
+2. [x] **AgentStateStore**：namespace marker、session/tool/idempotency/record 索引、
    revision/CAS、fencing、资源计数和恢复重建。
-3. **PersistenceManager 集成**：内部 `kTxn` 构造、状态 + idempotency 同 LSN、
+3. [x] **PersistenceManager 集成**：内部 `kTxn` 构造、状态 + idempotency 同 LSN、
    completion/fail-stop 和 owner-loop 边界。
-4. **AGENT 协议**：KvProtocol code 12、MDOR 参数/错误映射、显式事务拒绝和断连。
-5. **Server 启动与观测**：namespace 碰撞检查、Agent stats、GC timer、
+4. [x] **AGENT 协议**：KvProtocol code 12、MDOR 参数/错误映射、显式事务拒绝和断连。
+5. [x] **Server 启动与观测**：namespace 碰撞检查、Agent stats、GC timer、
    shutdown/checkpoint 接入。
-6. **测试与文档**：上述验收矩阵、进程测试、fuzz、protocol/architecture/
+6. [x] **测试与文档**：上述验收矩阵、进程测试、fuzz、protocol/architecture/
    recovery/troubleshooting 文档和最终证据。
 
 每个实现步骤必须保持工作树可构建、可测试和可回滚；不得把无关格式升级、许可证
@@ -936,5 +944,6 @@ R4-D 选择“普通 committed KV 上的版本化 Agent 记录 + 单 kTxn 幂等
 lease/fence”作为实现边界。它不新增持久化格式，不改变 R4-A/R4-B/R4-C 的已确认
 语义，并用严格 revision、幂等和启动 fail-stop 把可恢复性变成可测试契约。
 
-本 ADR 当前状态为 **Proposed**。只有在 docs-only ADR 提交取得自身 9/9 CI 后，
-才允许开始实现；实现完成和证据采集通过后，才可把状态更新为 Accepted。
+本 ADR 当前状态为 **Proposed — implementation complete; final CI acceptance pending**。
+实现和本地证据已完成；最终证据提交取得自身 9/9 CI 后，才可把状态更新为
+**Accepted**。

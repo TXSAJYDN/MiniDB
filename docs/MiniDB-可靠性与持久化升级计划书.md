@@ -1,21 +1,22 @@
 # MiniDB 可靠性与持久化升级计划书
 
-> 文档状态：`R0-R3 Completed / R4-A Completed / R4-B Completed / R4-C Completed / R4-D Next`
+> 文档状态：`R0-R3 Completed / R4-A Completed / R4-B Completed / R4-C Completed / R4-D Implemented — Final CI Acceptance Pending`
 >
 > 编写日期：2026-11-10（Asia/Shanghai）
 >
-> 实施与本地验收：2026-11-11（Asia/Shanghai）
+> 实施与本地验收：2026-11-12（Asia/Shanghai）
 >
 > 升级起点：`34dcc79`（`docs: translate README to Chinese`）
 >
 > 最近历史功能验收基线：`9da4b48`（阶段 A-H 技术验收 PASS）
 >
-> 计划性质：R0-R3、R4-A、R4-B 和 R4-C 已按本文完成实现并通过本地验证；
+> 计划性质：R0-R3、R4-A、R4-B、R4-C 和 R4-D 已按本文完成实现并通过本地验证；
 > R4-A 的 ADR-005、诊断指标、G3 和 clean-HEAD G4，R4-B 的 ADR-007、两阶段
-> checkpoint 和正式 artifact，以及 R4-C 的 ADR-008、Snapshot Isolation、
-> 单记录事务 WAL、GC/TTL/checkpoint 交互和本地六配置门禁均已记录。R4-D 仍需
-> 遵守“先 ADR、后实现、每阶段独立 CI”的准入顺序；ADR-009 获准前不写状态
-> 后端实现。所有远程 CI 结论只引用对应 `main` HEAD 的实际检查。
+> checkpoint 和正式 artifact，R4-C 的 ADR-008、Snapshot Isolation、单记录事务
+> WAL、GC/TTL/checkpoint 交互，以及 R4-D 的 ADR-009、AGENT 持久状态后端、
+> 幂等/CAS/lease/fence、恢复/GC 和六配置门禁均已记录。R4-D 已通过本地门禁，
+> 但最终证据提交仍需取得自身 9/9 CI 后才能写成发布验收。所有远程 CI 结论只引用
+> 对应 `main` HEAD 的实际检查。
 >
 > 推进方式：按技术依赖和验收门槛推进，不设置固定总工期或强制周计划。阶段状态、证据链接、已知限制和下一步准入条件随实现同步更新。
 >
@@ -37,6 +38,7 @@
 - [ADR-006：R4-A 组提交实现](decisions/006-group-commit-implementation.md)
 - [ADR-007：R4-B 后台全量 checkpoint](decisions/007-background-checkpoint.md)
 - [ADR-008：R4-C MVCC 与快照隔离事务](decisions/008-mvcc-transactions.md)
+- [ADR-009：R4-D AI Agent 持久状态后端](decisions/009-agent-state-backend.md)
 
 ## 目录
 
@@ -59,11 +61,11 @@
 
 ## 0. 执行摘要
 
-MiniDB 已经完成了阶段 A-H 的技术验收，具备较完整的网络层、KV/TTL 存储和 RDB 快照能力。当前问题不是“代码量不够”或“测试不够多”，而是：
+MiniDB 已完成阶段 A-H 以及 R0-R4-D 的实现和本地验收，具备 WAL、RDB checkpoint、组提交、后台快照、Snapshot Isolation 事务和 Agent 持久状态后端。立项时的问题不是“代码量不够”或“测试不够多”，而是：
 
-> **项目的核心机制仍然是一个常见的 mini KV + RDB 快照；真正较强的部分集中在验证和故障测试，而不是一个足够硬、可持续追问的存储问题。**
+> **当时项目的核心机制仍然是一个常见的 mini KV + RDB 快照；真正较强的部分集中在验证和故障测试，而不是一个足够硬、可持续追问的存储问题。**
 
-因此，本计划建议：
+因此，本计划当时建议：
 
 1. 取消“教学型”定位；
 2. 不宣称“生产级数据库”；
@@ -90,7 +92,7 @@ R0 重新定位与证据规范
 - 完整 Redis 兼容；
 - Raft、复制和集群；
 - 超出 Snapshot Isolation 的 serializable、范围冲突和分布式事务；
-- R4-D Agent 持久状态后端在 ADR-009 获准前的实现；
+- R4-D 的 HTTP Agent API、多节点 lease、分布式共识、外部工具副作用 exactly-once，以及 generic record 删除/TTL/遍历；
 - TLS、认证授权和多进程共享存储；
 - “生产级”“高并发”“高吞吐”等未经证据支持的宣传。
 
@@ -123,7 +125,7 @@ R0 重新定位与证据规范
 | 持久化 | RDB v2 全量快照、CRC32C、临时文件、fsync、原子 rename、目录 fsync | 工程质量强，但只有全量快照 |
 | 恢复 | 启动时加载最近一次 RDB；损坏时拒绝发布 | 没有基于 WAL 的崩溃恢复 |
 | 资源边界 | 32 连接、每连接 1.25 MiB 输入/输出预算、64 MiB RDB 上限 | 已有“有界资源”的雏形，应上升为项目命题 |
-| 测试 | 计划立项时历史基线为六配置各 214/214 CTest；R0-R3 为六配置各 305/305；R4-A 为六配置各 338/338；R4-B 为六配置各 348/348；R4-C 为六配置各 395/395，含 26 个进程用例和四个 20,000-run fuzz target | 已形成可复现的工程证据 |
+| 测试 | 计划立项时历史基线为六配置各 214/214 CTest；R0-R3 为六配置各 305/305；R4-A 为六配置各 338/338；R4-B 为六配置各 348/348；R4-C 为六配置各 395/395；R4-D 为六配置各 440/440，含 31 个进程用例和六个 20,000-run fuzz target | 已形成可复现的工程证据 |
 | 故障注入 | RDB EINTR、短写、ENOSPC、open/fsync/close/rename/dir-fsync 等 | 可复用为 WAL 崩溃矩阵的基础 |
 | 性能 | HTTP 约 1,782 req/s、KV 约 1,968 req/s，单连接、单 in-flight、closed-loop | 只能作为基线，不能作为容量或生产 SLA 结论 |
 | 主要缺口 | 无 WAL/AOF；无 ack 后崩溃一致性；SAVE stop-the-world；无事务、复制、多进程所有权 | 缺少一个真正硬的存储可靠性闭环 |
@@ -710,8 +712,8 @@ R1 的 checkpoint 仍可以是 stop-the-world；先保证正确性，再根据�
 - 恢复时间与 WAL 大小曲线；
 - checkpoint 停顿数据；
 - `SYNC`/`INTERVAL` 两种公开模式与 `SYNC` 内部组提交优化的对比；
-- R1 验收时为 305 项，R4-A 后增至 338 项，并在六种配置下无回退；
-- CI、ASan/UBSan/TSan 和四个 fuzz target 的结果。
+- R1 验收时为 305 项，R4-A 后增至 338 项，R4-D 当前为 440 项，并在六种配置下无回退；
+- CI、ASan/UBSan/TSan 和六个固定 seed fuzz target 的结果。
 
 ---
 
@@ -898,11 +900,28 @@ session 析构和 shutdown 时回滚。HTTP `/kv` 的每个 mutation 仍是隐�
 - [x] 完成本地六配置、sanitizer、TSan、fuzz、格式和静态分析门禁；
 - 本实现与证据提交必须在自身 `main` HEAD 上通过完整 GitHub Actions 9/9；在该提交的远程检查完成前不写成“已通过”。
 
-**R4-D：AI Agent 持久状态后端（下一阶段）**
+**R4-D：AI Agent 持久状态后端（实现完成，发布验收待最终 CI）**
 
-- [ ] 先写 ADR-009，冻结幂等键、lease、版本号/CAS、会话与工具调用状态恢复、有界资源、崩溃与恢复语义；
-- [ ] ADR-009 单独提交、推送并通过自身 9/9 CI 后才开始实现；
-- [ ] 实现必须在 R4-C 的 committed state、LSN 和事务边界之上完成，不能替代存储核心的崩溃一致性工作。
+实施状态（2026-11-12）：[ADR-009](decisions/009-agent-state-backend.md) 已先冻结
+幂等键、revision/CAS、session/tool 状态机、lease/fence、保留命名空间、资源上限、
+GC、checkpoint、恢复和统计契约，并按独立 docs-only 提交通过准入。实现已加入
+`AGENT=12` 的 15 个子命令、MDAR/MDOR 编解码、同一 `kTxn`/LSN 的状态与幂等记录、
+启动 namespace/marker 校验、孤儿 tool 处理、周期 GC 和 `agent` stats。本地门禁为
+六配置各 440/440 项 CTest、31 个进程用例和六个 20,000-run fuzz target；Agent
+进程用例覆盖 idempotency crash recovery、lease takeover、RUNNING tool 恢复、
+namespace collision 和 stats contract。最终证据提交仍必须在自身 `main` HEAD 上
+取得完整 GitHub Actions 9/9 后才能写成发布验收。
+
+- [x] 写 ADR-009，冻结幂等键、lease、版本号/CAS、会话与工具调用状态恢复、有界资源、崩溃与恢复语义；
+- [x] ADR-009 单独提交、推送并通过自身 9/9 CI 后才开始实现；
+- [x] 在 R4-C 的 committed state、LSN 和事务边界之上实现，不替代存储核心的崩溃一致性工作；
+- [x] Agent MDAR/MDOR codec、保留命名空间、严格 revision/CAS 和 SHA-256 canonical request；
+- [x] idempotency replay/conflict、同 `kTxn`/LSN 原子提交和崩溃后恢复；
+- [x] session/tool 状态机、lease TTL、单调 fence、旧 fence 拒绝和 RUNNING tool 接管；
+- [x] generic record 边界、资源计数、周期 GC、checkpoint/WAL/RDB 恢复和启动 fail-stop；
+- [x] KV `AGENT=12` 协议、显式事务拒绝、MDOR 错误映射、`agent` stats 和文档；
+- [x] 六配置 440/440 本地门禁、31 个进程用例、六个 fuzz target、格式和静态分析；
+- 最终证据提交必须在自身 `main` HEAD 上通过完整 GitHub Actions 9/9；在该提交的远程检查完成前不写成“已通过”。
 
 ---
 
@@ -996,7 +1015,7 @@ R1-R3 完成后可以写：
 | R4-A | 组提交只在 G1-G3 证明机会后实现，并完成 G1-G7、clean-HEAD G4 和完整门禁 |
 | R4-B | 两阶段后台全量 checkpoint、完整 live segment manifest、失败恢复和正式证据通过独立门禁 |
 | R4-C | ADR-008 已冻结；版本链、Snapshot Isolation、冲突、单记录事务 WAL、GC、TTL 和恢复通过六配置 395/395、26 个进程用例及独立提交/CI 门禁 |
-| R4-D | 先冻结 Agent 状态后端 ADR-009，再实现幂等键、lease、CAS、会话/工具状态恢复和有界资源；ADR 获准前不写实现 |
+| R4-D | ADR-009 已冻结；`AGENT=12`、MDAR/MDOR、幂等键、revision/CAS、lease/fence、会话/工具状态恢复、保留命名空间、GC 和同 `kTxn` 原子提交已实现；六配置 440/440、31 个进程用例、六个 fuzz target；最终证据提交待自身 9/9 CI |
 
 任何阶段如果出现：
 
@@ -1035,9 +1054,11 @@ R4-C 已完成并新增 per-key 版本链、Snapshot Isolation、first-committer
 单记录 `kTxn` 原子提交、事务 GC/TTL/checkpoint 交互和 395/26 本地门禁；
 其发布结论仍只引用最终证据提交自身的 9/9 CI。
 
-R4-D 是下一独立阶段，不随 R4-C 自动进入实现。必须先提交 ADR-009 并取得其自身
-9/9 CI，冻结幂等键、lease、CAS、会话/工具状态恢复、有界资源和崩溃语义后，才能
-开始代码。任何后续变更仍必须重新通过 sanitizer、崩溃矩阵、fuzz 和资源上限验证。
+R4-D 已按 ADR-009 完成实现：二进制 `AGENT=12`、MDAR/MDOR、幂等键、lease/fence、
+revision/CAS、会话/工具状态恢复、保留命名空间、GC 和同 `kTxn` 原子提交均已落地，
+并通过六配置 440/440、31 个进程用例和六个 fuzz target 的本地门禁。最终证据提交
+仍必须以自身 `main` HEAD 的 9/9 CI 作为发布门禁，不能继承实现提交的结果。任何
+后续变更仍必须重新通过 sanitizer、崩溃矩阵、fuzz 和资源上限验证。
 
 ---
 
@@ -1053,3 +1074,4 @@ R4-D 是下一独立阶段，不随 R4-C 自动进入实现。必须先提交 AD
 | 2026-11-11 | 0.6 | R4-A G4 PASS：clean HEAD `a06d7c2`、5 轮 32 客户端 `SYNC` write、median QPS 2,858.989、相对 418.018 为 6.84x、29,100 次成功 0 错误；artifact、digest、CPU/RSS/恢复代价和 G7 状态已写回，R4-A 完成 |
 | 2026-11-11 | 0.7 | R4-B 完成：ADR-007、两阶段后台全量 checkpoint、完整 live segment manifest、cleanup 重试、348/25 本地门禁和 clean-HEAD v3 artifact；下一步先提交 ADR-008，再实现 R4-C |
 | 2026-11-11 | 0.8 | R4-C 完成：ADR-008、per-key 版本链、Snapshot Isolation、first-committer-wins、单记录 `kTxn`、事务协议/stats、GC/TTL/checkpoint/恢复和 395/26 本地门禁；下一步先写 ADR-009，再实现 R4-D |
+| 2026-11-12 | 0.9 | R4-D 实现完成：ADR-009、`AGENT=12`、MDAR/MDOR、幂等/CAS/lease/fence、session/tool/generic、同 `kTxn` 原子提交、GC/恢复、`agent` stats 和六配置 440/31/六个 fuzz target 本地门禁；最终证据提交待自身 9/9 CI |

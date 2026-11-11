@@ -3,10 +3,11 @@
 ## Scope
 
 This document records the R0-R3 baseline, the R4-A instrumentation and G3
-batch-formation experiments, the implemented group-commit validation, and the
-R4-B background full-checkpoint validation, and the R4-C snapshot-isolation
-MVCC transaction validation for MiniDB's crash-consistent persistence work. It is deliberately a statement about a tested engineering
-prototype, not a production qualification.
+batch-formation experiments, the implemented group-commit validation, the R4-B
+background full-checkpoint validation, the R4-C snapshot-isolation MVCC
+transaction validation, and the R4-D durable Agent state-backend validation for
+MiniDB's crash-consistent persistence work. It is deliberately a statement
+about a tested engineering prototype, not a production qualification.
 
 The evidence covers:
 
@@ -23,11 +24,13 @@ The evidence covers:
 - per-key MVCC version chains, snapshot isolation, first-committer-wins,
   single-record transaction WAL commits, bounded GC/TTL behavior, and their
   protocol/recovery evidence;
+- durable Agent sessions, tools, leases/fences, generic records, idempotency,
+  bounded GC, namespace isolation, and their protocol/recovery evidence;
 - explicit limits and non-claims.
 
 ## Source and environment
 
-- Date: 2026-11-11 (Asia/Shanghai)
+- Date: 2026-11-12 (Asia/Shanghai)
 - Source worktree: `/home/win11/projects/miniDB`
 - Baseline commit at the start of the upgrade: `34dcc79`
 - Environment: Ubuntu 24.04 WSL2, kernel `6.18.58.1-microsoft-standard-WSL2`,
@@ -45,21 +48,21 @@ is about that baseline commit, not a claim about every later commit.
 
 ## Test matrix
 
-The local matrix for R4-C runs each configuration from its own CMake build
+The local matrix for R4-D runs each configuration from its own CMake build
 directory:
 
 | Configuration | CTest |
 |---|---:|
-| Debug | 395/395 |
-| Release | 395/395 |
-| ASan | 395/395 |
-| UBSan | 395/395 |
-| ASan + UBSan | 395/395 |
-| TSan (`setarch x86_64 -R`) | 395/395 |
+| Debug | 440/440 |
+| Release | 440/440 |
+| ASan | 440/440 |
+| UBSan | 440/440 |
+| ASan + UBSan | 440/440 |
+| TSan (`setarch x86_64 -R`) | 440/440 |
 
-Each configuration includes the 26 `ProcessIntegrationTest.*` cases. The R4-A
-historical matrix was 338 tests and 24 process cases; the R4-B historical
-matrix was 348 tests and 25 process cases.
+Each configuration includes 31 `ProcessIntegrationTest.*` cases. The R4-A
+historical matrix was 338 tests and 24 process cases; R4-B was 348/25; R4-C was
+395/26. Those historical counts are not reused as R4-D evidence.
 
 ~~~text
 CliContract
@@ -88,6 +91,11 @@ KvAsyncProtocol
 KvDisconnectSafety
 HttpAsyncProtocol
 HttpDisconnectSafety
+AgentIdempotencyCrashRecovery
+AgentLeaseTakeover
+AgentCrashRecovery
+AgentNamespaceCollision
+AgentStatsContract
 ~~~
 
 The unit and integration inventory also includes:
@@ -118,17 +126,26 @@ The unit and integration inventory also includes:
   conflicts;
 - BEGIN/COMMIT/ROLLBACK protocol validation, `CONFLICT=105` mapping, transaction
   stats schema, disconnect rollback, and process-level transaction persistence;
+- Agent MDAR/MDOR codecs, canonical request hashing, strict revision/CAS,
+  idempotency replay/conflict behavior, reserved-namespace isolation, session
+  and tool state transitions, lease expiry/fencing, bounded GC, and recovery
+  fail-stop for malformed or orphaned records;
+- process-level Agent idempotency crash recovery, lease takeover, RUNNING-tool
+  recovery, namespace collision, and the `agent` stats contract;
 - C01-C14 deterministic crash points.
 
 This is local reproducibility evidence. It is not a substitute for a public CI
 run. The R0-R3 baseline commit `cfbda60` and the R4-A implementation commit
-`a06d7c2` both passed 9/9 GitHub Actions jobs. The R4-A G4 evidence commit, the R4-B evidence commit, and each R4-C
-implementation/evidence commit must pass its own full CI run; status must be
-read from the GitHub checks for that commit, not inherited from an earlier one.
+`a06d7c2` both passed 9/9 GitHub Actions jobs. The R4-A G4 evidence commit, the
+R4-B evidence commit, each R4-C implementation/evidence commit, and the R4-D
+implementation/evidence commit must pass their own full CI run; status is read
+from the GitHub checks for that exact commit, not inherited from an earlier one.
+The R4-D ADR records the final implementation/evidence commit and run after the
+remote matrix completes.
 
 ## Fuzz evidence
 
-Four Clang libFuzzer targets are built with ASan and UBSan:
+Six Clang libFuzzer targets are built with ASan and UBSan:
 
 | Target | Corpus | Runs | Seed |
 |---|---|---:|---:|
@@ -136,6 +153,8 @@ Four Clang libFuzzer targets are built with ASan and UBSan:
 | `minidb_kv_protocol_fuzz` | `fuzz/corpus/kv` | 20,000 | 20261111 |
 | `minidb_wal_record_fuzz` | `fuzz/corpus/wal` | 20,000 | 20261111 |
 | `minidb_checkpoint_manifest_fuzz` | `fuzz/corpus/manifest` | 20,000 | 20261111 |
+| `minidb_agent_record_codec_fuzz` | `fuzz/corpus/agent_record` | 20,000 | 20261111 |
+| `minidb_agent_protocol_fuzz` | `fuzz/corpus/agent_protocol` | 20,000 | 20261111 |
 
 A clean run requires exit code 0 for every target, no ASan/UBSan diagnostic, and
 an empty artifact directory. Any crash must be minimized, added to the corpus,
@@ -362,6 +381,44 @@ The R4-C local gate is the same six-configuration matrix shown above
 ASan, UBSan, four 20,000-run fuzz targets, formatting, and static analysis. The
 committed implementation and evidence commits must each obtain their own 9/9
 GitHub Actions result before release status is claimed.
+
+## R4-D durable Agent state backend evidence
+
+R4-D adds a typed durable state layer over the existing committed KV, LSN,
+transaction, WAL, RDB, checkpoint, and recovery machinery. The design is frozen
+in ADR-009. The implemented surface is:
+
+- binary KV command `AGENT=12` with 15 session/tool/lease/generic subcommands;
+- MDAR records and an MDOR response envelope in the reserved namespace
+  `\x00minidb-agent-v1\x00`;
+- SHA-256 canonical request hashes, 1..128-byte idempotency keys, and replay of
+  the original response without a new LSN;
+- state mutation and idempotency in one internal `kTxn`, using the normal
+  group-commit durability mode;
+- strict revision/CAS, session lease TTL, monotonic fence, tool
+  claim/complete/requeue, and crash takeover without automatic RUNNING-tool
+  rewriting;
+- bounded session/tool/generic/idempotency indexes and a 64 MiB logical-byte
+  budget;
+- roughly one-second owner-loop GC with 64-candidate-group batches and atomic
+  session+tool deletion by internal `kTxn`;
+- startup validation of the marker and every MDAR, index/count reconstruction,
+  orphan-tool rejection, and fail-stop on malformed state;
+- HTTP exclusion and reserved-prefix rejection on every ordinary KV/HTTP path;
+- a stable top-level `agent` object in both `/stats` and KV `STATS`.
+
+The R4-D local gate uses the six-configuration matrix above (440/440 in each
+configuration), including 31 process-level cases. The five Agent process cases
+are `AgentIdempotencyCrashRecovery`, `AgentLeaseTakeover`, `AgentCrashRecovery`,
+`AgentNamespaceCollision`, and `AgentStatsContract`. The fixed-seed fuzz gate
+runs the six 20,000-run targets listed below with an empty artifact directory.
+TSan, ASan, UBSan, clang-format, clang-tidy, `git diff --check`, and Python
+syntax compilation are part of the same gate.
+
+This evidence covers process crashes and restart, not power loss, multi-node
+lease safety, or exactly-once external tool side effects. The implementation and
+evidence commit must obtain its own 9/9 GitHub Actions result; the ADR acceptance
+record names the exact commit and run.
 
 ## R4-A G3 batch-formation experiment
 
@@ -646,4 +703,6 @@ negative evidence; it is not converted into a PASS by changing thresholds.
 - [Benchmark methodology](../bench/README.md)
 - [ADR-005: R4-A group-commit candidate design and evidence gates](decisions/005-group-commit.md)
 - [ADR-006: R4-A group-commit implementation](decisions/006-group-commit-implementation.md)
+- [ADR-008: R4-C MVCC and snapshot-isolation transactions](decisions/008-mvcc-transactions.md)
+- [ADR-009: R4-D durable Agent state backend](decisions/009-agent-state-backend.md)
 - [Fuzz targets](../fuzz/README.md)

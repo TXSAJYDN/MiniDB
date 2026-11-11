@@ -125,13 +125,71 @@ quantiles or per-request traces. ADR-005 defines G1-G7; no group-commit work
 starts unless the baseline and a separate batch-formation experiment satisfy
 the gates.
 
-The v2 artifact path is
-`bench/results/reliability-20261111-r4a-baseline.json`. It does not overwrite
-the historical R3 artifact. See
-[ADR-005](decisions/005-group-commit.md) for the candidate boundaries and
-evidence gates.
+### v2 baseline artifact
 
-## Reliability benchmark
+- `bench/results/reliability-20261111-r4a-baseline.json`
+- 310,067 bytes
+- SHA-256:
+  `55bcad4ead05fcba26e44cecf17e71df6ffd7dba17e54a128398c5b65820fe84`
+- `git_head=964ba8446a71f6c491cd1241e5479632465b9835`
+- `working_tree_dirty_at_collection=false`
+- 18 configurations, 5 rounds per configuration, 2 seconds per measured round
+- 414,688 successful requests, 0 errors
+- 229.087 seconds wall-clock collection time
+- dataset: 128 keys, 64-byte values; seed `20261111`
+- same WSL2 host, closed-loop persistent KV connections
+- recovery: `SIGKILL` after each measured round, then fresh-process startup to
+  `PING`; checkpoint: KV `SAVE` after recovery
+
+The v2 artifact does not overwrite the historical R3 artifact. Timing columns
+below are medians of per-round measured-window means; pooled P50/P99 use every
+latency sample retained by the compact artifact.
+
+### All v2 configurations
+
+| Mode | Clients | Workload | Median QPS | Pooled P50 us | Pooled P99 us | Append mean us | Data-fsync mean us | SYNC mutation mean us | fsync share |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| sync | 1 | write | 687.070 | 1374.345 | 2879.352 | 6.820 | 1154.815 | 1165.759 | 0.990612 |
+| sync | 1 | mixed | 2228.074 | 216.531 | 1945.638 | 7.257 | 1119.843 | 1131.017 | 0.990120 |
+| sync | 1 | ttl | 1215.932 | 600.650 | 2347.764 | 6.589 | 1109.015 | 1119.335 | 0.990780 |
+| sync | 8 | write | 880.425 | 8714.207 | 16553.763 | 6.177 | 1102.107 | 1112.406 | 0.990957 |
+| sync | 8 | mixed | 2838.914 | 2385.140 | 10951.652 | 9.964 | 1390.477 | 1404.541 | 0.989882 |
+| sync | 8 | ttl | 1096.153 | 5564.772 | 25523.894 | 8.659 | 1719.864 | 1733.624 | 0.992063 |
+| sync | 32 | write | 617.673 | 46229.579 | 90371.772 | 9.238 | 1549.798 | 1567.930 | 0.990576 |
+| sync | 32 | mixed | 2791.755 | 10698.539 | 30171.530 | 12.628 | 1636.018 | 1655.599 | 0.988173 |
+| sync | 32 | ttl | 1105.965 | 27438.059 | 68522.596 | 11.245 | 1702.918 | 1720.882 | 0.989986 |
+| interval | 1 | write | 2290.404 | 393.712 | 721.018 | 4.927 | 6761.900 | — | — |
+| interval | 1 | mixed | 2319.531 | 370.827 | 703.912 | 9.791 | 9340.650 | — | — |
+| interval | 1 | ttl | 2172.389 | 379.212 | 709.066 | 6.452 | 16375.100 | — | — |
+| interval | 8 | write | 3206.664 | 1929.780 | 20616.165 | 4.434 | 18811.700 | — | — |
+| interval | 8 | mixed | 3235.710 | 1955.815 | 17702.712 | 9.173 | 15936.750 | — | — |
+| interval | 8 | ttl | 3370.619 | 1888.606 | 18955.247 | 5.761 | 14968.250 | — | — |
+| interval | 32 | write | 3586.213 | 7381.855 | 35754.491 | 4.208 | 14230.500 | — | — |
+| interval | 32 | mixed | 3735.053 | 7336.000 | 35570.755 | 8.605 | 10952.900 | — | — |
+| interval | 32 | ttl | 3794.925 | 7331.449 | 30518.429 | 5.585 | 11685.750 | — | — |
+
+### R4-A gate evaluation
+
+- **G1 PASS.** The artifact retains the source HEAD, clean-worktree marker,
+  environment, seed, round count, all 18 configurations, and the R3 artifact.
+- **G2 PASS.** For 32-client `SYNC` write, the median
+  `wal_data_fsync_total_us / sync_mutation_total_us` is **0.990576**, above the
+  `0.50` threshold. The median per-round data-fsync mean is 1,549.798 us,
+  compared with 9.238 us for WAL append and 1,567.930 us for the whole `SYNC`
+  persistence path. The median data-fsync count per successful mutation is
+  1.0. Pooled P50/P99 are 46,229.579/90,371.772 us at 617.673 median QPS;
+  recovery median is 0.022041 s and server RSS peak is 4,612 KiB.
+- **G3 NOT TESTED.** The 32-client rows show contention and connection-cap
+  behavior, not evidence that at least eight consecutive records can be formed
+  per fsync window. A separate non-production batch-formation experiment is
+  still required.
+- **G4-G7 NOT STARTED.** No writer, queue, batch, completion, or `BATCHED`
+  mode exists. An implementation-level ADR is required only after G3 passes.
+
+See [ADR-005](decisions/005-group-commit.md) for the candidate boundaries and
+remaining gates.
+
+## R3 reliability benchmark
 
 ### Configuration
 

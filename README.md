@@ -160,6 +160,8 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 - 19 个进程级用例，覆盖 HTTP/KV 持久化、尾部截断、中间损坏、缺失 segment、manifest 损坏、随机 kill、TTL 和 STATS；
 - HTTP、KV、WAL record、manifest 四个固定 seed fuzz target；
 - 多 durability、多客户端、写/混合/TTL 的 5 轮可靠性 benchmark；
+- R4-A v2 baseline：18 配置 × 5 轮、414,688 次成功请求、0 错误；32 客户端
+  `SYNC` write 的 fsync 占持久化耗时中位数 99.06%，G1/G2 达标，G3 尚未验证；
 - R4-A timing 字段、固定 fsync 桶和 v2 benchmark 采集契约；
 - clang-format、clang-tidy 和 `git diff --check`。
 

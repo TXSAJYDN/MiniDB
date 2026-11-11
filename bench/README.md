@@ -10,8 +10,9 @@ MiniDB keeps three complementary benchmark harnesses:
   retained only for reproducibility of the pre-WAL baseline.
 
 None of these harnesses is a saturation, capacity, open-loop, or
-production-SLA test. Only the R3 reliability benchmark supports current
-durability claims; Stage H numbers are historical background.
+production-SLA test. The R3 reliability benchmark supports current durability
+claims; the R4-A v2 baseline supports the diagnostic timing evidence used by
+ADR-005. Stage H numbers are historical background.
 
 ## Reliability benchmark suite
 
@@ -74,6 +75,17 @@ not implement group commit, a writer thread, a queue, batching, or `BATCHED`.
 `max` fields are process-lifetime maxima and include preload/warm-up; mean
 fields use measured-window deltas. Fixed buckets bound cardinality but do not
 provide per-request traces or arbitrary quantiles.
+
+The retained R4-A baseline was collected at clean commit `964ba84`:
+
+- 310,067 bytes, SHA-256 `55bcad4ead05fcba26e44cecf17e71df6ffd7dba17e54a128398c5b65820fe84`;
+- 18 configurations x 5 rounds, 414,688 successful requests, 0 errors,
+  229.087 seconds wall-clock collection time;
+- G1 **PASS**: all configurations and provenance are present;
+- G2 **PASS**: 32-client `SYNC` write fsync share of the `SYNC` persistence path
+  has median **0.990576**, above the `0.50` threshold;
+- G3 **NOT TESTED**: no batch-formation experiment has been run, and no
+  group-commit implementation exists.
 
 Run the v2 baseline from a clean source commit:
 

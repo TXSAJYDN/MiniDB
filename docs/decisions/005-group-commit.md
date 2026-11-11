@@ -1,6 +1,6 @@
 # ADR-005：R4-A 组提交候选设计与证据门槛
 
-- 状态：Proposed — evidence-gated，未实现
+- 状态：Proposed — evidence-gated；G1/G2 PASS，G3 NOT TESTED；未实现
 - 日期：2026-11-11
 - 关联：`docs/MiniDB-可靠性与持久化升级计划书.md`、`docs/architecture.md`、`docs/reliability-evidence.md`
 - 决策范围：R4-A 的设计、观测口径和准入条件；不包含组提交实现
@@ -160,6 +160,24 @@ R4-A 只有在以下条件全部满足后才能进入实现：
 - 若收益或正确性不达标，将本 ADR 标记为 Rejected 或 Deferred，并保留
   negative evidence；
 - 不得以“已经写了线程”作为继续推进的理由。
+
+## 当前证据状态（2026-11-11）
+
+- **G1：PASS。** 保留 v2 artifact
+  `bench/results/reliability-20261111-r4a-baseline.json`，310,067 bytes，SHA-256
+  `55bcad4ead05fcba26e44cecf17e71df6ffd7dba17e54a128398c5b65820fe84`；采集自提交 `964ba84`，工作树 clean；18 个配置各 5 轮，共
+  414,688 次成功请求、0 错误。
+- **G2：PASS。** 32 客户端 write 的
+  `data_fsync_share_of_sync_mutation` 中位数为 **0.990576**，高于 0.50 门槛；
+  `wal_data_fsync_us_mean` 中位数 1,549.798 us，
+  `sync_mutation_us_mean` 中位数 1,567.930 us，
+  `wal_append_us_mean` 中位数 9.238 us；每条成功 `SYNC` mutation 的 data fsync
+  中位数为 1.0。
+- **G3：NOT TESTED。** 基线确认 32 个并发客户端触及连接上限且排队延迟明显，
+  但没有证明一次 fsync 窗口可稳定形成至少 8 条连续待提交记录；仍需要独立的、
+  非生产路径的 batch 形成实验。
+- **G4-G7：NOT APPLICABLE。** 在 G3 满足并另写实现级 ADR 前，不启动 writer、
+  queue、batch 或异步 completion 实现。
 
 ## 明确非目标
 

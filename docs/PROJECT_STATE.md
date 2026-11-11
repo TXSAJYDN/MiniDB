@@ -42,7 +42,7 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 | R1 WAL + RDB checkpoint 正确性基线 | DONE | WAL/manifest 编解码、轮转、恢复、checkpoint、legacy import、单写者锁 |
 | R2 崩溃一致性与恢复模型闭环 | DONE | C01-C14、随机 kill、故障注入、四个 fuzz target、19 个进程用例 |
 | R3 性能、恢复与公开证据 | DONE | 18 配置 × 5 轮 benchmark、恢复/暂停/RSS/写放大数据 |
-| R4-A 组提交候选 | DESIGN + BASELINE INSTRUMENTATION DONE; IMPLEMENTATION NOT STARTED | ADR-005、v2 指标契约、baseline 采集；无 writer/queue/batch |
+| R4-A 组提交候选 | G1/G2 PASS; G3 NOT TESTED; IMPLEMENTATION NOT STARTED | ADR-005、v2 指标契约、clean baseline；无 writer/queue/batch |
 | R4-B 后台/增量 checkpoint | NOT STARTED | 需要独立证据和原子发布语义回归 |
 | R4-C MVCC/事务 | NOT STARTED | 独立阶段，不与 WAL 基线混合 |
 
@@ -139,6 +139,8 @@ R0-R3 与 R4-A baseline instrumentation 的最终本地验证包括：
 - clang-format dry-run、clang-tidy、`git diff --check`；
 - 18 配置 × 5 轮 R3 可靠性 benchmark，seed `20261111`；
 - R4-A 的 `/stats`/`STATS` timing 契约、fsync 桶分区和 v2 可靠性 benchmark；
+- v2 baseline：18 配置 × 5 轮、414,688 次成功请求、0 错误；G1/G2 PASS，
+  G3 NOT TESTED；
 - 远程 CI：R0-R3 基线 `cfbda60` 的 GitHub Actions 9/9 通过；后续最终 HEAD
   状态以 GitHub checks 为准；
 - 本地证据不替代远程 CI，也不构成生产验收。
@@ -146,13 +148,19 @@ R0-R3 与 R4-A baseline instrumentation 的最终本地验证包括：
 正式 benchmark 原始数据：
 
 ~~~text
-bench/results/reliability-20261111.json
+R3: bench/results/reliability-20261111.json
 bytes: 133,299
 sha256: a5c3099789be938654771f830acbd25ecedc1da5520f7c4aa1567493c0e74254
+
+R4-A v2: bench/results/reliability-20261111-r4a-baseline.json
+bytes: 310,067
+sha256: 55bcad4ead05fcba26e44cecf17e71df6ffd7dba17e54a128398c5b65820fe84
+git_head: 964ba8446a71f6c491cd1241e5479632465b9835
+working_tree_dirty_at_collection: false
 ~~~
 
-数据采集自未提交工作树，环境为 WSL2 同机 loopback closed-loop，不是容量或生产
-SLA 证据。汇总：
+以下为历史 R3 artifact 的汇总；R3 数据采集自未提交工作树，环境为 WSL2 同机
+loopback closed-loop，不是容量或生产 SLA 证据。汇总：
 
 | 指标 | SYNC | INTERVAL |
 |---|---:|---:|
@@ -161,7 +169,8 @@ SLA 证据。汇总：
 | checkpoint pause median | 11,571 - 20,852 us | 12,387 - 19,323 us |
 | server RSS peak max | 4,608 KiB | 4,608 KiB |
 
-全部 18 个配置共 340,240 次成功请求、0 错误，采集总耗时 238.703 秒。
+R3 的 18 个配置共 340,240 次成功请求、0 错误，采集总耗时 238.703 秒；R4-A v2
+baseline 的对应数字见上文。
 
 ## 7. 已知限制
 
@@ -195,14 +204,14 @@ SLA 证据。汇总：
 
 ## 9. 后续工作
 
-R4-A 当前停在证据门槛前，不直接实现并发写路径：
+R4-A 的 G1/G2 已通过，当前停在 G3 前，不直接实现并发写路径：
 
-1. 用 v2 baseline 检查 G1-G3：fsync 是否占 `SYNC` 持久化耗时至少 50%，
-   以及 32 客户端下是否能证明存在可用的 batch 形成机会；
-2. 若 G1-G3 不满足，将 ADR-005 标记为 Rejected 或 Deferred，保留 negative
+1. 设计独立的非生产 batch 形成实验，验证一次 fsync 窗口内能否稳定形成至少
+   8 条连续待提交记录；该实验不得把 writer/queue 合并到主线；
+2. 若 G3 不成立，将 ADR-005 标记为 Rejected 或 Deferred，保留 negative
    evidence，不为“高级感”引入 writer/queue；
-3. 若满足，先补实现级 ADR，明确队列/字节/batch 上限、completion 和失败矩阵，
-   再实现组提交并验证 G4-G7；
+3. 若 G3 成立，先补实现级 ADR，明确队列/字节/batch 上限、completion 和失败
+   矩阵，再实现组提交并验证 G4-G7；
 4. 后台/增量 checkpoint 与 MVCC/事务保持独立阶段，不与 R4-A 混合。
 
 任何 R4 工作都必须重新通过 TSan、崩溃矩阵和资源上限验证，不能牺牲当前

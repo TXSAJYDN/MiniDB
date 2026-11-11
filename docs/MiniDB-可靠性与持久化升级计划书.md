@@ -1,6 +1,6 @@
 # MiniDB 可靠性与持久化升级计划书
 
-> 文档状态：`R0-R3 Completed / R4-A Design + Baseline Instrumentation Done / Group Commit Not Started`
+> 文档状态：`R0-R3 Completed / R4-A G1-G2 PASS, G3 Pending / Group Commit Not Started`
 >
 > 编写日期：2026-11-10（Asia/Shanghai）
 >
@@ -10,8 +10,9 @@
 >
 > 最近历史功能验收基线：`9da4b48`（阶段 A-H 技术验收 PASS）
 >
-> 计划性质：R0-R3 已按本文完成实现并通过本地验证；R4-A 已完成 ADR 和诊断指标，
-> 组提交实现仍未开始；其他 R4 路线仅是证据驱动的可选项。
+> 计划性质：R0-R3 已按本文完成实现并通过本地验证；R4-A 已完成 ADR、诊断指标、
+> clean v2 baseline 和 G1/G2 证据判定，G3 尚未验证，组提交实现仍未开始；其他
+> R4 路线仅是证据驱动的可选项。
 >
 > 推进方式：按技术依赖和验收门槛推进，不设置固定总工期或强制周计划。阶段状态、证据链接、已知限制和下一步准入条件随实现同步更新。
 >
@@ -826,12 +827,15 @@ durability/客户端数/负载矩阵，seed 为 `20261111`。原始数据保存�
 
 **实施状态（2026-11-11）：** 已用 [ADR-005](decisions/005-group-commit.md)
 固化候选边界、不可妥协不变量和 G1-G7 证据门槛；已增加成功 append、data
-fsync、`SYNC` 持久化路径计时及固定 fsync 桶，并升级为 v2 baseline
-benchmark。writer thread、队列、completion 和批量 fsync 均尚未实现。
+fsync、`SYNC` 持久化路径计时及固定 fsync 桶，并完成 clean v2 baseline。
+32 客户端 `SYNC` write 的 fsync 占持久化耗时中位数为 99.06%，G1/G2 PASS；
+G3 的 batch 形成机会尚未验证。writer thread、队列、completion 和批量 fsync
+均尚未实现。
 
 - [x] 写 ADR，定义候选边界、失败矩阵和证据门槛；
 - [x] 增加低开销诊断指标和 `/stats`/`STATS` 契约；
-- [x] 只有基线显示 fsync 是主要瓶颈时才进入实现；
+- [x] 采集 clean v2 基线并判定 G1/G2：fsync 占 `SYNC` 持久化耗时 99.06%；
+- [ ] G3：独立非生产实验证明一次 fsync 窗口可形成至少 8 条连续待提交记录；
 - [ ] 专用 WAL writer thread；
 - [ ] 有界队列和 completion；
 - [ ] 一次 fsync 服务多个写；
@@ -979,7 +983,8 @@ R1 开始前的文档决策均已落地：
 7. 保持 `-r <rdb_path>`，sidecar 为 `.manifest`、`.wal/`、`.lock`；
 8. R1 已引入单写者锁以及 HTTP/KV 共享的持久化统计。
 
-R4 不自动启动。只有新的测量证据表明当前瓶颈值得增加复杂度，并满足以下准入条件后才进入设计：
+R4 不自动启动。R4-A 的 v2 基线已判定 G1/G2 PASS，fsync 是 `SYNC` 持久化路径的
+主成本；G3 仍未验证，因此在通过 G3 并另写实现级 ADR 前不进入实现：
 
 - 组提交必须保持 ack 后不丢、全局应用顺序、有界队列和完整 stop/drain；
 - 后台或增量 checkpoint 必须保持 manifest 原子发布语义，不得删除仍被引用的 WAL；
@@ -994,4 +999,4 @@ R4 不自动启动。只有新的测量证据表明当前瓶颈值得增加复�
 |---|---|---|
 | 2026-11-10 | 0.1 | 初稿：完成定位调整、WAL/checkpoint 设计、崩溃测试、性能和 R0-R4 路线规划 |
 | 2026-11-11 | 0.2 | R0-R3 完成实现与本地验收：305 项测试、四个 fuzz target、18 配置可靠性 benchmark；R4 未启动 |
-| 2026-11-11 | 0.3 | R4-A 完成 ADR-005、timing 指标和 v2 baseline 采集契约；组提交实现仍未开始 |
+| 2026-11-11 | 0.3 | R4-A 完成 ADR-005、timing 指标和 clean v2 baseline；G1/G2 PASS，G3 待验证；组提交实现仍未开始 |

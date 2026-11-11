@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AgentStateStore.h"
 #include "DurabilityPolicy.h"
 #include "GroupCommitWriter.h"
 #include "KvStore.h"
@@ -74,6 +75,7 @@ struct MutationAdmission {
 };
 
 using MutationCompletion = std::function<void(MutationOutcome)>;
+using AgentMutationCompletion = std::function<void(AgentResult)>;
 using CheckpointCompletion =
     std::function<void(RdbSaveResult, const std::string&)>;
 
@@ -169,6 +171,7 @@ struct PersistenceSnapshot {
     WalManagerStats wal;
     PersistenceStats persistence;
     TransactionStats transactions;
+    AgentStateStore::Stats agent;
     GroupCommitStats group_commit;
 };
 
@@ -258,6 +261,16 @@ class PersistenceManager {
     MutationAdmission expire_async(std::string key, std::int64_t ttl_ms,
                                    MutationCompletion completion);
 
+    // Agent commands are serialized through the same owner-loop admission
+    // path as ordinary mutations.  Queries are synchronous reads; mutations
+    // return kAccepted and complete later with either the original MDOR
+    // response or a transport/persistence failure.  GC is an internal
+    // fire-and-forget kTxn batch and never creates idempotency records.
+    AgentResult agent_query(const AgentRequest& request);
+    AgentResult agent_mutate_async(const AgentRequest& request,
+                                   AgentMutationCompletion completion);
+    bool agent_gc_async(std::string* error = nullptr);
+
     // INTERVAL timer hooks.  The synchronous form remains available before
     // group commit starts and returns false afterwards; the asynchronous form
     // is serialized through the writer barrier.
@@ -307,15 +320,23 @@ class PersistenceManager {
     enum class PendingMutationKind : std::uint8_t {
         kStandalone,
         kTransaction,
+        kAgent,
+        kAgentGc,
     };
 
     struct PendingMutation {
         std::uint64_t lsn = 0;
         std::uint64_t started_us = 0;
         MutationCompletion completion;
+        AgentMutationCompletion agent_completion;
         PendingMutationKind kind = PendingMutationKind::kStandalone;
         std::uint64_t txn_id = 0;
         std::vector<std::string> keys;
+        std::vector<WalTxnOp> agent_operations;
+        std::string agent_response;
+        std::uint64_t agent_reservation_id = 0;
+        std::size_t agent_gc_candidates = 0;
+        std::size_t agent_gc_keys = 0;
     };
 
     enum class TransactionStateKind : std::uint8_t {
@@ -378,6 +399,12 @@ class PersistenceManager {
     admit_async(WalRecord record, MutationCompletion completion,
                 PendingMutationKind kind = PendingMutationKind::kStandalone,
                 std::uint64_t txn_id = 0);
+    MutationAdmission
+    admit_agent_async(WalRecord record, std::vector<WalTxnOp> operations,
+                      std::string response, std::uint64_t reservation_id,
+                      PendingMutationKind kind,
+                      AgentMutationCompletion completion,
+                      std::size_t gc_candidates = 0, std::size_t gc_keys = 0);
     MutationAdmission admission_fail(MutationAdmissionStatus status,
                                      const std::string& error) const;
     MutationOutcome fail(MutationStatus status, const std::string& error);
@@ -419,6 +446,7 @@ class PersistenceManager {
     void mark_failed();
 
     std::shared_ptr<KvStore> store_;
+    AgentStateStore agent_store_;
     std::string rdb_path_;
     std::string manifest_path_;
     std::string wal_dir_;

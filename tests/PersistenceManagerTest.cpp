@@ -1294,6 +1294,31 @@ std::optional<MutationOutcome> commit_and_wait(PersistenceManager* manager,
     return outcome;
 }
 
+bool parse_agent_request(const std::string& subcommand,
+                         const std::vector<std::string>& args,
+                         AgentRequest* request, std::string* error) {
+    return AgentStateStore::parse_request(subcommand, args, request, error);
+}
+
+std::optional<AgentResult> mutate_agent_and_wait(PersistenceManager* manager,
+                                                 OwnerPump* pump,
+                                                 const AgentRequest& request) {
+    bool done = false;
+    AgentResult result;
+    const AgentResult admission =
+        manager->agent_mutate_async(request, [&](AgentResult completed) {
+            result = std::move(completed);
+            done = true;
+        });
+    EXPECT_EQ(admission.status, AgentRequestStatus::kAccepted)
+        << admission.error;
+    if (admission.status != AgentRequestStatus::kAccepted) {
+        return std::nullopt;
+    }
+    EXPECT_TRUE(pump->RunUntil([&]() { return done; }));
+    return result;
+}
+
 TEST(PersistenceManagerTest,
      TransactionsProvideSnapshotIsolationRepeatableReadAndReadYourWrites) {
     DatabasePaths paths("minidb_transaction_isolation_");
@@ -1735,6 +1760,351 @@ TEST(PersistenceManagerTest,
     EXPECT_EQ(store->get("fails").has_value(), false);
     EXPECT_EQ(manager.set_async("after", "value", {}).status,
               MutationAdmissionStatus::kIoError);
+}
+
+std::string make_agent_session_record(const std::string& state) {
+    AgentRecordCodec::SessionPayload payload;
+    payload.session_expires_at_ms = 1700000600000LL;
+    payload.state = state;
+    std::string encoded_payload;
+    std::string error;
+    EXPECT_TRUE(AgentRecordCodec::encode_session_payload(
+        payload, &encoded_payload, &error))
+        << error;
+    AgentRecordCodec::Record record;
+    record.type = AgentRecordCodec::RecordType::kSession;
+    record.status =
+        static_cast<std::uint8_t>(AgentRecordCodec::SessionStatus::kActive);
+    record.revision = 1;
+    record.created_at_ms = 1700000000000LL;
+    record.updated_at_ms = 1700000000000LL;
+    record.payload = std::move(encoded_payload);
+    std::string encoded_record;
+    EXPECT_TRUE(
+        AgentRecordCodec::encode_record(record, &encoded_record, &error))
+        << error;
+    return encoded_record;
+}
+
+std::string make_agent_tool_record(const std::string& session_id,
+                                   const std::string& tool_id) {
+    AgentRecordCodec::ToolPayload payload;
+    payload.tool_id = tool_id;
+    payload.name = "test-tool";
+    payload.request = "{}";
+    std::string encoded_payload;
+    std::string error;
+    EXPECT_TRUE(AgentRecordCodec::encode_tool_payload(payload, &encoded_payload,
+                                                      &error))
+        << error;
+    AgentRecordCodec::Record record;
+    record.type = AgentRecordCodec::RecordType::kTool;
+    record.status =
+        static_cast<std::uint8_t>(AgentRecordCodec::ToolStatus::kPending);
+    record.revision = 1;
+    record.created_at_ms = 1700000000000LL;
+    record.updated_at_ms = 1700000000000LL;
+    record.payload = std::move(encoded_payload);
+    std::string encoded_record;
+    EXPECT_TRUE(
+        AgentRecordCodec::encode_record(record, &encoded_record, &error))
+        << error;
+    (void)session_id;
+    return encoded_record;
+}
+
+TEST(PersistenceManagerTest,
+     AgentMutationCommitsStateAndIdempotencyInOneTransaction) {
+    DatabasePaths paths("minidb_agent_pm_single_txn_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    AgentRequest request;
+    ASSERT_TRUE(parse_agent_request("SESSION_CREATE",
+                                    {"s1", "60000", "ready", "create-s1"},
+                                    &request, &error))
+        << error;
+    const auto result = mutate_agent_and_wait(&manager, &pump, request);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->status, AgentRequestStatus::kCompleted) << result->error;
+    AgentRecordCodec::Response response;
+    ASSERT_TRUE(AgentRecordCodec::decode_response(result->encoded_response,
+                                                  &response, &error))
+        << error;
+    EXPECT_EQ(response.status, static_cast<std::uint8_t>(
+                                   AgentRecordCodec::ResponseStatus::kCreated));
+    EXPECT_EQ(response.lsn, 1u);
+
+    std::string session_key;
+    std::string idem_key;
+    ASSERT_TRUE(AgentRecordCodec::session_key("s1", &session_key, &error))
+        << error;
+    ASSERT_TRUE(
+        AgentRecordCodec::idempotency_key("create-s1", &idem_key, &error))
+        << error;
+    const std::vector<std::string> keys = {AgentRecordCodec::marker_key(),
+                                           session_key, idem_key};
+    for (const std::string& key : keys) {
+        EXPECT_EQ(store->latest_committed_lsn(key), response.lsn)
+            << "key=" << key;
+        EXPECT_TRUE(store->get(key).has_value()) << "key=" << key;
+    }
+
+    const PersistenceSnapshot snapshot = manager.snapshot();
+    EXPECT_EQ(snapshot.last_lsn, 1u);
+    EXPECT_EQ(snapshot.next_lsn, 2u);
+    EXPECT_EQ(snapshot.agent.sessions_created, 1u);
+    EXPECT_EQ(snapshot.agent.idempotency_stored, 1u);
+}
+
+TEST(PersistenceManagerTest, AgentIdempotencyReplaySurvivesRestartWithoutWAL) {
+    DatabasePaths paths("minidb_agent_pm_restart_replay_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    AgentRequest request;
+    std::string error;
+    ASSERT_TRUE(parse_agent_request("SESSION_CREATE",
+                                    {"s1", "60000", "ready", "create-s1"},
+                                    &request, &error))
+        << error;
+    std::string original_response;
+
+    {
+        auto store = std::make_shared<KvStore>(clock);
+        PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+        ASSERT_TRUE(manager.open(&error)) << error;
+        OwnerPump pump;
+        ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error))
+            << error;
+        const auto result = mutate_agent_and_wait(&manager, &pump, request);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->status, AgentRequestStatus::kCompleted)
+            << result->error;
+        original_response = result->encoded_response;
+
+        bool shutdown_done = false;
+        ASSERT_TRUE(manager.shutdown_async(
+            [&](RdbSaveResult save_result, const std::string& shutdown_error) {
+                EXPECT_EQ(save_result, RdbSaveResult::Ok) << shutdown_error;
+                shutdown_done = true;
+            },
+            &error))
+            << error;
+        ASSERT_TRUE(pump.RunUntil([&]() { return shutdown_done; }));
+    }
+
+    auto recovered = std::make_shared<KvStore>(clock);
+    PersistenceManager restarted(recovered, paths.rdb, DurabilityMode::kSync);
+    ASSERT_TRUE(restarted.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(restarted.start_group_commit(pump.dispatcher(), &error))
+        << error;
+    const PersistenceSnapshot before = restarted.snapshot();
+
+    const auto replay = mutate_agent_and_wait(&restarted, &pump, request);
+    ASSERT_TRUE(replay.has_value());
+    ASSERT_EQ(replay->status, AgentRequestStatus::kCompleted) << replay->error;
+    EXPECT_EQ(replay->encoded_response, original_response);
+
+    const PersistenceSnapshot after = restarted.snapshot();
+    EXPECT_EQ(after.last_lsn, before.last_lsn);
+    EXPECT_EQ(after.next_lsn, before.next_lsn);
+    EXPECT_EQ(after.wal.appends, before.wal.appends);
+    EXPECT_EQ(after.agent.idempotency_replays,
+              before.agent.idempotency_replays + 1u);
+    std::string session_key;
+    ASSERT_TRUE(AgentRecordCodec::session_key("s1", &session_key, &error))
+        << error;
+    EXPECT_EQ(before.last_lsn, 1u);
+    EXPECT_TRUE(recovered->get(session_key).has_value());
+}
+
+TEST(PersistenceManagerTest,
+     AgentPendingKeyConflictReleasesAdmissionAndThenReplays) {
+    DatabasePaths paths("minidb_agent_pm_pending_conflict_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    AgentRequest request;
+    ASSERT_TRUE(parse_agent_request("SESSION_CREATE",
+                                    {"s1", "60000", "ready", "create-s1"},
+                                    &request, &error))
+        << error;
+    bool done = false;
+    AgentResult first;
+    const AgentResult admitted =
+        manager.agent_mutate_async(request, [&](AgentResult result) {
+            first = std::move(result);
+            done = true;
+        });
+    ASSERT_EQ(admitted.status, AgentRequestStatus::kAccepted) << admitted.error;
+
+    const AgentResult conflict = manager.agent_mutate_async(request, {});
+    EXPECT_EQ(conflict.status, AgentRequestStatus::kConflict) << conflict.error;
+
+    ASSERT_TRUE(pump.RunUntil([&]() { return done; }));
+    ASSERT_EQ(first.status, AgentRequestStatus::kCompleted) << first.error;
+    EXPECT_EQ(manager.snapshot().last_lsn, 1u);
+
+    const auto replay = mutate_agent_and_wait(&manager, &pump, request);
+    ASSERT_TRUE(replay.has_value());
+    ASSERT_EQ(replay->status, AgentRequestStatus::kCompleted) << replay->error;
+    AgentRecordCodec::Response response;
+    ASSERT_TRUE(AgentRecordCodec::decode_response(replay->encoded_response,
+                                                  &response, &error))
+        << error;
+    EXPECT_EQ(response.lsn, 1u);
+    EXPECT_EQ(manager.snapshot().last_lsn, 1u);
+    EXPECT_EQ(manager.snapshot().next_lsn, 2u);
+}
+
+TEST(PersistenceManagerTest, ReservedAgentNamespaceIsRejectedOnEveryKvPath) {
+    DatabasePaths paths("minidb_agent_pm_reserved_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+
+    const std::string reserved =
+        std::string(AgentRecordCodec::kReservedPrefix) + "probe";
+    const auto expect_invalid = [](const MutationOutcome& outcome) {
+        EXPECT_EQ(outcome.status, MutationStatus::kInvalidArgument)
+            << outcome.error;
+        EXPECT_NE(outcome.error.find("reserved"), std::string::npos);
+    };
+    expect_invalid(manager.set(reserved, "value"));
+    expect_invalid(manager.del(reserved));
+    expect_invalid(manager.expire(reserved, 1000));
+
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+    const auto expect_admission_invalid =
+        [](const MutationAdmission& admission) {
+            EXPECT_EQ(admission.status,
+                      MutationAdmissionStatus::kInvalidArgument)
+                << admission.error;
+            EXPECT_NE(admission.error.find("reserved"), std::string::npos);
+        };
+    expect_admission_invalid(manager.set_async(reserved, "value", {}));
+    expect_admission_invalid(manager.del_async(reserved, {}));
+    expect_admission_invalid(manager.expire_async(reserved, 1000, {}));
+
+    const auto transaction = manager.begin_transaction();
+    ASSERT_TRUE(transaction.ok()) << transaction.error;
+    const auto expect_txn_invalid =
+        [](const PersistenceManager::TransactionResult& result) {
+            EXPECT_EQ(result.status, MutationStatus::kInvalidArgument)
+                << result.error;
+            EXPECT_NE(result.error.find("reserved"), std::string::npos);
+        };
+    expect_txn_invalid(
+        manager.transaction_set(transaction.txn_id, reserved, "value"));
+    expect_txn_invalid(manager.transaction_get(transaction.txn_id, reserved));
+    expect_txn_invalid(manager.transaction_del(transaction.txn_id, reserved));
+    expect_txn_invalid(
+        manager.transaction_expire(transaction.txn_id, reserved, 1000));
+    expect_txn_invalid(manager.transaction_ttl(transaction.txn_id, reserved));
+    EXPECT_TRUE(manager.rollback_transaction(transaction.txn_id).ok());
+
+    const PersistenceSnapshot snapshot = manager.snapshot();
+    EXPECT_EQ(snapshot.last_lsn, 0u);
+    EXPECT_EQ(snapshot.next_lsn, 1u);
+    EXPECT_FALSE(store->get(reserved).has_value());
+}
+
+TEST(PersistenceManagerTest, AgentStartupFailsClosedOnCorruptNamespace) {
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    std::string error;
+    std::string session_key;
+    ASSERT_TRUE(AgentRecordCodec::session_key("s1", &session_key, &error))
+        << error;
+    std::string tool_key;
+    ASSERT_TRUE(AgentRecordCodec::tool_key("s1", "t1", &tool_key, &error))
+        << error;
+
+    {
+        DatabasePaths paths("minidb_agent_pm_no_marker_");
+        KvStore legacy(clock);
+        legacy.set(session_key, make_agent_session_record("ready"));
+        RdbManager rdb(paths.rdb);
+        ASSERT_EQ(rdb.save_checked(legacy), RdbSaveResult::Ok);
+        auto store = std::make_shared<KvStore>(clock);
+        PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+        ASSERT_FALSE(manager.open(&error));
+        EXPECT_NE(error.find("marker"), std::string::npos) << error;
+        EXPECT_TRUE(manager.failed());
+    }
+
+    {
+        DatabasePaths paths("minidb_agent_pm_orphan_");
+        KvStore legacy(clock);
+        legacy.set(AgentRecordCodec::marker_key(),
+                   AgentRecordCodec::encode_marker());
+        legacy.set(tool_key, make_agent_tool_record("s1", "t1"));
+        RdbManager rdb(paths.rdb);
+        ASSERT_EQ(rdb.save_checked(legacy), RdbSaveResult::Ok);
+        auto store = std::make_shared<KvStore>(clock);
+        PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+        ASSERT_FALSE(manager.open(&error));
+        EXPECT_NE(error.find("orphan"), std::string::npos) << error;
+        EXPECT_TRUE(manager.failed());
+    }
+}
+
+TEST(PersistenceManagerTest, AgentSnapshotStatsComeFromOneCommittedPoint) {
+    DatabasePaths paths("minidb_agent_pm_stats_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    AgentRequest create;
+    ASSERT_TRUE(parse_agent_request("SESSION_CREATE",
+                                    {"s1", "60000", "ready", "create-s1"},
+                                    &create, &error))
+        << error;
+    const auto created = mutate_agent_and_wait(&manager, &pump, create);
+    ASSERT_TRUE(created.has_value());
+    ASSERT_EQ(created->status, AgentRequestStatus::kCompleted)
+        << created->error;
+
+    AgentRequest close;
+    ASSERT_TRUE(parse_agent_request(
+        "SESSION_CLOSE", {"s1", "1", "COMPLETED", "close-s1"}, &close, &error))
+        << error;
+    const auto closed = mutate_agent_and_wait(&manager, &pump, close);
+    ASSERT_TRUE(closed.has_value());
+    ASSERT_EQ(closed->status, AgentRequestStatus::kCompleted) << closed->error;
+
+    const PersistenceSnapshot snapshot = manager.snapshot();
+    EXPECT_EQ(snapshot.last_lsn, 2u);
+    EXPECT_EQ(snapshot.agent.sessions_stored, 1u);
+    EXPECT_EQ(snapshot.agent.sessions_live, 0u);
+    EXPECT_EQ(snapshot.agent.sessions_created, 1u);
+    EXPECT_EQ(snapshot.agent.sessions_completed, 1u);
+    EXPECT_EQ(snapshot.agent.idempotency_stored, 2u);
+    EXPECT_EQ(snapshot.agent.logical_bytes_max,
+              AgentRecordCodec::Limits::kMaxLogicalBytes);
+    EXPECT_GE(snapshot.agent.gc_total_us, snapshot.agent.gc_max_us);
 }
 
 } // namespace

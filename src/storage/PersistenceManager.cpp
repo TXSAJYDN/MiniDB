@@ -108,6 +108,55 @@ void maybe_pause_after_checkpoint_rdb_publish() {
 const char* mutation_io_error = "persistence I/O failure";
 const char* group_commit_active_error =
     "group commit is active; use the asynchronous persistence API";
+const char* reserved_agent_key_error = "key is in the reserved agent namespace";
+
+bool is_reserved_agent_key(const std::string& key) noexcept {
+    return AgentRecordCodec::is_reserved_key(key);
+}
+
+AgentRequestStatus
+agent_status_from_mutation_status(MutationStatus status) noexcept {
+    switch (status) {
+    case MutationStatus::kOk:
+        return AgentRequestStatus::kCompleted;
+    case MutationStatus::kInvalidArgument:
+        return AgentRequestStatus::kInvalidArgument;
+    case MutationStatus::kIoError:
+        return AgentRequestStatus::kIoError;
+    case MutationStatus::kResourceLimit:
+        return AgentRequestStatus::kResourceLimit;
+    case MutationStatus::kNotReady:
+        return AgentRequestStatus::kNotReady;
+    case MutationStatus::kNoTransaction:
+        return AgentRequestStatus::kInvalidArgument;
+    case MutationStatus::kConflict:
+        return AgentRequestStatus::kConflict;
+    }
+    return AgentRequestStatus::kIoError;
+}
+
+AgentRequestStatus
+agent_status_from_admission_status(MutationAdmissionStatus status) noexcept {
+    switch (status) {
+    case MutationAdmissionStatus::kAccepted:
+        return AgentRequestStatus::kAccepted;
+    case MutationAdmissionStatus::kInvalidArgument:
+        return AgentRequestStatus::kInvalidArgument;
+    case MutationAdmissionStatus::kIoError:
+        return AgentRequestStatus::kIoError;
+    case MutationAdmissionStatus::kResourceLimit:
+        return AgentRequestStatus::kResourceLimit;
+    case MutationAdmissionStatus::kNotReady:
+        return AgentRequestStatus::kNotReady;
+    case MutationAdmissionStatus::kShuttingDown:
+        return AgentRequestStatus::kShuttingDown;
+    case MutationAdmissionStatus::kNoTransaction:
+        return AgentRequestStatus::kInvalidArgument;
+    case MutationAdmissionStatus::kConflict:
+        return AgentRequestStatus::kConflict;
+    }
+    return AgentRequestStatus::kIoError;
+}
 constexpr std::size_t kMaxActiveTransactions = 64;
 constexpr std::size_t kMaxTransactionWriteKeys = WalFormat::MAX_TXN_OPS;
 
@@ -228,7 +277,9 @@ PersistenceManager::PersistenceManager(
     std::shared_ptr<KvStore> store, std::string rdb_path, DurabilityMode mode,
     std::shared_ptr<WalFileOperations> wal_operations,
     std::shared_ptr<RdbFileOperations> rdb_operations, WalLimits limits)
-    : store_(std::move(store)), rdb_path_(std::move(rdb_path)),
+    : store_(std::move(store)),
+      agent_store_(store_ ? store_->clock() : nullptr),
+      rdb_path_(std::move(rdb_path)),
       manifest_path_(checkpoint_manifest_path(rdb_path_)),
       wal_dir_(wal_directory_path(rdb_path_)), durability_mode_(mode),
       wal_operations_(std::move(wal_operations)),
@@ -314,6 +365,16 @@ bool PersistenceManager::open(std::string* error) {
         }
     }
 
+    std::string agent_rebuild_error;
+    if (!agent_store_.rebuild(store_->export_all(), &agent_rebuild_error)) {
+        if (error != nullptr) {
+            *error =
+                "startup agent state validation failed: " + agent_rebuild_error;
+        }
+        failed_ = true;
+        return false;
+    }
+
     opened_ = true;
     return true;
 }
@@ -330,6 +391,9 @@ MutationOutcome PersistenceManager::set(const std::string& key,
     }
     if (key.empty() || key.size() > RdbFormat::MAX_KEY_SIZE) {
         return fail(MutationStatus::kInvalidArgument, "invalid key length");
+    }
+    if (is_reserved_agent_key(key)) {
+        return fail(MutationStatus::kInvalidArgument, reserved_agent_key_error);
     }
     if (value.size() > WalFormat::MAX_VALUE_SIZE) {
         return fail(MutationStatus::kResourceLimit, "value exceeds WAL limit");
@@ -357,6 +421,9 @@ MutationOutcome PersistenceManager::del(const std::string& key) {
     if (key.empty() || key.size() > RdbFormat::MAX_KEY_SIZE) {
         return fail(MutationStatus::kInvalidArgument, "invalid key length");
     }
+    if (is_reserved_agent_key(key)) {
+        return fail(MutationStatus::kInvalidArgument, reserved_agent_key_error);
+    }
     const bool measure_sync = durability_mode_ == DurabilityMode::kSync;
     const std::uint64_t started_us = measure_sync ? steady_now_us() : 0;
     MutationOutcome outcome = del_impl(key);
@@ -380,6 +447,9 @@ MutationOutcome PersistenceManager::expire(const std::string& key,
     }
     if (key.empty() || key.size() > RdbFormat::MAX_KEY_SIZE) {
         return fail(MutationStatus::kInvalidArgument, "invalid key length");
+    }
+    if (is_reserved_agent_key(key)) {
+        return fail(MutationStatus::kInvalidArgument, reserved_agent_key_error);
     }
     const bool measure_sync = durability_mode_ == DurabilityMode::kSync;
     const std::uint64_t started_us = measure_sync ? steady_now_us() : 0;
@@ -633,6 +703,10 @@ PersistenceManager::TransactionResult PersistenceManager::transaction_set(
         return transaction_fail(MutationStatus::kInvalidArgument,
                                 "invalid key length");
     }
+    if (is_reserved_agent_key(key)) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                reserved_agent_key_error);
+    }
     if (value.size() > WalFormat::MAX_VALUE_SIZE) {
         return transaction_fail(MutationStatus::kResourceLimit,
                                 "transaction value exceeds the size limit");
@@ -683,6 +757,10 @@ PersistenceManager::transaction_get(std::uint64_t txn_id,
         return transaction_fail(MutationStatus::kInvalidArgument,
                                 "invalid key length");
     }
+    if (is_reserved_agent_key(key)) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                reserved_agent_key_error);
+    }
 
     const auto it = transaction->writes.find(key);
     if (it != transaction->writes.end()) {
@@ -722,6 +800,10 @@ PersistenceManager::transaction_del(std::uint64_t txn_id,
     if (key.empty() || key.size() > WalFormat::MAX_KEY_SIZE) {
         return transaction_fail(MutationStatus::kInvalidArgument,
                                 "invalid key length");
+    }
+    if (is_reserved_agent_key(key)) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                reserved_agent_key_error);
     }
 
     const auto it = transaction->writes.find(key);
@@ -785,6 +867,10 @@ PersistenceManager::TransactionResult PersistenceManager::transaction_expire(
     if (key.empty() || key.size() > WalFormat::MAX_KEY_SIZE) {
         return transaction_fail(MutationStatus::kInvalidArgument,
                                 "invalid key length");
+    }
+    if (is_reserved_agent_key(key)) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                reserved_agent_key_error);
     }
 
     const auto it = transaction->writes.find(key);
@@ -851,6 +937,10 @@ PersistenceManager::transaction_ttl(std::uint64_t txn_id,
         return transaction_fail(MutationStatus::kInvalidArgument,
                                 "invalid key length");
     }
+    if (is_reserved_agent_key(key)) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                reserved_agent_key_error);
+    }
 
     TransactionResult result;
     result.status = MutationStatus::kOk;
@@ -913,6 +1003,15 @@ PersistenceManager::commit_transaction_async(std::uint64_t txn_id,
     }
 
     const std::uint64_t commit_started_us = steady_now_us();
+    for (const auto& [key, write] : transaction->writes) {
+        (void)write;
+        if (is_reserved_agent_key(key)) {
+            abort_transaction_locked(txn_id, MutationStatus::kInvalidArgument,
+                                     reserved_agent_key_error);
+            return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                                  reserved_agent_key_error);
+        }
+    }
     if (transaction->writes.empty()) {
         ++transaction_stats_.committed;
         finish_transaction_locked(txn_id);
@@ -1372,6 +1471,10 @@ MutationAdmission PersistenceManager::set_async(const std::string& key,
         return admission_fail(MutationAdmissionStatus::kInvalidArgument,
                               "invalid key length");
     }
+    if (is_reserved_agent_key(key)) {
+        return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                              reserved_agent_key_error);
+    }
     if (value.size() > WalFormat::MAX_VALUE_SIZE) {
         return admission_fail(MutationAdmissionStatus::kResourceLimit,
                               "value exceeds WAL limit");
@@ -1417,6 +1520,10 @@ MutationAdmission PersistenceManager::del_async(std::string key,
         return admission_fail(MutationAdmissionStatus::kInvalidArgument,
                               "invalid key length");
     }
+    if (is_reserved_agent_key(key)) {
+        return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                              reserved_agent_key_error);
+    }
 
     std::string writer_error;
     if (!ensure_group_commit_writer_locked(&writer_error)) {
@@ -1458,6 +1565,10 @@ PersistenceManager::expire_async(std::string key, std::int64_t ttl_ms,
         return admission_fail(MutationAdmissionStatus::kInvalidArgument,
                               "invalid key length");
     }
+    if (is_reserved_agent_key(key)) {
+        return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                              reserved_agent_key_error);
+    }
 
     std::string writer_error;
     if (!ensure_group_commit_writer_locked(&writer_error)) {
@@ -1477,6 +1588,333 @@ PersistenceManager::expire_async(std::string key, std::int64_t ttl_ms,
             add_ttl_saturated(store_->wall_clock_now_ms(), ttl_ms);
     }
     return admit_async(std::move(record), std::move(completion));
+}
+
+AgentResult PersistenceManager::agent_query(const AgentRequest& request) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    AgentResult result;
+    if (!opened_) {
+        result.status = AgentRequestStatus::kNotReady;
+        result.error = "persistence is not open";
+        return result;
+    }
+    if (failed_) {
+        result.status = AgentRequestStatus::kIoError;
+        result.error = mutation_io_error;
+        return result;
+    }
+    if (AgentStateStore::is_mutation(request.command)) {
+        result.status = AgentRequestStatus::kInvalidArgument;
+        result.error = "command is not an Agent query";
+        return result;
+    }
+
+    AgentRecordCodec::Response response;
+    std::string query_error;
+    if (!agent_store_.prepare_query(request, *store_, &response,
+                                    &query_error)) {
+        mark_failed();
+        result.status = AgentRequestStatus::kIoError;
+        result.error = query_error.empty() ? "Agent query failed" : query_error;
+        return result;
+    }
+    if (!AgentRecordCodec::encode_response(response, &result.encoded_response,
+                                           &query_error)) {
+        mark_failed();
+        result.status = AgentRequestStatus::kIoError;
+        result.error = query_error.empty() ? "Agent response encoding failed"
+                                           : query_error;
+        return result;
+    }
+    result.status = AgentRequestStatus::kCompleted;
+    return result;
+}
+
+AgentResult
+PersistenceManager::agent_mutate_async(const AgentRequest& request,
+                                       AgentMutationCompletion completion) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    AgentResult result;
+    if (!opened_ || failed_) {
+        result.status = failed_ ? AgentRequestStatus::kIoError
+                                : AgentRequestStatus::kNotReady;
+        result.error = failed_ ? mutation_io_error : "persistence is not open";
+        return result;
+    }
+    if (!group_commit_started_) {
+        result.status = AgentRequestStatus::kNotReady;
+        result.error = "group commit writer is not started";
+        return result;
+    }
+    if (shutdown_requested_ || shutdown_complete_) {
+        result.status = AgentRequestStatus::kShuttingDown;
+        result.error = "persistence is shutting down";
+        return result;
+    }
+    if (!accepting_mutations_) {
+        result.status = AgentRequestStatus::kNotReady;
+        result.error = "persistence admission is paused";
+        return result;
+    }
+    if (!AgentStateStore::is_mutation(request.command)) {
+        result.status = AgentRequestStatus::kInvalidArgument;
+        result.error = "command is not an Agent mutation";
+        return result;
+    }
+
+    std::string writer_error;
+    if (!ensure_group_commit_writer_locked(&writer_error)) {
+        result.status = failed_ ? AgentRequestStatus::kIoError
+                                : AgentRequestStatus::kNotReady;
+        result.error =
+            writer_error.empty() ? "group commit is not ready" : writer_error;
+        return result;
+    }
+
+    AgentStateStore::MutationPlan plan;
+    std::string prepare_error;
+    const std::uint64_t assigned_lsn = group_commit_writer_->next_lsn();
+    if (!agent_store_.prepare_mutation(request, *store_, assigned_lsn, &plan,
+                                       &prepare_error)) {
+        result.status = AgentRequestStatus::kInvalidArgument;
+        result.error =
+            prepare_error.empty() ? "invalid Agent mutation" : prepare_error;
+        return result;
+    }
+
+    if (plan.disposition ==
+        AgentStateStore::MutationPlanDisposition::kImmediate) {
+        result.status = AgentRequestStatus::kAccepted;
+        if (completion) {
+            AgentResult immediate;
+            immediate.status = AgentRequestStatus::kCompleted;
+            immediate.encoded_response = std::move(plan.encoded_response);
+            dispatch_owner([completion = std::move(completion),
+                            immediate = std::move(immediate)]() mutable {
+                completion(std::move(immediate));
+            });
+        }
+        return result;
+    }
+
+    if (plan.operations.empty() || plan.reservation_id == 0) {
+        agent_store_.cancel_reservation(plan.reservation_id);
+        result.status = AgentRequestStatus::kResourceLimit;
+        result.error = "Agent mutation plan is invalid";
+        return result;
+    }
+
+    std::string payload_error;
+    const std::vector<std::uint8_t> payload =
+        WalFormat::encode_transaction(plan.operations, &payload_error);
+    if (payload.empty()) {
+        agent_store_.cancel_reservation(plan.reservation_id);
+        result.status = AgentRequestStatus::kResourceLimit;
+        result.error = payload_error.empty() ? "Agent transaction is invalid"
+                                             : payload_error;
+        return result;
+    }
+
+    WalRecord record;
+    record.lsn = assigned_lsn;
+    record.op = WalOp::kTxn;
+    record.key = "txn";
+    record.value.assign(reinterpret_cast<const char*>(payload.data()),
+                        payload.size());
+
+    const MutationAdmission admission =
+        admit_agent_async(std::move(record), std::move(plan.operations),
+                          std::move(plan.encoded_response), plan.reservation_id,
+                          PendingMutationKind::kAgent, std::move(completion));
+    result.status = agent_status_from_admission_status(admission.status);
+    result.error = admission.error;
+    return result;
+}
+
+bool PersistenceManager::agent_gc_async(std::string* error) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    if (!opened_ || failed_) {
+        if (error != nullptr) {
+            *error = failed_ ? mutation_io_error : "persistence is not open";
+        }
+        return false;
+    }
+    if (!group_commit_started_) {
+        if (error != nullptr) {
+            *error = "group commit writer is not started";
+        }
+        return false;
+    }
+    if (shutdown_requested_ || shutdown_complete_ || !accepting_mutations_) {
+        return true;
+    }
+
+    std::string writer_error;
+    if (!ensure_group_commit_writer_locked(&writer_error)) {
+        if (error != nullptr) {
+            *error = writer_error.empty() ? "group commit is not ready"
+                                          : writer_error;
+        }
+        return !failed_;
+    }
+
+    const std::vector<AgentStateStore::GcCandidate> candidates =
+        agent_store_.collect_gc_candidates();
+    std::vector<std::string> selected_keys;
+    std::size_t selected_candidates = 0;
+    for (const AgentStateStore::GcCandidate& candidate : candidates) {
+        bool pending = false;
+        for (const std::string& key : candidate.keys) {
+            if (pending_key_lsn_locked(key) != 0) {
+                pending = true;
+                break;
+            }
+        }
+        if (pending || selected_keys.size() + candidate.keys.size() >
+                           WalFormat::MAX_TXN_OPS) {
+            continue;
+        }
+        if (selected_candidates >= AgentRecordCodec::Limits::kMaxGcCandidates) {
+            break;
+        }
+        selected_keys.insert(selected_keys.end(), candidate.keys.begin(),
+                             candidate.keys.end());
+        ++selected_candidates;
+    }
+
+    if (selected_keys.empty()) {
+        return true;
+    }
+
+    std::vector<WalTxnOp> operations;
+    operations.reserve(selected_keys.size());
+    for (const std::string& key : selected_keys) {
+        WalTxnOp operation;
+        operation.op = WalOp::kDel;
+        operation.key = key;
+        operations.push_back(std::move(operation));
+    }
+
+    std::string payload_error;
+    const std::vector<std::uint8_t> payload =
+        WalFormat::encode_transaction(operations, &payload_error);
+    if (payload.empty()) {
+        agent_store_.note_gc_failure();
+        if (error != nullptr) {
+            *error = payload_error.empty() ? "Agent GC transaction is invalid"
+                                           : payload_error;
+        }
+        return true;
+    }
+
+    WalRecord record;
+    record.lsn = group_commit_writer_->next_lsn();
+    record.op = WalOp::kTxn;
+    record.key = "txn";
+    record.value.assign(reinterpret_cast<const char*>(payload.data()),
+                        payload.size());
+
+    const MutationAdmission admission =
+        admit_agent_async(std::move(record), std::move(operations), {}, 0,
+                          PendingMutationKind::kAgentGc, {},
+                          selected_candidates, selected_keys.size());
+    if (admission.accepted()) {
+        return true;
+    }
+
+    agent_store_.note_gc_failure();
+    if (error != nullptr) {
+        *error = admission.error.empty() ? "Agent GC admission failed"
+                                         : admission.error;
+    }
+    if (admission.status == MutationAdmissionStatus::kIoError ||
+        admission.status == MutationAdmissionStatus::kShuttingDown) {
+        return false;
+    }
+    return true;
+}
+
+MutationAdmission PersistenceManager::admit_agent_async(
+    WalRecord record, std::vector<WalTxnOp> operations, std::string response,
+    std::uint64_t reservation_id, PendingMutationKind kind,
+    AgentMutationCompletion completion, std::size_t gc_candidates,
+    std::size_t gc_keys) {
+    if (kind != PendingMutationKind::kAgent &&
+        kind != PendingMutationKind::kAgentGc) {
+        agent_store_.cancel_reservation(reservation_id);
+        return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                              "invalid Agent pending mutation kind");
+    }
+    if ((kind == PendingMutationKind::kAgent && reservation_id == 0) ||
+        (kind == PendingMutationKind::kAgentGc && reservation_id != 0) ||
+        (kind == PendingMutationKind::kAgent && response.empty()) ||
+        operations.empty()) {
+        agent_store_.cancel_reservation(reservation_id);
+        return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                              "invalid Agent admission metadata");
+    }
+
+    PendingMutation pending;
+    pending.lsn = record.lsn;
+    pending.started_us = steady_now_us();
+    pending.agent_completion = std::move(completion);
+    pending.kind = kind;
+    pending.keys.reserve(operations.size());
+    for (const WalTxnOp& operation : operations) {
+        pending.keys.push_back(operation.key);
+    }
+    std::sort(pending.keys.begin(), pending.keys.end());
+    if (std::adjacent_find(pending.keys.begin(), pending.keys.end()) !=
+        pending.keys.end()) {
+        agent_store_.cancel_reservation(reservation_id);
+        return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                              "Agent transaction contains duplicate keys");
+    }
+    pending.agent_operations = std::move(operations);
+    pending.agent_response = std::move(response);
+    pending.agent_reservation_id = reservation_id;
+    pending.agent_gc_candidates = gc_candidates;
+    pending.agent_gc_keys = gc_keys;
+
+    for (const std::string& key : pending.keys) {
+        if (pending_key_lsn_locked(key) != 0) {
+            agent_store_.cancel_reservation(reservation_id);
+            return admission_fail(MutationAdmissionStatus::kConflict,
+                                  "Agent key has a pending mutation");
+        }
+    }
+
+    for (const std::string& key : pending.keys) {
+        add_pending_key_lsn_locked(key, record.lsn);
+    }
+    pending_mutations_.push_back(std::move(pending));
+
+    GroupCommitEntry entry;
+    entry.record = std::move(record);
+    entry.submitted_us = steady_now_us();
+    std::string submit_error;
+    if (!group_commit_writer_->submit(std::move(entry), &submit_error)) {
+        const PendingMutation& rejected = pending_mutations_.back();
+        remove_pending_keys_locked(rejected.keys, rejected.lsn);
+        agent_store_.cancel_reservation(rejected.agent_reservation_id);
+        pending_mutations_.pop_back();
+
+        MutationAdmissionStatus status = MutationAdmissionStatus::kNotReady;
+        const GroupCommitWriterState state = group_commit_writer_->state();
+        if (state == GroupCommitWriterState::kFailed) {
+            status = MutationAdmissionStatus::kIoError;
+        } else if (state == GroupCommitWriterState::kStopped ||
+                   state == GroupCommitWriterState::kDraining) {
+            status = MutationAdmissionStatus::kShuttingDown;
+        } else if (submit_error.find("full") != std::string::npos) {
+            status = MutationAdmissionStatus::kResourceLimit;
+        }
+        return admission_fail(status, submit_error);
+    }
+
+    MutationAdmission admission;
+    admission.status = MutationAdmissionStatus::kAccepted;
+    return admission;
 }
 
 MutationAdmission PersistenceManager::admit_async(WalRecord record,
@@ -2398,7 +2836,9 @@ void PersistenceManager::on_group_commit_completion(
     if (completion.kind == GroupCommitCompletion::Kind::kRecords) {
         struct CompletionCall {
             MutationCompletion completion;
+            AgentMutationCompletion agent_completion;
             MutationOutcome outcome;
+            AgentResult agent_outcome;
         };
         std::vector<CompletionCall> callbacks;
         callbacks.reserve(completion.records.size());
@@ -2414,11 +2854,20 @@ void PersistenceManager::on_group_commit_completion(
                 pending_mutations_.pop_front();
                 remove_pending_keys_locked(pending.keys, pending.lsn);
 
-                MutationOutcome outcome;
-                bool applied = false;
-                bool transaction_finished = false;
                 const bool is_transaction =
                     pending.kind == PendingMutationKind::kTransaction;
+                const bool is_agent =
+                    pending.kind == PendingMutationKind::kAgent;
+                const bool is_agent_gc =
+                    pending.kind == PendingMutationKind::kAgentGc;
+                const bool has_agent_state = is_agent || is_agent_gc;
+                bool transaction_finished = false;
+                bool agent_state_applied = !has_agent_state;
+                bool gc_failure_recorded = false;
+                MutationOutcome outcome;
+                AgentResult agent_outcome;
+                agent_outcome.status = AgentRequestStatus::kIoError;
+
                 const auto finish_pending_transaction = [&]() {
                     if (!is_transaction || transaction_finished) {
                         return;
@@ -2428,24 +2877,46 @@ void PersistenceManager::on_group_commit_completion(
                     }
                     transaction_finished = true;
                 };
+                const auto note_agent_failure = [&](AgentRequestStatus status,
+                                                    const std::string& error) {
+                    if (has_agent_state && !agent_state_applied) {
+                        agent_store_.cancel_reservation(
+                            pending.agent_reservation_id);
+                        if (is_agent_gc && !gc_failure_recorded) {
+                            agent_store_.note_gc_failure();
+                            gc_failure_recorded = true;
+                        }
+                    }
+                    if (is_agent) {
+                        agent_outcome.status = status;
+                        agent_outcome.error = error;
+                    }
+                };
+                const auto persist_failure = [&](MutationStatus status,
+                                                 const std::string& error) {
+                    outcome.status = status;
+                    outcome.error = error;
+                    note_agent_failure(
+                        agent_status_from_mutation_status(status), error);
+                };
 
                 if (pending.lsn != result.record.lsn) {
                     mark_failed();
-                    outcome.status = MutationStatus::kIoError;
-                    outcome.error = "group commit completion LSN mismatch";
+                    persist_failure(MutationStatus::kIoError,
+                                    "group commit completion LSN mismatch");
                 } else if (!result.ok() || !result.written) {
                     mark_failed();
-                    outcome.status = mutation_status_from_wal(result.status);
-                    outcome.error = result.error.empty()
+                    persist_failure(mutation_status_from_wal(result.status),
+                                    result.error.empty()
                                         ? "group commit WAL operation failed"
-                                        : result.error;
+                                        : result.error);
                 } else if (failed_) {
-                    outcome.status = MutationStatus::kIoError;
-                    outcome.error = mutation_io_error;
+                    persist_failure(MutationStatus::kIoError,
+                                    mutation_io_error);
                 } else if (result.record.lsn != last_lsn_ + 1) {
                     mark_failed();
-                    outcome.status = MutationStatus::kIoError;
-                    outcome.error = "group commit apply LSN is not contiguous";
+                    persist_failure(MutationStatus::kIoError,
+                                    "group commit apply LSN is not contiguous");
                 } else {
                     bool changed = false;
                     std::string apply_error;
@@ -2460,8 +2931,8 @@ void PersistenceManager::on_group_commit_completion(
                             // durable WAL is inconsistent with the in-memory
                             // admission path, so fail closed.
                             mark_failed();
-                            outcome.status = MutationStatus::kInvalidArgument;
-                            outcome.error = decode_error;
+                            persist_failure(MutationStatus::kInvalidArgument,
+                                            decode_error);
                         } else {
                             for (const KvStore::AppliedMutation& mutation :
                                  mutations) {
@@ -2473,12 +2944,12 @@ void PersistenceManager::on_group_commit_completion(
                                     result.record.lsn, mutations, &apply_error);
                             if (apply_status != KvStore::ApplyStatus::kOk) {
                                 mark_failed();
-                                outcome.status =
+                                persist_failure(
                                     apply_status ==
                                             KvStore::ApplyStatus::kResourceLimit
                                         ? MutationStatus::kResourceLimit
-                                        : MutationStatus::kIoError;
-                                outcome.error = apply_error;
+                                        : MutationStatus::kIoError,
+                                    apply_error);
                             } else {
                                 apply_succeeded = true;
                                 last_lsn_ = result.record.lsn;
@@ -2488,16 +2959,47 @@ void PersistenceManager::on_group_commit_completion(
                         }
                     } catch (const std::exception& ex) {
                         mark_failed();
-                        outcome.status = MutationStatus::kIoError;
-                        outcome.error =
-                            std::string("store apply failed: ") + ex.what();
+                        persist_failure(MutationStatus::kIoError,
+                                        std::string("store apply failed: ") +
+                                            ex.what());
                     } catch (...) {
                         mark_failed();
-                        outcome.status = MutationStatus::kIoError;
-                        outcome.error = "store apply failed";
+                        persist_failure(MutationStatus::kIoError,
+                                        "store apply failed");
                     }
 
-                    if (apply_succeeded) {
+                    if (apply_succeeded && has_agent_state) {
+                        std::string agent_error;
+                        if (!agent_store_.apply_committed(
+                                pending.agent_operations, result.record.lsn,
+                                pending.agent_reservation_id, &agent_error)) {
+                            mark_failed();
+                            persist_failure(MutationStatus::kIoError,
+                                            agent_error.empty()
+                                                ? "Agent state apply failed"
+                                                : agent_error);
+                        } else {
+                            agent_state_applied = true;
+                            if (is_agent) {
+                                agent_outcome.status =
+                                    AgentRequestStatus::kCompleted;
+                                agent_outcome.encoded_response =
+                                    pending.agent_response;
+                                agent_outcome.error.clear();
+                            } else {
+                                std::uint64_t elapsed_us = 0;
+                                const std::uint64_t now_us = steady_now_us();
+                                if (now_us >= pending.started_us) {
+                                    elapsed_us = now_us - pending.started_us;
+                                }
+                                agent_store_.note_gc_success(
+                                    pending.agent_gc_candidates,
+                                    pending.agent_gc_keys, elapsed_us);
+                            }
+                        }
+                    }
+
+                    if (apply_succeeded && agent_state_applied) {
                         // A committing transaction has already built its WAL
                         // record and can no longer read its snapshot.  Release
                         // it before GC so the new commit is not artificially
@@ -2511,6 +3013,12 @@ void PersistenceManager::on_group_commit_completion(
                             outcome.error = gc_error.empty()
                                                 ? "version GC failed"
                                                 : gc_error;
+                            if (is_agent) {
+                                agent_outcome.status =
+                                    AgentRequestStatus::kIoError;
+                                agent_outcome.error = outcome.error;
+                                agent_outcome.encoded_response.clear();
+                            }
                         } else {
                             if (after_apply_callback_) {
                                 after_apply_callback_(result.record);
@@ -2528,9 +3036,10 @@ void PersistenceManager::on_group_commit_completion(
                             } else {
                                 ++stats_.interval_mutations;
                             }
+                            outcome.status = MutationStatus::kOk;
                             outcome.changed = changed;
                             outcome.lsn = result.record.lsn;
-                            applied = true;
+                            outcome.error.clear();
 
                             if (is_transaction) {
                                 ++transaction_stats_.committed;
@@ -2550,17 +3059,34 @@ void PersistenceManager::on_group_commit_completion(
                 }
 
                 finish_pending_transaction();
-                if (!applied && is_transaction) {
+                if (outcome.status != MutationStatus::kOk && is_transaction) {
                     ++transaction_stats_.failed;
                 }
                 observe_transaction_metrics_locked();
 
-                callbacks.push_back(
-                    {std::move(pending.completion), std::move(outcome)});
+                CompletionCall call;
+                call.completion = std::move(pending.completion);
+                call.agent_completion = std::move(pending.agent_completion);
+                call.outcome = std::move(outcome);
+                call.agent_outcome = std::move(agent_outcome);
+                callbacks.push_back(std::move(call));
             }
         }
 
         for (CompletionCall& call : callbacks) {
+            if (call.agent_completion) {
+                try {
+                    call.agent_completion(std::move(call.agent_outcome));
+                } catch (const std::exception& ex) {
+                    Log::Error(
+                        std::string("Agent mutation completion threw: ") +
+                        ex.what());
+                } catch (...) {
+                    Log::Error(
+                        "Agent mutation completion threw an unknown exception");
+                }
+                continue;
+            }
             if (!call.completion) {
                 continue;
             }
@@ -2769,6 +3295,7 @@ PersistenceSnapshot PersistenceManager::snapshot() const {
     result.recovery = recovery_stats_;
     result.persistence = stats_;
     result.transactions = transaction_stats_;
+    result.agent = agent_store_.stats();
     if (group_commit_writer_) {
         const GroupCommitWalSnapshot wal_snapshot =
             group_commit_writer_->wal_snapshot();

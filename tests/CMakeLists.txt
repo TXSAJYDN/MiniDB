@@ -27,6 +27,7 @@ minidb_discover_tests(base_test)
 
 add_executable(storage_test
     AgentRecordCodecTest.cpp
+    AgentStateStoreTest.cpp
     KvStoreTtlTest.cpp
     KvStoreTtlStressTest.cpp
     KvStoreMvccTest.cpp

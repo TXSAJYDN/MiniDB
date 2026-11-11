@@ -1,5 +1,6 @@
 add_library(minidb_storage
     AgentRecordCodec.cpp
+    AgentStateStore.cpp
     KvStore.cpp
     RdbFormat.cpp
     RdbManager.cpp

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -16,15 +17,31 @@ namespace minidb {
 
 // A thread-safe key/value store with lazy and periodic TTL expiry.
 //
+// Committed values are kept in per-key version chains ordered by commit LSN.
+// Snapshot reads select the newest version whose commit_lsn is not greater
+// than the caller-provided snapshot.  The legacy set/get/del/expire helpers
+// synthesize commit LSNs so in-memory users and tests share the same version
+// representation as persistent/WAL-backed operation.
+//
 // Time semantics:
-//   * deadline_ is maintained on the monotonic clock, so wall-clock jumps
-//     cannot make a key expire early or late while the process is running.
-//   * Entry::expiry_ms is an absolute Unix epoch millisecond timestamp. It is
-//     used only at the RDB boundary; never persist a relative TTL as a
-//     deadline.
+//   * a version stores a monotonic deadline, so wall-clock jumps cannot make a
+//     key expire early or late while the process is running;
+//   * Entry::expiry_ms is an absolute Unix epoch millisecond timestamp used
+//     only at the RDB boundary;
+//   * reads select a version first and then apply TTL expiry.  Expiry never
+//     falls back to an older version.
 class KvStore {
   public:
+    static constexpr std::size_t MAX_KEY_SIZE = 1024;
+    static constexpr std::size_t MAX_VALUE_SIZE = std::size_t{1024} * 1024;
+    static constexpr std::size_t DEFAULT_MAX_VERSIONS = 1000000;
+
+    struct Limits {
+        std::size_t max_versions = DEFAULT_MAX_VERSIONS;
+    };
+
     explicit KvStore(std::shared_ptr<ClockInterface> clock = nullptr);
+    KvStore(std::shared_ptr<ClockInterface> clock, Limits limits);
     ~KvStore();
 
     KvStore(const KvStore&) = delete;
@@ -33,7 +50,8 @@ class KvStore {
     // SET replaces the value and clears any existing TTL.
     void set(const std::string& key, const std::string& value);
 
-    // Returns no value for a missing, expired, or already-reaped key.
+    // Returns no value for a missing, expired, already-reaped, or tombstoned
+    // key.
     std::optional<std::string> get(const std::string& key);
 
     // Returns true only when a live key was removed.
@@ -51,9 +69,30 @@ class KvStore {
 
     // SET with an absolute expiry.  This is used by WAL replay so a restart
     // cannot extend or shorten a persisted TTL.  An expired record is valid
-    // input but leaves the key absent.
+    // input but leaves the key logically absent.
     bool set_with_expiry(const std::string& key, const std::string& value,
                          int64_t absolute_expiry_ms);
+
+    struct AppliedMutation {
+        enum class Kind : std::uint8_t { kSet, kDelete, kExpire };
+        Kind kind = Kind::kSet;
+        std::string key;
+        std::string value;
+        std::int64_t absolute_expiry_ms = 0;
+    };
+
+    // Validates and atomically publishes one committed WAL record.  Every key
+    // appears at most once in the resulting version metadata: duplicate
+    // operations in the input are folded to their final state first.  On
+    // validation/allocation failure no version or LSN is published.
+    bool apply_committed(std::uint64_t commit_lsn,
+                         const std::vector<AppliedMutation>& mutations,
+                         std::string* error = nullptr);
+
+    // Snapshot read.  snapshot_lsn == 0 addresses versions restored from an
+    // RDB image, which predate the replayed WAL.
+    std::optional<std::string> get_at(const std::string& key,
+                                      std::uint64_t snapshot_lsn);
 
     // Exposed for the persistence layer, which must record the same absolute
     // deadline that the in-memory store will use.
@@ -70,6 +109,7 @@ class KvStore {
 
     // Distinguishes a missing/expired key from an existing key without TTL.
     TtlResult ttl_info(const std::string& key);
+    TtlResult ttl_info_at(const std::string& key, std::uint64_t snapshot_lsn);
 
     // Compatibility helper: Missing/expired: nullopt.  Existing without TTL:
     // -1.  Otherwise the remaining monotonic duration rounded down to
@@ -77,14 +117,15 @@ class KvStore {
     // 0; only now >= deadline is treated as expired.
     std::optional<int64_t> ttl(const std::string& key);
 
-    // Number of live (non-expired) entries.  Expired entries are reaped while
-    // computing the result.
+    // Number of logical live entries at the latest commit LSN.  Expired
+    // versions are retired while computing the result.
     size_t size() const;
 
     void clear();
 
     // Atomic publication of a fully validated recovery image.  The source
-    // store must use the same clock policy as the target.
+    // store must use the same clock policy as the target.  Data, synthetic
+    // LSN progress, and version metadata are swapped together.
     // NOLINTNEXTLINE(performance-noexcept-swap): locking may throw.
     void swap(KvStore& other);
 
@@ -95,15 +136,42 @@ class KvStore {
         int64_t expiry_ms = 0;
     };
 
-    // Export only live entries.  TTLs are converted to absolute wall-clock
-    // timestamps under the same lock used by all mutations.
+    // Export only the latest live version of each key.  TTLs are converted to
+    // absolute wall-clock timestamps under the same lock used by mutations.
     std::vector<Entry> export_all() const;
 
-    // Restore a single entry using an absolute Unix epoch millisecond
-    // timestamp.  Expired entries are discarded.  This is deliberately
-    // separate from set()+expire() so recovery does not extend a TTL.
+    // Restore a single RDB entry using an absolute Unix epoch millisecond
+    // timestamp.  RDB state predates the WAL, so restored versions use the
+    // synthetic commit LSN 0.  Expired entries are discarded.  This is
+    // deliberately separate from set()+expire() so recovery does not extend a
+    // TTL.
     bool restore_entry(const std::string& key, const std::string& value,
                        int64_t absolute_expiry_ms);
+
+    // Largest commit LSN applied through apply_committed() (or synthesized by
+    // the legacy helpers).
+    std::uint64_t current_lsn() const;
+
+    // Last committed LSN for a key, including tombstones.  Returns 0 when no
+    // version metadata remains.
+    std::uint64_t latest_committed_lsn(const std::string& key) const;
+
+    std::size_t version_count() const;
+    std::size_t max_versions() const;
+
+    struct GcResult {
+        std::size_t versions_before = 0;
+        std::size_t versions_after = 0;
+        std::size_t versions_reclaimed = 0;
+    };
+
+    // Reclaims versions that cannot affect any supplied active snapshot or the
+    // latest committed state.  The caller includes every active and committing
+    // transaction snapshot.  A failure may have safely reclaimed earlier keys
+    // but never changes the logical result of a listed snapshot.
+    bool garbage_collect(const std::vector<std::uint64_t>& snapshot_lsns,
+                         GcResult* result = nullptr,
+                         std::string* error = nullptr);
 
     std::shared_ptr<ClockInterface> clock() const {
         return clock_;
@@ -168,25 +236,43 @@ class KvStore {
     size_t sweep_expired();
 
   private:
-    struct InternalEntry {
+    struct Version {
+        std::uint64_t commit_lsn = 0;
         std::string value;
         std::chrono::steady_clock::time_point deadline;
         bool has_ttl = false;
+        bool deleted = false;
     };
 
-    using InternalMap = std::unordered_map<std::string, InternalEntry>;
+    using VersionChain = std::vector<Version>; // commit_lsn ascending
+    using InternalMap = std::unordered_map<std::string, VersionChain>;
 
     std::chrono::steady_clock::time_point now() const;
     int64_t system_now_ms() const;
-    bool is_expired(const InternalEntry& entry,
+    bool is_expired(const Version& version,
                     std::chrono::steady_clock::time_point current) const;
+    bool is_live(const Version& version,
+                 std::chrono::steady_clock::time_point current) const;
+    const Version* visible_version_locked(const std::string& key,
+                                          std::uint64_t snapshot_lsn) const;
+    const Version* latest_version_locked(const std::string& key) const;
+    std::uint64_t next_synthetic_lsn_locked();
+    bool append_version_locked(const std::string& key, Version version,
+                               std::string* error);
+    bool append_synthetic_version(const std::string& key, Version version);
+    bool retire_expired_chain_locked(
+        VersionChain& chain,
+        std::chrono::steady_clock::time_point current) const;
     size_t
     purge_expired_locked(std::chrono::steady_clock::time_point current) const;
     void scanner_loop();
 
     std::shared_ptr<ClockInterface> clock_;
     mutable std::mutex mutex_;
-    mutable InternalMap store_;
+    mutable InternalMap versions_;
+    mutable std::uint64_t max_applied_lsn_ = 0;
+    mutable std::size_t version_count_ = 0;
+    std::size_t max_versions_ = DEFAULT_MAX_VERSIONS;
 
     void ensure_scanner_locked(std::chrono::milliseconds interval);
     void stop_scanner_locked(std::thread* thread);

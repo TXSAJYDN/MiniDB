@@ -27,6 +27,7 @@ minidb_discover_tests(base_test)
 add_executable(storage_test
     KvStoreTtlTest.cpp
     KvStoreTtlStressTest.cpp
+    KvStoreMvccTest.cpp
     RdbManagerFaultTest.cpp
     RdbFormatTest.cpp
     RdbManagerTest.cpp

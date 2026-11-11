@@ -223,8 +223,11 @@ nonzero on shutdown.
 
 `/stats` and `STATS` expose a coherent snapshot of the durability mode, LSNs,
 WAL bytes and segment count, mutation/fsync/checkpoint counters, checkpoint
-pause time, and recovery statistics. They are diagnostic endpoints, not a
-health-check substitute.
+pause time, recovery statistics, and R4-A timing diagnostics. Timing counters
+cover successful operations only; process-lifetime maxima include preload and
+warm-up, and fixed fsync buckets do not provide arbitrary quantiles. They are
+diagnostic endpoints, not an SLO or health-check substitute. See
+[ADR-005](decisions/005-group-commit.md) for the evidence gates.
 
 ## Backup
 

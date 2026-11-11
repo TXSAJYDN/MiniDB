@@ -142,23 +142,30 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 - mutation、fsync、checkpoint、interval flush 计数；
 - checkpoint 暂停时间；
 - WAL append、rotation、segment 清理和目录 fsync 计数；
+- 成功 append、data fsync 与 `SYNC` 持久化路径的累计/最大耗时，以及固定 fsync 延迟桶；
 - 启动恢复的 RDB 记录数、扫描/重放记录数、截断字节和遗留 residue；
 - legacy import 与 bootstrap 状态。
 
 字段定义见 [KV 协议](docs/protocol-kv.md) 和 [HTTP 协议](docs/protocol-http.md)。
+`timing` 指标只记录成功操作；`max` 是进程生命周期最大值，包含 preload/warm-up，
+不是本轮窗口最大值，也不是生产 SLO。固定桶不提供任意分位数或逐请求 trace。
 
 ## 验证状态
 
-当前 R0-R3 已完成实现与本地验收，R4 未启动：
+当前 R0-R3 已完成实现与本地验收；R4-A 已完成 ADR 和 baseline instrumentation，
+组提交实现尚未开始：
 
 - 六种构建配置的真实 CTest 矩阵；
 - WAL 编解码、manifest、恢复、checkpoint、单写者锁和故障注入单元测试；
 - 19 个进程级用例，覆盖 HTTP/KV 持久化、尾部截断、中间损坏、缺失 segment、manifest 损坏、随机 kill、TTL 和 STATS；
 - HTTP、KV、WAL record、manifest 四个固定 seed fuzz target；
 - 多 durability、多客户端、写/混合/TTL 的 5 轮可靠性 benchmark；
+- R4-A timing 字段、固定 fsync 桶和 v2 benchmark 采集契约；
 - clang-format、clang-tidy 和 `git diff --check`。
 
-具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。GitHub Actions 配置已更新，但本文不声称远程 CI 已在某次提交上运行。
+具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。R0-R3 基线
+`cfbda60` 的远程 GitHub Actions 已 9/9 通过；R4-A 提交的最终状态以推送后的
+GitHub checks 为准。本项目的 R4-A 只做证据采集，不实现组提交。
 
 ## 明确的非目标
 
@@ -169,7 +176,9 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 - 不提供 TLS、认证或授权；
 - 不承诺生产 SLA、容量规划或高并发表现；
 - 不覆盖多进程共享数据目录、掉电一致性或设备故障证明；
-- 不实现 `BATCHED`、组提交或后台 checkpoint（均为 R4 候选，不是当前能力）。
+- 不实现 `BATCHED`、组提交或后台 checkpoint；R4-A 只完成
+  [ADR-005](docs/decisions/005-group-commit.md) 和指标采集，组提交实现仍为
+  NOT STARTED。
 
 ## 文档
 
@@ -186,4 +195,5 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 - [RDB v2 格式](docs/rdb-format.md)
 - [可复现 benchmark](bench/README.md)
 - [Fuzz targets](fuzz/README.md)
+- [ADR-005：R4-A 组提交候选设计与证据门槛](docs/decisions/005-group-commit.md)
 - [架构决策记录](docs/decisions/)

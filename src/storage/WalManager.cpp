@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -27,6 +28,34 @@ bool checked_add(std::uint64_t left, std::uint64_t right,
     }
     *result = left + right;
     return true;
+}
+
+std::uint64_t steady_now_us() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+void add_saturated(std::uint64_t* counter, std::uint64_t delta) {
+    const std::uint64_t maximum = std::numeric_limits<std::uint64_t>::max();
+    *counter = delta > maximum - *counter ? maximum : *counter + delta;
+}
+
+void observe_timing(std::uint64_t elapsed_us, std::uint64_t* total_us,
+                    std::uint64_t* maximum_us) {
+    add_saturated(total_us, elapsed_us);
+    *maximum_us = std::max(*maximum_us, elapsed_us);
+}
+
+std::size_t data_fsync_bucket(std::uint64_t elapsed_us) {
+    for (std::size_t index = 0; index < kWalDataFsyncLatencyBoundsUs.size();
+         ++index) {
+        if (elapsed_us <= kWalDataFsyncLatencyBoundsUs[index]) {
+            return index;
+        }
+    }
+    return kWalDataFsyncLatencyBoundsUs.size();
 }
 
 } // namespace
@@ -200,15 +229,19 @@ WalResult WalManager::append(const WalRecord& record, DurabilityMode mode,
         return WalResult::kResourceLimit;
     }
 
+    const std::uint64_t append_started_us = steady_now_us();
     if (!write_all(operations_.get(), active_fd_, encoded.data(),
                    encoded.size(), error)) {
         fail("WAL append failed");
         return WalResult::kIoError;
     }
+    const std::uint64_t append_elapsed_us = steady_now_us() - append_started_us;
     active->size += encoded.size();
     total_bytes_ = new_total;
-    stats_.appends++;
+    ++stats_.appends;
     stats_.bytes_written += encoded.size();
+    observe_timing(append_elapsed_us, &stats_.append_total_us,
+                   &stats_.append_max_us);
     dirty_ = true;
     next_lsn_++;
 
@@ -227,13 +260,12 @@ bool WalManager::flush(std::string* error) {
     if (!dirty_) {
         return true;
     }
-    if (operations_->fsync_fd(active_fd_) < 0) {
+    if (!data_sync(active_fd_)) {
         set_error(error,
                   "WAL fsync failed: " + std::string(std::strerror(errno)));
         fail("WAL fsync failed");
         return false;
     }
-    stats_.data_fsyncs++;
     dirty_ = false;
     return true;
 }
@@ -379,7 +411,7 @@ bool WalManager::create_empty_segment(std::uint64_t start_lsn,
                              std::string(std::strerror(errno)));
         return false;
     }
-    if (operations_->fsync_fd(fd) < 0) {
+    if (!data_sync(fd)) {
         const int saved_errno = errno;
         (void)operations_->close_fd(fd);
         (void)operations_->unlink_file(path);
@@ -387,7 +419,6 @@ bool WalManager::create_empty_segment(std::uint64_t start_lsn,
         set_error(error, "failed to fsync new WAL segment");
         return false;
     }
-    stats_.data_fsyncs++;
     if (operations_->close_fd(fd) < 0) {
         set_error(error, "failed to close new WAL segment");
         return false;
@@ -410,6 +441,20 @@ bool WalManager::open_active_segment(std::string* error) {
                              std::string(std::strerror(errno)));
         return false;
     }
+    return true;
+}
+
+bool WalManager::data_sync(int fd) {
+    const std::uint64_t started_us = steady_now_us();
+    if (operations_->fsync_fd(fd) < 0) {
+        return false;
+    }
+    const std::uint64_t elapsed_us = steady_now_us() - started_us;
+    ++stats_.data_fsyncs;
+    observe_timing(elapsed_us, &stats_.data_fsync_total_us,
+                   &stats_.data_fsync_max_us);
+    add_saturated(
+        &stats_.data_fsync_latency_buckets[data_fsync_bucket(elapsed_us)], 1);
     return true;
 }
 

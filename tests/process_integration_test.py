@@ -361,6 +361,41 @@ def stats_for(protocol, port):
     return read_http_stats(port) if protocol == "http" else read_kv_stats(port)
 
 
+def check_timing_contract(stats, label):
+    timing = stats.get("timing")
+    check(isinstance(timing, dict), f"{label} stats omitted timing: {stats!r}")
+    required = (
+        "wal_append_total_us",
+        "wal_append_max_us",
+        "wal_data_fsync_total_us",
+        "wal_data_fsync_max_us",
+        "sync_mutation_total_us",
+        "sync_mutation_max_us",
+    )
+    for name in required:
+        check(isinstance(timing.get(name), int) and timing[name] >= 0,
+              f"{label} timing field {name} is invalid: {stats!r}")
+    check(timing["wal_append_total_us"] >= timing["wal_append_max_us"],
+          f"{label} append timing is inconsistent: {stats!r}")
+    check(timing["wal_data_fsync_total_us"] >=
+          timing["wal_data_fsync_max_us"],
+          f"{label} data-fsync timing is inconsistent: {stats!r}")
+    check(timing["sync_mutation_total_us"] >=
+          timing["sync_mutation_max_us"],
+          f"{label} SYNC timing is inconsistent: {stats!r}")
+    bounds = timing.get("fsync_latency_bucket_bounds_us")
+    counts = timing.get("fsync_latency_bucket_counts")
+    check(isinstance(bounds, list) and bounds and
+          all(isinstance(value, int) and value > 0 for value in bounds) and
+          bounds == sorted(bounds),
+          f"{label} fsync bucket bounds are invalid: {stats!r}")
+    check(isinstance(counts, list) and len(counts) == len(bounds) + 1 and
+          all(isinstance(value, int) and value >= 0 for value in counts),
+          f"{label} fsync bucket counts are invalid: {stats!r}")
+    check(sum(counts) == stats["wal"]["data_fsyncs"],
+          f"{label} fsync buckets do not partition data_fsyncs: {stats!r}")
+
+
 def expect_startup_failure(binary, label, port, rdb_path, cwd, expected):
     result = subprocess.run(
         [binary, "-p", str(port), "-r", rdb_path],
@@ -1163,6 +1198,7 @@ def test_stats_contract():
             check(stats["wal"]["appends"] == 1
                   and stats["wal"]["data_fsyncs"] >= 1,
                   f"HTTP WAL counters are inconsistent: {stats!r}")
+            check_timing_contract(stats, "HTTP")
             check(stats["recovery"]["manifest_present"] is True,
                   f"HTTP stats omitted manifest state: {stats!r}")
 
@@ -1192,6 +1228,7 @@ def test_stats_contract():
             check(stats["persistence"]["mutations"] == 1
                   and stats["wal"]["appends"] == 1,
                   f"KV stats counters are inconsistent: {stats!r}")
+            check_timing_contract(stats, "KV")
             check(stats["wal_bytes"] > 0,
                   f"KV stats omitted WAL bytes: {stats!r}")
 

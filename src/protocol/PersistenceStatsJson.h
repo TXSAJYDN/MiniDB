@@ -32,7 +32,31 @@ inline std::string persistence_stats_json(const PersistenceSnapshot& stats) {
         << ",\"directory_fsyncs\":" << stats.wal.directory_fsyncs
         << ",\"rotations\":" << stats.wal.rotations
         << ",\"segments_removed\":" << stats.wal.segments_removed
-        << "},\"recovery\":{\"rdb_records\":" << stats.recovery.rdb_records
+        << "},\"timing\":{\"wal_append_total_us\":" << stats.wal.append_total_us
+        << ",\"wal_append_max_us\":" << stats.wal.append_max_us
+        << ",\"wal_data_fsync_total_us\":" << stats.wal.data_fsync_total_us
+        << ",\"wal_data_fsync_max_us\":" << stats.wal.data_fsync_max_us
+        << ",\"sync_mutation_total_us\":"
+        << stats.persistence.sync_mutation_total_us
+        << ",\"sync_mutation_max_us\":"
+        << stats.persistence.sync_mutation_max_us
+        << ",\"fsync_latency_bucket_bounds_us\":[";
+    for (std::size_t index = 0; index < kWalDataFsyncLatencyBoundsUs.size();
+         ++index) {
+        if (index != 0) {
+            out << ',';
+        }
+        out << kWalDataFsyncLatencyBoundsUs[index];
+    }
+    out << "],\"fsync_latency_bucket_counts\":[";
+    for (std::size_t index = 0;
+         index < stats.wal.data_fsync_latency_buckets.size(); ++index) {
+        if (index != 0) {
+            out << ',';
+        }
+        out << stats.wal.data_fsync_latency_buckets[index];
+    }
+    out << "]},\"recovery\":{\"rdb_records\":" << stats.recovery.rdb_records
         << ",\"checkpoint_lsn\":" << stats.recovery.checkpoint_lsn
         << ",\"last_lsn\":" << stats.recovery.last_lsn
         << ",\"next_lsn\":" << stats.recovery.next_lsn

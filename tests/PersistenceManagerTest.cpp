@@ -57,10 +57,16 @@ TEST(PersistenceManagerTest, SyncAcknowledgedMutationSurvivesManagerRestart) {
         const MutationOutcome outcome = manager.set("durable", "value");
         ASSERT_TRUE(outcome.ok()) << outcome.error;
         EXPECT_TRUE(outcome.changed);
-        EXPECT_EQ(manager.snapshot().last_lsn, 1u);
-        EXPECT_EQ(manager.snapshot().next_lsn, 2u);
-        EXPECT_EQ(manager.snapshot().persistence.sync_mutations, 1u);
-        EXPECT_EQ(manager.snapshot().persistence.interval_mutations, 0u);
+        const PersistenceSnapshot snapshot = manager.snapshot();
+        EXPECT_EQ(snapshot.last_lsn, 1u);
+        EXPECT_EQ(snapshot.next_lsn, 2u);
+        EXPECT_EQ(snapshot.persistence.sync_mutations, 1u);
+        EXPECT_EQ(snapshot.persistence.interval_mutations, 0u);
+        EXPECT_GE(snapshot.persistence.sync_mutation_total_us,
+                  snapshot.persistence.sync_mutation_max_us);
+        EXPECT_GE(snapshot.wal.append_total_us, snapshot.wal.append_max_us);
+        EXPECT_GE(snapshot.wal.data_fsync_total_us,
+                  snapshot.wal.data_fsync_max_us);
         EXPECT_TRUE(fs::is_regular_file(paths.rdb));
         EXPECT_TRUE(fs::is_regular_file(paths.manifest));
         EXPECT_EQ(segment_count(paths.wal_dir), 1u);
@@ -328,10 +334,16 @@ TEST(PersistenceManagerTest,
         ASSERT_TRUE(manager.open(&error)) << error;
         const MutationOutcome acked = manager.set("acked", "value");
         ASSERT_TRUE(acked.ok()) << acked.error;
+        const PersistenceSnapshot before_failure = manager.snapshot();
         operations->set_fail_fsync(EIO);
         const MutationOutcome failed = manager.set("unacked", "possible");
         EXPECT_EQ(failed.status, MutationStatus::kIoError);
         EXPECT_TRUE(manager.failed());
+        const PersistenceSnapshot after_failure = manager.snapshot();
+        EXPECT_EQ(after_failure.persistence.sync_mutations,
+                  before_failure.persistence.sync_mutations);
+        EXPECT_EQ(after_failure.persistence.sync_mutation_total_us,
+                  before_failure.persistence.sync_mutation_total_us);
         EXPECT_FALSE(store->get("unacked").has_value());
         EXPECT_EQ(manager.set("later", "must-not-run").status,
                   MutationStatus::kNotReady);
@@ -408,6 +420,10 @@ TEST(PersistenceManagerTest, SnapshotReportsOneCoherentPersistencePoint) {
     EXPECT_EQ(snapshot.persistence.checkpoints, 1u);
     EXPECT_EQ(snapshot.wal.appends, 3u);
     EXPECT_EQ(snapshot.wal_segment_count, snapshot.wal.appends > 0 ? 1u : 0u);
+    EXPECT_GE(snapshot.persistence.sync_mutation_total_us,
+              snapshot.persistence.sync_mutation_max_us);
+    EXPECT_GE(snapshot.wal.append_total_us, snapshot.wal.append_max_us);
+    EXPECT_GE(snapshot.wal.data_fsync_total_us, snapshot.wal.data_fsync_max_us);
 }
 
 } // namespace

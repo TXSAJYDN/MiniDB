@@ -55,6 +55,14 @@ flushes, checkpoints, and diagnostic snapshots. A slow filesystem operation
 such as a checkpoint blocks the owner loop; there is no worker pool and no
 background checkpoint. This is a deliberate R0-R3 boundary.
 
+R4-A adds diagnostic instrumentation only. It records successful WAL
+`write_all()`, WAL data-fsync, and `SYNC` persistence-path timings with
+fixed-memory counters and fixed latency buckets. It does not add a writer
+thread, queue, completion path, or batched durability mode; the owner-loop and
+single-writer model above is unchanged. The evidence gates and candidate
+boundaries are recorded in
+[ADR-005](decisions/005-group-commit.md).
+
 ## Component map
 
 | Layer | Main files | Responsibility |
@@ -144,9 +152,12 @@ level-triggered epoll because no new kernel edge exists for user-space bytes.
 8. The session stops reading while a response is in flight. Write completion
    resumes draining buffered pipelined requests or re-enables socket reads.
 
-`GET /stats` returns the stable persistence statistics JSON. `POST /save`
-performs a stop-the-world checkpoint and reports failure or unconfirmed
-durability explicitly.
+`GET /stats` returns the stable persistence statistics JSON. Its `timing`
+object reports successful-operation cumulative and process-lifetime maximum
+durations plus fixed WAL data-fsync buckets; it is diagnostic evidence for
+[ADR-005](decisions/005-group-commit.md), not an SLO. `POST /save` performs a
+stop-the-world checkpoint and reports failure or unconfirmed durability
+explicitly.
 
 ## Idle timeout
 
@@ -338,7 +349,9 @@ The local evidence suite covers:
 - process-level CLI, default path, restart persistence, corrupt startup,
   writer-lock conflict, and shutdown-save failure behavior;
 - sanitizer, clang-format, clang-tidy, four fixed-seed fuzz targets, and the
-  reliability benchmark.
+  reliability benchmark;
+- R4-A timing counters, fixed fsync buckets, and protocol contract checks in
+  both HTTP and KV paths.
 
 The acceptance matrix runs Debug, Release, ASan, UBSan, ASan+UBSan, and TSan
 from separate build directories. Passing it is local reproducibility evidence,
@@ -350,8 +363,14 @@ not a substitute for a public CI run or a production qualification.
 - Replication, sharding, clustering, consensus, or transactions.
 - HTTP/2, WebSocket, chunked requests, or Expect/100-continue.
 - Multi-process sharing of one data directory.
-- Group commit, batched durability, or background/incremental checkpoint.
+- Group-commit implementation, batched durability, or background/incremental
+  checkpoint. R4-A currently consists only of
+  [ADR-005](decisions/005-group-commit.md) and diagnostic instrumentation.
 - Power-loss, kernel-crash, firmware-cache, or media-failure proofs.
 - Production SLAs, capacity claims, or arbitrary client scaling.
 
 These exclusions are part of the contract, not hidden implementation gaps.
+
+## Related decisions
+
+- [ADR-005: R4-A group-commit candidate design and evidence gates](decisions/005-group-commit.md)

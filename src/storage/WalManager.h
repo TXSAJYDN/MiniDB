@@ -4,6 +4,8 @@
 #include "WalFileOperations.h"
 #include "WalFormat.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -17,6 +19,15 @@ enum class WalResult : std::uint8_t {
     kResourceLimit,
 };
 
+// Fixed latency buckets for successful WAL data-fsync observations.  The
+// final bucket covers values greater than the last bound.  Keeping these as a
+// compile-time array avoids dynamic allocation or high-cardinality histograms
+// on the write path.
+inline constexpr std::array<std::uint64_t, 11> kWalDataFsyncLatencyBoundsUs = {
+    50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000};
+inline constexpr std::size_t kWalDataFsyncLatencyBucketCount =
+    kWalDataFsyncLatencyBoundsUs.size() + 1;
+
 struct WalManagerStats {
     std::uint64_t appends = 0;
     std::uint64_t bytes_written = 0;
@@ -24,6 +35,17 @@ struct WalManagerStats {
     std::uint64_t directory_fsyncs = 0;
     std::uint64_t rotations = 0;
     std::uint64_t segments_removed = 0;
+
+    // Cumulative monotonic-clock timings for successful operations only.
+    // Append timing covers write_all(), excluding record encoding, rotation,
+    // and any fsync.  Data-fsync timing covers every successful WAL data
+    // fsync, including creation of an empty segment.
+    std::uint64_t append_total_us = 0;
+    std::uint64_t append_max_us = 0;
+    std::uint64_t data_fsync_total_us = 0;
+    std::uint64_t data_fsync_max_us = 0;
+    std::array<std::uint64_t, kWalDataFsyncLatencyBucketCount>
+        data_fsync_latency_buckets{};
 };
 
 // Appends validated WAL records to one active segment.  The manager never
@@ -87,6 +109,7 @@ class WalManager {
     bool create_empty_segment(std::uint64_t start_lsn,
                               std::string* error = nullptr);
     bool open_active_segment(std::string* error = nullptr);
+    bool data_sync(int fd);
     bool directory_sync(std::string* error = nullptr);
     void fail(const std::string& message);
 

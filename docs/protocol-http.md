@@ -181,6 +181,18 @@ the duration of snapshot serialization, file I/O, fsyncs, and cleanup.
     "rotations": 0,
     "segments_removed": 0
   },
+  "timing": {
+    "wal_append_total_us": 2100,
+    "wal_append_max_us": 120,
+    "wal_data_fsync_total_us": 30000,
+    "wal_data_fsync_max_us": 8000,
+    "sync_mutation_total_us": 45000,
+    "sync_mutation_max_us": 12000,
+    "fsync_latency_bucket_bounds_us": [
+      50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000
+    ],
+    "fsync_latency_bucket_counts": [20, 10, 5, 3, 2, 1, 1, 0, 0, 0, 0, 0]
+  },
   "recovery": {
     "rdb_records": 0,
     "checkpoint_lsn": 0,
@@ -203,6 +215,16 @@ All fields come from one `PersistenceSnapshot` taken under the persistence
 mutex. Counters are cumulative for the current process unless their names
 explicitly describe recovery state. The endpoint is diagnostic, not a
 replacement for `/health` or a liveness probe.
+
+`timing` records successful operations only. `wal_append_*` covers
+`write_all()` without record encoding, rotation, or fsync. `wal_data_fsync_*`
+covers successful WAL data fsyncs, including empty-segment creation, but not
+directory fsyncs. `sync_mutation_*` starts after mutation validation and spans
+bootstrap, WAL append/fsync, and in-memory apply for successful `SYNC`
+mutations; it excludes network parsing and response serialization. `total`
+fields support window means, while `max` fields are process-lifetime maxima
+that include preload/warm-up. The fixed buckets partition `wal.data_fsyncs`;
+they provide bounded cardinality, not arbitrary quantiles or per-request traces.
 
 If the persistence manager was never opened, `/stats` returns 503 with the
 plain-text body `Persistence is not open\n`. Once a manager exists and has

@@ -23,8 +23,10 @@ MiniDB 选择少量、可验证的模式，而不是提供一组名称好听但�
 `INTERVAL` 的 timer 周期是 100 ms，由 owner EventLoop 的 timerfd 驱动。实际丢失
 窗口受调度、I/O 和事件循环停顿影响，不能理解为一个精确的 100 ms 承诺。
 
-`BATCHED` 未实现。只有在 R1-R3 的证据证明 fsync 是主要瓶颈后，才在 R4 评估组
-提交；R4 需要专用 writer thread、有界队列、completion 顺序和新的崩溃矩阵。
+`BATCHED` 未实现。[ADR-005](005-group-commit.md) 已把 R4-A 定义为
+evidence-gated 的组提交设计、诊断指标和准入条件；当前只完成 ADR 与 baseline
+instrumentation，writer thread、有界队列、批量 fsync 和 completion 顺序均未
+实现。只有 G1-G7 门槛满足后才进入实现。
 
 ## fsync 失败语义
 

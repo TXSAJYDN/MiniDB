@@ -2,9 +2,9 @@
 
 ## Scope
 
-This document records the local R0-R3 evidence for MiniDB's crash-consistent
-persistence work. It is deliberately a statement about a tested engineering
-prototype, not a production qualification.
+This document records the local R0-R3 evidence and the R4-A instrumentation
+baseline for MiniDB's crash-consistent persistence work. It is deliberately a
+statement about a tested engineering prototype, not a production qualification.
 
 The evidence covers:
 
@@ -12,6 +12,7 @@ The evidence covers:
 - deterministic crash points and process-level crash recovery;
 - sanitizer, fuzz, format, and static-analysis gates;
 - durability-mode performance, checkpoint pause, recovery time, and RSS;
+- R4-A diagnostic timing fields and fixed WAL data-fsync buckets;
 - explicit limits and non-claims.
 
 ## Source and environment
@@ -24,15 +25,18 @@ The evidence covers:
 - CPU: Intel Core i9-14900HX, 32 logical CPUs visible to WSL2
 - Filesystem: WSL2 ext4
 
-The benchmark JSON records `git_head=34dcc79` and
+The historical R3 benchmark JSON records `git_head=34dcc79` and
 `working_tree_dirty_at_collection=true`, because the reliability implementation
-was still uncommitted when the data was collected. The final commit packages the
-same implementation and documentation, but the benchmark metadata is retained
-honestly rather than rewritten.
+was still uncommitted when that artifact was collected. The metadata is retained
+honestly rather than rewritten. The baseline commit `cfbda60` was later pushed
+to `main`, where its GitHub Actions run passed all 9 jobs: debug, release, ASan,
+UBSan, ASan+UBSan, TSan, format, static analysis, and fuzz smoke. This statement
+is about that baseline commit, not a claim about every later commit.
 
 ## Test matrix
 
-The final local matrix runs each configuration from its own CMake preset:
+The final local matrix for R0-R3 plus R4-A instrumentation runs each
+configuration from its own CMake preset:
 
 | Configuration | CTest |
 |---|---:|
@@ -79,8 +83,8 @@ The unit and integration inventory also includes:
 - C01-C14 deterministic crash points.
 
 This is local reproducibility evidence. It is not a substitute for a public CI
-run. This work was committed locally and not pushed, so no claim is made that
-GitHub Actions ran on the final commit.
+run. The R0-R3 baseline commit `cfbda60` passed 9/9 GitHub Actions jobs; R4-A
+final-HEAD status must be read from the GitHub checks for that commit.
 
 ## Fuzz evidence
 
@@ -96,6 +100,36 @@ Four Clang libFuzzer targets are built with ASan and UBSan:
 A clean run requires exit code 0 for every target, no ASan/UBSan diagnostic, and
 an empty artifact directory. Any crash must be minimized, added to the corpus,
 and covered by a durable regression test before the run is accepted again.
+
+## R4-A instrumentation baseline
+
+R4-A is evidence-gated. This phase adds instrumentation, not group-commit
+implementation. The write path still performs one WAL data fsync per successful
+`SYNC` mutation on the owner event loop.
+
+The v2 benchmark records successful-operation timings from
+`std::chrono::steady_clock`:
+
+- `wal_append_*`: `write_all()` only; excludes encoding, rotation, and fsync;
+- `wal_data_fsync_*`: successful WAL data fsyncs, including empty-segment
+  creation, but excluding directory fsyncs;
+- `sync_mutation_*`: successful `SYNC` from post-validation persistence
+  admission through in-memory apply; includes bootstrap and checkpoint retry
+  work, excludes network parsing and response serialization;
+- `fsync_latency_bucket_counts`: fixed 50 us through 100 ms upper bounds plus
+  an overflow bucket; counts must sum to `wal.data_fsyncs`.
+
+`total` fields support measured-window means. `max` fields are process-lifetime
+maxima that include preload/warm-up. The fixed buckets do not provide arbitrary
+quantiles or per-request traces. ADR-005 defines G1-G7; no group-commit work
+starts unless the baseline and a separate batch-formation experiment satisfy
+the gates.
+
+The v2 artifact path is
+`bench/results/reliability-20261111-r4a-baseline.json`. It does not overwrite
+the historical R3 artifact. See
+[ADR-005](decisions/005-group-commit.md) for the candidate boundaries and
+evidence gates.
 
 ## Reliability benchmark
 
@@ -185,7 +219,9 @@ Total successful requests: 340,240. Total errors: 0. Wall-clock collection time:
 - multi-node, replicated, transactional, or multi-writer operation;
 - any Redis or SQL compatibility;
 - a production SLA;
-- that GitHub Actions ran on the final commit.
+- group-commit implementation or performance benefit;
+- that every later commit inherited the baseline CI result without its own
+  checks.
 
 ## Reproduction notes
 
@@ -211,4 +247,5 @@ machine, power mode, kernel, compiler, build configuration, and background load.
 - [WAL and manifest format](wal-format.md)
 - [Deployment and operation](deployment.md)
 - [Benchmark methodology](../bench/README.md)
+- [ADR-005: R4-A group-commit candidate design and evidence gates](decisions/005-group-commit.md)
 - [Fuzz targets](../fuzz/README.md)

@@ -42,6 +42,12 @@ struct PersistenceStats {
     std::uint64_t checkpoints = 0;
     std::uint64_t interval_flushes = 0;
     std::uint64_t checkpoint_pause_us = 0;
+
+    // Successful SYNC mutations only.  The interval starts after mutation
+    // validation and spans bootstrap, WAL append/fsync, and the in-memory
+    // apply; it excludes network parsing and response serialization.
+    std::uint64_t sync_mutation_total_us = 0;
+    std::uint64_t sync_mutation_max_us = 0;
 };
 
 // A single-lock snapshot for diagnostic endpoints. Reading these values via

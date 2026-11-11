@@ -1,6 +1,6 @@
 # MiniDB 可靠性与持久化升级计划书
 
-> 文档状态：`R0-R3 Completed / R4 Not Started`
+> 文档状态：`R0-R3 Completed / R4-A Design + Baseline Instrumentation Done / Group Commit Not Started`
 >
 > 编写日期：2026-11-10（Asia/Shanghai）
 >
@@ -10,7 +10,8 @@
 >
 > 最近历史功能验收基线：`9da4b48`（阶段 A-H 技术验收 PASS）
 >
-> 计划性质：R0-R3 已按本文完成实现并通过本地验证；R4 仅是证据驱动的可选路线，尚未实现。
+> 计划性质：R0-R3 已按本文完成实现并通过本地验证；R4-A 已完成 ADR 和诊断指标，
+> 组提交实现仍未开始；其他 R4 路线仅是证据驱动的可选项。
 >
 > 推进方式：按技术依赖和验收门槛推进，不设置固定总工期或强制周计划。阶段状态、证据链接、已知限制和下一步准入条件随实现同步更新。
 >
@@ -28,6 +29,7 @@
 - [恢复模型](recovery.md)
 - [崩溃一致性](crash-consistency.md)
 - [可靠性证据](reliability-evidence.md)
+- [ADR-005：R4-A 组提交候选设计与证据门槛](decisions/005-group-commit.md)
 
 ## 目录
 
@@ -822,11 +824,19 @@ durability/客户端数/负载矩阵，seed 为 `20261111`。原始数据保存�
 
 **R4-A：组提交**
 
+**实施状态（2026-11-11）：** 已用 [ADR-005](decisions/005-group-commit.md)
+固化候选边界、不可妥协不变量和 G1-G7 证据门槛；已增加成功 append、data
+fsync、`SYNC` 持久化路径计时及固定 fsync 桶，并升级为 v2 baseline
+benchmark。writer thread、队列、completion 和批量 fsync 均尚未实现。
+
+- [x] 写 ADR，定义候选边界、失败矩阵和证据门槛；
+- [x] 增加低开销诊断指标和 `/stats`/`STATS` 契约；
+- [x] 只有基线显示 fsync 是主要瓶颈时才进入实现；
 - [ ] 专用 WAL writer thread；
 - [ ] 有界队列和 completion；
 - [ ] 一次 fsync 服务多个写；
 - [ ] 保持 ack 后不丢和全局顺序；
-- [ ] 只有在基线显示 fsync 是主要瓶颈时实施；
+- [ ] 通过 G1-G3 后才写实现级 ADR；
 - [ ] 需要 TSan、stop/drain 和崩溃矩阵重新验证。
 
 **R4-B：后台/增量 checkpoint**
@@ -984,3 +994,4 @@ R4 不自动启动。只有新的测量证据表明当前瓶颈值得增加复�
 |---|---|---|
 | 2026-11-10 | 0.1 | 初稿：完成定位调整、WAL/checkpoint 设计、崩溃测试、性能和 R0-R4 路线规划 |
 | 2026-11-11 | 0.2 | R0-R3 完成实现与本地验收：305 项测试、四个 fuzz target、18 配置可靠性 benchmark；R4 未启动 |
+| 2026-11-11 | 0.3 | R4-A 完成 ADR-005、timing 指标和 v2 baseline 采集契约；组提交实现仍未开始 |

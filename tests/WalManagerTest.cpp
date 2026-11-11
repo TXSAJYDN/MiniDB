@@ -27,6 +27,14 @@ WalRecord MakeRecord(std::uint64_t lsn, std::string key = "key",
     return record;
 }
 
+std::uint64_t DataFsyncBucketCount(const WalManagerStats& stats) {
+    std::uint64_t total = 0;
+    for (const std::uint64_t count : stats.data_fsync_latency_buckets) {
+        total += count;
+    }
+    return total;
+}
+
 class WalManagerTest : public ::testing::Test {
   protected:
     void SetUp() override {
@@ -56,6 +64,9 @@ TEST_F(WalManagerTest, OpenCreatesDurableEmptySegment) {
     EXPECT_TRUE(fs::is_directory(wal_dir_));
     EXPECT_TRUE(fs::exists(wal_dir_ + "/" + wal_segment_name(1)));
     EXPECT_GT(operations->dir_fsync_calls(), 0);
+    const WalManagerStats stats = manager.stats();
+    EXPECT_EQ(DataFsyncBucketCount(stats), stats.data_fsyncs);
+    EXPECT_GE(stats.data_fsync_total_us, stats.data_fsync_max_us);
 }
 
 TEST_F(WalManagerTest, SyncAppendPersistsAndAdvancesLsn) {
@@ -69,8 +80,12 @@ TEST_F(WalManagerTest, SyncAppendPersistsAndAdvancesLsn) {
         << error;
     EXPECT_EQ(manager.next_lsn(), 2u);
     EXPECT_EQ(manager.total_bytes(), WalFormat::encoded_size(record));
-    EXPECT_EQ(manager.stats().appends, 1u);
-    EXPECT_GE(manager.stats().data_fsyncs, 2u);
+    const WalManagerStats stats = manager.stats();
+    EXPECT_EQ(stats.appends, 1u);
+    EXPECT_GE(stats.data_fsyncs, 2u);
+    EXPECT_GE(stats.append_total_us, stats.append_max_us);
+    EXPECT_GE(stats.data_fsync_total_us, stats.data_fsync_max_us);
+    EXPECT_EQ(DataFsyncBucketCount(stats), stats.data_fsyncs);
     EXPECT_EQ(fs::file_size(wal_dir_ + "/" + wal_segment_name(1)),
               WalFormat::encoded_size(record));
 }
@@ -84,6 +99,9 @@ TEST_F(WalManagerTest, IntervalAppendDefersFsyncUntilFlush) {
               WalResult::kOk);
     EXPECT_EQ(manager.stats().data_fsyncs,
               static_cast<std::uint64_t>(fsync_before));
+    EXPECT_GE(manager.stats().append_total_us, manager.stats().append_max_us);
+    EXPECT_EQ(DataFsyncBucketCount(manager.stats()),
+              manager.stats().data_fsyncs);
     std::string error;
     ASSERT_TRUE(manager.flush(&error)) << error;
     EXPECT_GT(manager.stats().data_fsyncs,
@@ -121,12 +139,16 @@ TEST_F(WalManagerTest, FsyncFailureMarksManagerUnhealthy) {
     auto operations = std::make_shared<minidb_test::FaultWalFileOperations>();
     WalManager manager(wal_dir_, operations);
     ASSERT_TRUE(manager.open({}, 1));
+    const WalManagerStats before = manager.stats();
     operations->set_fail_fsync(EIO);
     std::string error;
     EXPECT_EQ(manager.append(MakeRecord(1), DurabilityMode::kSync, &error),
               WalResult::kIoError);
     EXPECT_FALSE(manager.healthy());
     EXPECT_NE(error.find("fsync"), std::string::npos);
+    const WalManagerStats after = manager.stats();
+    EXPECT_EQ(after.data_fsyncs, before.data_fsyncs);
+    EXPECT_EQ(DataFsyncBucketCount(after), after.data_fsyncs);
 }
 
 TEST_F(WalManagerTest, WrongLsnAndInvalidRecordFailClosed) {

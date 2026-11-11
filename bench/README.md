@@ -13,15 +13,16 @@ None of these harnesses is a saturation, capacity, open-loop, or
 production-SLA test. Only the R3 reliability benchmark supports current
 durability claims; Stage H numbers are historical background.
 
-## Current R3 reliability benchmark
+## Reliability benchmark suite
 
-The current evidence artifact is
-`bench/results/reliability-20261111.json`:
+### R3 historical baseline
+
+`bench/results/reliability-20261111.json` is the retained R0-R3 baseline:
 
 - 133,299 bytes;
 - SHA-256
   `a5c3099789be938654771f830acbd25ecedc1da5520f7c4aa1567493c0e74254`;
-- 18 configurations: `SYNC`/`INTERVAL` × clients 1/8/32 ×
+- 18 configurations: `SYNC`/`INTERVAL` x clients 1/8/32 x
   write/mixed/TTL;
 - 5 rounds per configuration, 2 seconds per measured round;
 - dataset: 128 keys, 64-byte values;
@@ -33,8 +34,13 @@ The current evidence artifact is
 - 340,240 successful requests, 0 errors, 238.703 seconds wall-clock collection
   time.
 
-Reproduce it with a fresh output path so the retained evidence is not
-overwritten:
+The JSON records `git_head=34dcc79` and
+`working_tree_dirty_at_collection=true` because it was collected from the
+uncommitted reliability implementation. It is retained honestly and is not
+rewritten after commit. Full per-configuration data and interpretation limits
+are in [`docs/reliability-evidence.md`](../docs/reliability-evidence.md).
+
+Reproduce the historical baseline with a fresh output path:
 
 ~~~bash
 python3 bench/run_reliability_benchmark.py \
@@ -45,24 +51,42 @@ python3 bench/run_reliability_benchmark.py \
   --modes sync interval \
   --clients 1 8 32 \
   --workloads write mixed ttl \
-  --out /tmp/reliability-reproduction.json
+  --out /tmp/reliability-r3-reproduction.json
 ~~~
 
-Aggregate results:
+### R4-A instrumentation baseline (v2)
 
-| Metric | SYNC | INTERVAL |
-|---|---:|---:|
-| Median QPS range | 408.815 - 2,219.464 | 2,020.629 - 3,367.577 |
-| Recovery median range | 0.022716 - 0.023829 s | 0.043730 - 0.086119 s |
-| Checkpoint pause median range | 11,571 - 20,852 us | 12,387 - 19,323 us |
-| Server RSS peak max | 4,608 KiB | 4,608 KiB |
+The current harness emits schema `minidb-reliability-benchmark-v2`. Its default
+artifact is `bench/results/reliability-20261111-r4a-baseline.json`; it must not
+overwrite the R3 artifact. The v2 schema adds:
 
-The JSON records `git_head=34dcc79` and
-`working_tree_dirty_at_collection=true` because it was collected from the
-uncommitted reliability implementation. The artifact is retained honestly; its
-metadata was not rewritten after commit. Full per-configuration data and
-interpretation limits are in
-[`docs/reliability-evidence.md`](../docs/reliability-evidence.md).
+- measured-window deltas for successful WAL append, WAL data-fsync, and
+  `SYNC` persistence-path totals;
+- fixed WAL data-fsync latency buckets from 50 us through 100 ms plus an
+  overflow bucket;
+- per-round `wal_data_fsyncs_per_sync_mutation` and
+  `data_fsync_share_of_sync_mutation`;
+- explicit timing semantics and R4-A evidence metadata.
+
+The counters are diagnostic instruments for
+[ADR-005](../docs/decisions/005-group-commit.md), not a production SLO. They do
+not implement group commit, a writer thread, a queue, batching, or `BATCHED`.
+`max` fields are process-lifetime maxima and include preload/warm-up; mean
+fields use measured-window deltas. Fixed buckets bound cardinality but do not
+provide per-request traces or arbitrary quantiles.
+
+Run the v2 baseline from a clean source commit:
+
+~~~bash
+python3 bench/run_reliability_benchmark.py \
+  --kv build/release/app/minidb_kv_server \
+  --rounds 5 --duration-seconds 2 \
+  --dataset-keys 128 --value-size 64 \
+  --seed 20261111 \
+  --modes sync interval \
+  --clients 1 8 32 \
+  --workloads write mixed ttl
+~~~
 
 The benchmark reaches the repository's 32-connection cap on its largest
 configurations. That is a boundary observation, not evidence of scaling beyond

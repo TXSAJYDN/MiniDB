@@ -21,6 +21,19 @@ std::uint64_t steady_now_us() {
             .count());
 }
 
+void add_saturated(std::uint64_t* counter, std::uint64_t delta) {
+    const std::uint64_t maximum = std::numeric_limits<std::uint64_t>::max();
+    *counter = delta > maximum - *counter ? maximum : *counter + delta;
+}
+
+void observe_timing(std::uint64_t elapsed_us, std::uint64_t* total_us,
+                    std::uint64_t* maximum_us) {
+    add_saturated(total_us, elapsed_us);
+    if (elapsed_us > *maximum_us) {
+        *maximum_us = elapsed_us;
+    }
+}
+
 std::int64_t add_ttl_saturated(std::int64_t wall_now_ms, std::int64_t ttl_ms) {
     if (ttl_ms <= 0) {
         return 0;
@@ -123,7 +136,15 @@ MutationOutcome PersistenceManager::set(const std::string& key,
     if (value.size() > WalFormat::MAX_VALUE_SIZE) {
         return fail(MutationStatus::kResourceLimit, "value exceeds WAL limit");
     }
-    return set_impl(key, value);
+    const bool measure_sync = durability_mode_ == DurabilityMode::kSync;
+    const std::uint64_t started_us = measure_sync ? steady_now_us() : 0;
+    MutationOutcome outcome = set_impl(key, value);
+    if (measure_sync && outcome.ok()) {
+        observe_timing(steady_now_us() - started_us,
+                       &stats_.sync_mutation_total_us,
+                       &stats_.sync_mutation_max_us);
+    }
+    return outcome;
 }
 
 MutationOutcome PersistenceManager::del(const std::string& key) {
@@ -135,7 +156,15 @@ MutationOutcome PersistenceManager::del(const std::string& key) {
     if (key.empty() || key.size() > RdbFormat::MAX_KEY_SIZE) {
         return fail(MutationStatus::kInvalidArgument, "invalid key length");
     }
-    return del_impl(key);
+    const bool measure_sync = durability_mode_ == DurabilityMode::kSync;
+    const std::uint64_t started_us = measure_sync ? steady_now_us() : 0;
+    MutationOutcome outcome = del_impl(key);
+    if (measure_sync && outcome.ok()) {
+        observe_timing(steady_now_us() - started_us,
+                       &stats_.sync_mutation_total_us,
+                       &stats_.sync_mutation_max_us);
+    }
+    return outcome;
 }
 
 MutationOutcome PersistenceManager::expire(const std::string& key,
@@ -148,7 +177,15 @@ MutationOutcome PersistenceManager::expire(const std::string& key,
     if (key.empty() || key.size() > RdbFormat::MAX_KEY_SIZE) {
         return fail(MutationStatus::kInvalidArgument, "invalid key length");
     }
-    return expire_impl(key, ttl_ms);
+    const bool measure_sync = durability_mode_ == DurabilityMode::kSync;
+    const std::uint64_t started_us = measure_sync ? steady_now_us() : 0;
+    MutationOutcome outcome = expire_impl(key, ttl_ms);
+    if (measure_sync && outcome.ok()) {
+        observe_timing(steady_now_us() - started_us,
+                       &stats_.sync_mutation_total_us,
+                       &stats_.sync_mutation_max_us);
+    }
+    return outcome;
 }
 
 MutationOutcome PersistenceManager::set_impl(const std::string& key,

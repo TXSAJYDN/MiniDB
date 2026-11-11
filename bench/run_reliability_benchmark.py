@@ -266,6 +266,110 @@ def _median(values):
     return round(statistics.median(values), 6) if values else 0.0
 
 
+def _median_optional(values):
+    present = [value for value in values if value is not None]
+    return _median(present) if present else None
+
+
+def _delta(after, before):
+    if type(after) is not int or type(before) is not int or after < before:
+        raise RuntimeError(
+            f"STATS counter is not monotonic: {before!r} -> {after!r}")
+    return after - before
+
+
+def _ratio(numerator, denominator):
+    return round(numerator / denominator, 6) if denominator else None
+
+
+def _round_or_none(value):
+    return round(value, 3) if value is not None else None
+
+
+def _timing_metrics(stats_before, stats_after):
+    try:
+        before_timing = stats_before["timing"]
+        after_timing = stats_after["timing"]
+        before_wal = stats_before["wal"]
+        after_wal = stats_after["wal"]
+        before_persistence = stats_before["persistence"]
+        after_persistence = stats_after["persistence"]
+        before_bounds = before_timing["fsync_latency_bucket_bounds_us"]
+        bounds = after_timing["fsync_latency_bucket_bounds_us"]
+        before_counts = before_timing["fsync_latency_bucket_counts"]
+        after_counts = after_timing["fsync_latency_bucket_counts"]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError(
+            "STATS is missing R4-A timing metrics; rebuild the KV server") from error
+
+    if before_bounds != bounds:
+        raise RuntimeError("fsync bucket bounds changed during a round")
+    if (not isinstance(bounds, list) or not bounds or
+            any(type(value) is not int or value <= 0 for value in bounds) or
+            any(right <= left for left, right in zip(bounds, bounds[1:]))):
+        raise RuntimeError("fsync latency bucket bounds are invalid")
+    expected_count = len(bounds) + 1
+    for label, counts in (("before", before_counts), ("after", after_counts)):
+        if (not isinstance(counts, list) or len(counts) != expected_count or
+                any(type(value) is not int or value < 0 for value in counts)):
+            raise RuntimeError(
+                f"fsync latency bucket counts are invalid {label}: {counts!r}")
+    counts = [_delta(after, before)
+              for before, after in zip(before_counts, after_counts)]
+    appends = _delta(after_wal["appends"], before_wal["appends"])
+    fsyncs = _delta(after_wal["data_fsyncs"], before_wal["data_fsyncs"])
+    sync_mutations = _delta(
+        after_persistence["sync_mutations"],
+        before_persistence["sync_mutations"])
+    append_total_us = _delta(
+        after_timing["wal_append_total_us"],
+        before_timing["wal_append_total_us"])
+    data_fsync_total_us = _delta(
+        after_timing["wal_data_fsync_total_us"],
+        before_timing["wal_data_fsync_total_us"])
+    sync_mutation_total_us = _delta(
+        after_timing["sync_mutation_total_us"],
+        before_timing["sync_mutation_total_us"])
+
+    for label, total_name, max_name in (
+            ("WAL append", "wal_append_total_us", "wal_append_max_us"),
+            ("WAL data fsync", "wal_data_fsync_total_us",
+             "wal_data_fsync_max_us"),
+            ("SYNC mutation", "sync_mutation_total_us",
+             "sync_mutation_max_us")):
+        total = after_timing[total_name]
+        maximum = after_timing[max_name]
+        if type(total) is not int or type(maximum) is not int or total < maximum:
+            raise RuntimeError(
+                f"{label} timing counters are inconsistent: {total!r} < {maximum!r}")
+
+    if sum(counts) != fsyncs:
+        raise RuntimeError(
+            f"fsync buckets ({sum(counts)}) do not match data_fsyncs ({fsyncs})")
+
+    bucket_rows = [
+        {"upper_bound_us": bound, "count": count}
+        for bound, count in zip(bounds, counts[:-1])
+    ]
+    bucket_rows.append({"upper_bound_us": None, "count": counts[-1]})
+    return {
+        "wal_append_us_mean": _round_or_none(_ratio(append_total_us, appends)),
+        "wal_append_us_max_observed": after_timing["wal_append_max_us"],
+        "wal_data_fsync_us_mean": _round_or_none(
+            _ratio(data_fsync_total_us, fsyncs)),
+        "wal_data_fsync_us_max_observed":
+            after_timing["wal_data_fsync_max_us"],
+        "sync_mutation_us_mean": _round_or_none(
+            _ratio(sync_mutation_total_us, sync_mutations)),
+        "sync_mutation_us_max_observed":
+            after_timing["sync_mutation_max_us"],
+        "data_fsyncs_per_sync_mutation": _ratio(fsyncs, sync_mutations),
+        "data_fsync_share_of_sync_mutation": _ratio(
+            data_fsync_total_us, sync_mutation_total_us),
+        "fsync_latency_buckets": bucket_rows,
+    }
+
+
 def kill_hard(server):
     if server.proc.poll() is None:
         os.killpg(server.proc.pid, signal.SIGKILL)
@@ -347,15 +451,16 @@ def run_round(kv_binary, durability_mode, client_count, workload, dataset,
             raise RuntimeError(f"{tag} completed no successful requests")
 
         stats_after = read_stats(port)
-        wal_bytes = max(
-            0, stats_after["wal"]["bytes_written"] -
+        wal_bytes = _delta(
+            stats_after["wal"]["bytes_written"],
             stats_before["wal"]["bytes_written"])
-        fsyncs = max(
-            0, stats_after["wal"]["data_fsyncs"] -
+        fsyncs = _delta(
+            stats_after["wal"]["data_fsyncs"],
             stats_before["wal"]["data_fsyncs"])
-        interval_flushes = max(
-            0, stats_after["persistence"]["interval_flushes"] -
+        interval_flushes = _delta(
+            stats_after["persistence"]["interval_flushes"],
             stats_before["persistence"]["interval_flushes"])
+        timing = _timing_metrics(stats_before, stats_after)
         write_amplification = (
             wal_bytes / mutation_bytes if mutation_bytes else 0.0)
         clock_ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
@@ -385,6 +490,7 @@ def run_round(kv_binary, durability_mode, client_count, workload, dataset,
             "mutation_logical_bytes": mutation_bytes,
             "write_amplification": round(write_amplification, 6),
             "wal_bytes_at_kill": stats_after["wal_bytes"],
+            "timing": timing,
         }
 
         if durability_mode == "interval":
@@ -431,6 +537,20 @@ def run_round(kv_binary, durability_mode, client_count, workload, dataset,
             server.log_file.close()
 
 
+def _pool_buckets(rounds):
+    first = rounds[0]["timing"]["fsync_latency_buckets"]
+    bounds = [row["upper_bound_us"] for row in first]
+    counts = [0] * len(first)
+    for item in rounds:
+        rows = item["timing"]["fsync_latency_buckets"]
+        if [row["upper_bound_us"] for row in rows] != bounds:
+            raise RuntimeError("fsync latency bucket bounds differ between rounds")
+        for index, row in enumerate(rows):
+            counts[index] += row["count"]
+    return [{"upper_bound_us": bound, "count": count}
+            for bound, count in zip(bounds, counts)]
+
+
 def aggregate_configuration(mode, client_count, workload, rounds):
     pooled_latencies = []
     for item in rounds:
@@ -453,6 +573,7 @@ def aggregate_configuration(mode, client_count, workload, rounds):
             "server_rss_peak_kib": item["server_rss_peak_kib"],
             "wal_bytes": item["wal_bytes"],
             "wal_data_fsyncs": item["wal_data_fsyncs"],
+            "timing": item["timing"],
             "write_amplification": item["write_amplification"],
             "checkpoint_save_us": item["checkpoint_save_us"],
             "checkpoint_pause_us": item["checkpoint_pause_us"],
@@ -486,6 +607,28 @@ def aggregate_configuration(mode, client_count, workload, rounds):
         "wal_bytes_median": _median([item["wal_bytes"] for item in rounds]),
         "wal_data_fsyncs_median": _median(
             [item["wal_data_fsyncs"] for item in rounds]),
+        "wal_append_us_mean_median": _median_optional(
+            [item["timing"]["wal_append_us_mean"] for item in rounds]),
+        "wal_append_us_max_observed": max(
+            item["timing"]["wal_append_us_max_observed"]
+            for item in rounds),
+        "wal_data_fsync_us_mean_median": _median_optional(
+            [item["timing"]["wal_data_fsync_us_mean"] for item in rounds]),
+        "wal_data_fsync_us_max_observed": max(
+            item["timing"]["wal_data_fsync_us_max_observed"]
+            for item in rounds),
+        "sync_mutation_us_mean_median": _median_optional(
+            [item["timing"]["sync_mutation_us_mean"] for item in rounds]),
+        "sync_mutation_us_max_observed": max(
+            item["timing"]["sync_mutation_us_max_observed"]
+            for item in rounds),
+        "data_fsyncs_per_sync_mutation_median": _median_optional(
+            [item["timing"]["data_fsyncs_per_sync_mutation"]
+             for item in rounds]),
+        "data_fsync_share_of_sync_mutation_median": _median_optional(
+            [item["timing"]["data_fsync_share_of_sync_mutation"]
+             for item in rounds]),
+        "fsync_latency_buckets_pooled": _pool_buckets(rounds),
         "write_amplification_median": _median(
             [item["write_amplification"] for item in rounds]),
         "checkpoint_save_us_median": _median(
@@ -558,7 +701,7 @@ def parse_args():
     parser.add_argument("--workloads", nargs="+",
                         default=["write", "mixed", "ttl"])
     parser.add_argument("--out",
-                        default="bench/results/reliability-20261111.json")
+                        default="bench/results/reliability-20261111-r4a-baseline.json")
     return parser.parse_args()
 
 
@@ -604,7 +747,7 @@ def main():
                         mode, client_count, workload, rounds))
 
     output = {
-        "schema": "minidb-reliability-benchmark-v1",
+        "schema": "minidb-reliability-benchmark-v2",
         "generated_at": datetime.datetime.now(
             datetime.timezone.utc).isoformat(),
         "environment": environment_record(),
@@ -628,6 +771,20 @@ def main():
                 "SIGKILL after the measured round, then fresh-process startup to PING",
             "checkpoint_method":
                 "KV SAVE after recovery, measured client-side and via STATS checkpoint_pause_us",
+            "timing_method":
+                "STATS deltas measured with std::chrono::steady_clock; successes only",
+        },
+        "r4a_evidence": {
+            "status": "baseline instrumentation only; group commit is not implemented",
+            "adr": "docs/decisions/005-group-commit.md",
+            "timing_semantics": {
+                "wal_append": "write_all only; excludes encoding, rotation, and fsync",
+                "wal_data_fsync": "all successful WAL data fsyncs, including empty-segment creation",
+                "sync_mutation": "successful SYNC persistence path through in-memory apply; excludes network parsing/serialization",
+                "max_fields": "process-lifetime maxima at the end of a round; include preload/warm-up",
+                "mean_fields": "computed from measured-window counter and total-time deltas",
+                "fsync_buckets": "fixed 50 us through 100 ms upper bounds plus a greater-than-100 ms overflow bucket",
+            },
         },
         "limits": {
             "concurrent_connections_per_server": 32,
@@ -646,6 +803,10 @@ def main():
             "INTERVAL acknowledges after append and relies on a 100 ms timer or checkpoint/shutdown flush.",
             "Recovery is measured at one quiescent crash point after each round, not across every possible crash point.",
             "The compact artifact intentionally omits raw latency samples; per-round percentiles and variation are retained.",
+            "Timing counters are successful-operation cumulative values from steady_clock; they are diagnostic, not a production latency SLO.",
+            "Observed max timing fields are process-lifetime maxima including preload/warm-up; mean timing fields use measured-window deltas.",
+            "Fixed fsync buckets bound memory and cardinality but do not provide per-request traces or arbitrary quantiles.",
+            "This v2 artifact collects evidence for R4-A evaluation; it does not demonstrate that group commit is implemented or beneficial.",
         ],
         "configurations": configurations,
         "elapsed_wall_seconds": round(time.monotonic() - total_started, 3),
@@ -666,6 +827,14 @@ def main():
                 "errors": item["errors"],
                 "recovery_seconds_median":
                     item["recovery_seconds_median"],
+                "wal_append_us_mean_median":
+                    item["wal_append_us_mean_median"],
+                "wal_data_fsync_us_mean_median":
+                    item["wal_data_fsync_us_mean_median"],
+                "sync_mutation_us_mean_median":
+                    item["sync_mutation_us_mean_median"],
+                "data_fsync_share_of_sync_mutation_median":
+                    item["data_fsync_share_of_sync_mutation_median"],
             }
             for item in configurations
         ],

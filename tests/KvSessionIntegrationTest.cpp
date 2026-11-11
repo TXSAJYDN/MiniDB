@@ -338,19 +338,23 @@ class KvSessionIntegrationTest : public ::testing::Test {
 
 class KvPersistenceIntegrationTest : public ::testing::Test {
   protected:
-    void StartServer() {
+    void StartServer(std::shared_ptr<ClockInterface> clock = nullptr) {
         temp_dir_ = minidb_test::make_unique_temp_dir("minidb_kv_txn_");
         rdb_path_ = temp_dir_ + "/db.rdb";
         std::promise<uint16_t> ready;
         auto port = ready.get_future();
         server_thread_ =
-            std::thread([this, ready = std::move(ready)]() mutable {
+            std::thread([this, ready = std::move(ready),
+                         clock = std::move(clock)]() mutable {
                 bool published = false;
                 try {
                     EventLoop loop;
                     loop_pointer_.store(&loop);
                     KvServer server(&loop, InetAddress(0, true), rdb_path_,
                                     DurabilityMode::kSync);
+                    if (clock) {
+                        server.set_kv_store(std::make_shared<KvStore>(clock));
+                    }
                     if (!server.load_rdb()) {
                         throw std::runtime_error("failed to open persistence");
                     }
@@ -768,6 +772,39 @@ TEST_F(KvPersistenceIntegrationTest,
     ExpectType(Request(&client, KvProtocol::kSet, {"inside", "ok"}),
                KvProtocol::kOk);
     ExpectType(Request(&client, KvProtocol::kCommit), KvProtocol::kOk);
+    ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
+}
+
+TEST_F(KvPersistenceIntegrationTest, AgentGcTimerDeletesTerminalGroups) {
+    auto clock = std::make_shared<minidb_test::FrozenClock>(
+        1000, 1700000000000);
+    StartServer(clock);
+    KvClient client;
+    client.ConnectTo(port_);
+
+    ExpectType(Request(&client, KvProtocol::kAgent,
+                       {"SESSION_CREATE", "timer-session", "60000", "state",
+                        "timer-create"}),
+               KvProtocol::kValue);
+    ExpectType(Request(&client, KvProtocol::kAgent,
+                       {"TOOL_CREATE", "timer-session", "timer-tool", "tool",
+                        "request", "timer-tool-create"}),
+               KvProtocol::kValue);
+    ExpectType(Request(&client, KvProtocol::kAgent,
+                       {"SESSION_CLOSE", "timer-session", "2", "COMPLETED",
+                        "timer-close"}),
+               KvProtocol::kValue);
+
+    ASSERT_TRUE(WaitForAgent([](const AgentStateStore::Stats& stats) {
+        return stats.gc_runs >= 1u;
+    }));
+    const AgentStateStore::Stats stats =
+        persistence_manager_.load()->snapshot().agent;
+    EXPECT_EQ(stats.sessions_stored, 0u);
+    EXPECT_EQ(stats.tools_stored, 0u);
+    EXPECT_EQ(stats.gc_candidates, 1u);
+    EXPECT_EQ(stats.gc_deleted, 2u);
+    EXPECT_EQ(stats.gc_failures, 0u);
     ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
 }
 

@@ -94,6 +94,7 @@ class AgentRecordCodec {
         static constexpr std::int64_t kDefaultIdempotencyTtlMs =
             std::int64_t{24} * 60 * 60 * 1000;
         static constexpr std::size_t kMaxGcCandidates = 64;
+        static constexpr std::size_t kMaxGcTxnOps = 131;
     };
 
     static constexpr std::string_view kReservedPrefix{

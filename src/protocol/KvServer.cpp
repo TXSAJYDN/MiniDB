@@ -11,6 +11,7 @@ namespace minidb {
 namespace {
 
 constexpr std::int64_t kIntervalFlushMs = 100;
+constexpr std::int64_t kAgentGcIntervalMs = 1000;
 
 } // namespace
 
@@ -60,10 +61,18 @@ void KvServer::start() {
             interval_timer_id_ = loop_->run_every(
                 kIntervalFlushMs, [this]() { flush_interval(); });
         }
+        if (persistence_manager_ && persistence_manager_->opened()) {
+            agent_gc_timer_id_ = loop_->run_every(
+                kAgentGcIntervalMs, [this]() { run_agent_gc(); });
+        }
     } catch (...) {
         if (interval_timer_id_ != 0) {
             loop_->cancel_timer(interval_timer_id_);
             interval_timer_id_ = 0;
+        }
+        if (agent_gc_timer_id_ != 0) {
+            loop_->cancel_timer(agent_gc_timer_id_);
+            agent_gc_timer_id_ = 0;
         }
         scanner_lease_.reset();
         throw;
@@ -75,6 +84,10 @@ void KvServer::stop() {
     if (interval_timer_id_ != 0) {
         loop_->cancel_timer(interval_timer_id_);
         interval_timer_id_ = 0;
+    }
+    if (agent_gc_timer_id_ != 0) {
+        loop_->cancel_timer(agent_gc_timer_id_);
+        agent_gc_timer_id_ = 0;
     }
     if (shutdown_retry_timer_id_ != 0) {
         loop_->cancel_timer(shutdown_retry_timer_id_);
@@ -103,6 +116,10 @@ void KvServer::begin_shutdown(ShutdownCompletion completion) {
     if (interval_timer_id_ != 0) {
         loop_->cancel_timer(interval_timer_id_);
         interval_timer_id_ = 0;
+    }
+    if (agent_gc_timer_id_ != 0) {
+        loop_->cancel_timer(agent_gc_timer_id_);
+        agent_gc_timer_id_ = 0;
     }
     scanner_lease_.reset();
     server_.stop();
@@ -279,6 +296,23 @@ void KvServer::flush_interval() {
             Log::Error("INTERVAL WAL flush could not be scheduled: " + error);
             begin_shutdown();
         }
+    }
+}
+
+void KvServer::run_agent_gc() {
+    if (shutdown_started_ || shutdown_complete_ || !persistence_manager_) {
+        return;
+    }
+    std::string error;
+    if (persistence_manager_->agent_gc_async(&error)) {
+        return;
+    }
+    const bool retryable = error.find("control operation") != std::string::npos ||
+                           error.find("in progress") != std::string::npos;
+    if (!retryable) {
+        Log::Error("Agent GC failed; stopping fail-closed: " +
+                   (error.empty() ? std::string("unknown error") : error));
+        begin_shutdown();
     }
 }
 

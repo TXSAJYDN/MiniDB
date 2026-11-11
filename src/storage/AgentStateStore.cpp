@@ -2377,9 +2377,6 @@ AgentStateStore::collect_gc_candidates() const {
               [](const GcCandidate& left, const GcCandidate& right) {
                   return left.keys.front() < right.keys.front();
               });
-    if (candidates.size() > C::Limits::kMaxGcCandidates) {
-        candidates.resize(C::Limits::kMaxGcCandidates);
-    }
     return candidates;
 }
 

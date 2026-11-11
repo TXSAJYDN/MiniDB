@@ -179,8 +179,9 @@ class AgentStateStore {
                          std::string* error = nullptr);
     void cancel_reservation(std::uint64_t reservation_id) noexcept;
 
-    // Returns at most 64 deterministic candidate groups. Callers must skip
-    // groups that conflict with pending keys.
+    // Returns deterministic candidate groups ordered by their first key.
+    // Selection and the 64-group batch bound live in PersistenceManager so a
+    // pending or oversized group cannot starve later groups.
     std::vector<GcCandidate> collect_gc_candidates() const;
 
     void note_gc_success(std::size_t candidates, std::size_t deleted_keys,

@@ -1319,6 +1319,95 @@ std::optional<AgentResult> mutate_agent_and_wait(PersistenceManager* manager,
     return result;
 }
 
+bool create_terminal_session_group(PersistenceManager* manager, OwnerPump* pump,
+                                   const std::string& session_id,
+                                   std::size_t tool_count) {
+    std::string error;
+    AgentRequest request;
+    if (!parse_agent_request(
+            "SESSION_CREATE",
+            {session_id, "60000", "ready", "create-" + session_id}, &request,
+            &error)) {
+        ADD_FAILURE() << error;
+        return false;
+    }
+    const auto created = mutate_agent_and_wait(manager, pump, request);
+    if (!created.has_value() ||
+        created->status != AgentRequestStatus::kCompleted) {
+        ADD_FAILURE() << (created.has_value() ? created->error
+                                              : "create was not admitted");
+        return false;
+    }
+    AgentRecordCodec::Response create_response;
+    if (!AgentRecordCodec::decode_response(created->encoded_response,
+                                           &create_response, &error) ||
+        create_response.status !=
+            static_cast<std::uint8_t>(
+                AgentRecordCodec::ResponseStatus::kCreated)) {
+        ADD_FAILURE() << "unexpected create response: " << error;
+        return false;
+    }
+
+    for (std::size_t index = 0; index < tool_count; ++index) {
+        std::string tool_id = "t";
+        const std::string digits = std::to_string(index);
+        tool_id.append(3 - std::min<std::size_t>(3, digits.size()), '0');
+        tool_id += digits;
+        if (!parse_agent_request("TOOL_CREATE",
+                                 {session_id, tool_id, "tool", "request",
+                                  "tool-" + session_id + "-" + digits},
+                                 &request, &error)) {
+            ADD_FAILURE() << error;
+            return false;
+        }
+        const auto tool = mutate_agent_and_wait(manager, pump, request);
+        if (!tool.has_value() ||
+            tool->status != AgentRequestStatus::kCompleted) {
+            ADD_FAILURE() << (tool.has_value()
+                                  ? tool->error
+                                  : "tool create was not admitted");
+            return false;
+        }
+        AgentRecordCodec::Response tool_response;
+        if (!AgentRecordCodec::decode_response(tool->encoded_response,
+                                               &tool_response, &error) ||
+            tool_response.status !=
+                static_cast<std::uint8_t>(
+                    AgentRecordCodec::ResponseStatus::kCreated)) {
+            ADD_FAILURE() << "unexpected tool response: " << error;
+            return false;
+        }
+    }
+
+    const std::string close_revision = std::to_string(1 + tool_count);
+    if (!parse_agent_request(
+            "SESSION_CLOSE",
+            {session_id, close_revision, "COMPLETED", "close-" + session_id},
+            &request, &error)) {
+        ADD_FAILURE() << error;
+        return false;
+    }
+    const auto closed = mutate_agent_and_wait(manager, pump, request);
+    if (!closed.has_value() ||
+        closed->status != AgentRequestStatus::kCompleted) {
+        ADD_FAILURE() << (closed.has_value() ? closed->error
+                                             : "close was not admitted");
+        return false;
+    }
+    AgentRecordCodec::Response close_response;
+    if (!AgentRecordCodec::decode_response(closed->encoded_response,
+                                           &close_response, &error) ||
+        close_response.status !=
+            static_cast<std::uint8_t>(AgentRecordCodec::ResponseStatus::kOk)) {
+        ADD_FAILURE() << "unexpected close response status="
+                      << static_cast<unsigned>(close_response.status)
+                      << " error=" << error
+                      << " manager failure=" << manager->failed();
+        return false;
+    }
+    return true;
+}
+
 TEST(PersistenceManagerTest,
      TransactionsProvideSnapshotIsolationRepeatableReadAndReadYourWrites) {
     DatabasePaths paths("minidb_transaction_isolation_");
@@ -2105,6 +2194,253 @@ TEST(PersistenceManagerTest, AgentSnapshotStatsComeFromOneCommittedPoint) {
     EXPECT_EQ(snapshot.agent.logical_bytes_max,
               AgentRecordCodec::Limits::kMaxLogicalBytes);
     EXPECT_GE(snapshot.agent.gc_total_us, snapshot.agent.gc_max_us);
+}
+
+TEST(PersistenceManagerTest,
+     AgentGcDeletesSessionAnd128ToolsInOneBoundedTransaction) {
+    DatabasePaths paths("minidb_agent_pm_gc_128_tools_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    ASSERT_TRUE(create_terminal_session_group(
+        &manager, &pump, "s1", AgentRecordCodec::Limits::kMaxToolsPerSession));
+    const PersistenceSnapshot before = manager.snapshot();
+    ASSERT_EQ(before.agent.sessions_stored, 1u);
+    ASSERT_EQ(before.agent.tools_stored,
+              AgentRecordCodec::Limits::kMaxToolsPerSession);
+    ASSERT_EQ(before.agent.idempotency_stored, 130u);
+
+    ASSERT_TRUE(manager.agent_gc_async(&error)) << error;
+    ASSERT_TRUE(pump.RunUntil(
+        [&]() { return manager.snapshot().agent.gc_runs == 1u; }));
+
+    const PersistenceSnapshot after = manager.snapshot();
+    EXPECT_EQ(after.agent.gc_runs, 1u);
+    EXPECT_EQ(after.agent.gc_candidates, 1u);
+    EXPECT_EQ(after.agent.gc_deleted,
+              1u + AgentRecordCodec::Limits::kMaxToolsPerSession);
+    EXPECT_EQ(after.agent.gc_failures, 0u);
+    EXPECT_EQ(after.agent.sessions_stored, 0u);
+    EXPECT_EQ(after.agent.tools_stored, 0u);
+    EXPECT_EQ(after.agent.idempotency_stored, before.agent.idempotency_stored);
+
+    std::string session_key;
+    ASSERT_TRUE(AgentRecordCodec::session_key("s1", &session_key, &error))
+        << error;
+    EXPECT_FALSE(store->get(session_key).has_value());
+    for (std::size_t index = 0;
+         index < AgentRecordCodec::Limits::kMaxToolsPerSession; ++index) {
+        std::string tool_id = "t";
+        const std::string digits = std::to_string(index);
+        tool_id.append(3 - std::min<std::size_t>(3, digits.size()), '0');
+        tool_id += digits;
+        std::string tool_key;
+        ASSERT_TRUE(
+            AgentRecordCodec::tool_key("s1", tool_id, &tool_key, &error))
+            << error;
+        EXPECT_FALSE(store->get(tool_key).has_value()) << tool_id;
+    }
+    EXPECT_TRUE(store->get(AgentRecordCodec::marker_key()).has_value());
+}
+
+TEST(PersistenceManagerTest,
+     AgentGcNeverSplitsASessionGroupAcrossTransactions) {
+    DatabasePaths paths("minidb_agent_pm_gc_group_limit_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    ASSERT_TRUE(create_terminal_session_group(
+        &manager, &pump, "a", AgentRecordCodec::Limits::kMaxToolsPerSession));
+    ASSERT_TRUE(create_terminal_session_group(&manager, &pump, "b", 2));
+
+    ASSERT_TRUE(manager.agent_gc_async(&error)) << error;
+    const bool first_gc_ran =
+        pump.RunUntil([&]() { return manager.snapshot().agent.gc_runs == 1u; });
+    PersistenceSnapshot snapshot = manager.snapshot();
+    ASSERT_TRUE(first_gc_ran)
+        << "runs=" << snapshot.agent.gc_runs
+        << " candidates=" << snapshot.agent.gc_candidates
+        << " deleted=" << snapshot.agent.gc_deleted
+        << " failures=" << snapshot.agent.gc_failures
+        << " sessions_live=" << snapshot.agent.sessions_live
+        << " wal_appends=" << snapshot.wal.appends
+        << " manager_failed=" << manager.failed();
+    EXPECT_EQ(snapshot.agent.gc_candidates, 1u);
+    EXPECT_EQ(snapshot.agent.gc_deleted, 129u);
+    EXPECT_EQ(snapshot.agent.sessions_stored, 1u);
+    EXPECT_EQ(snapshot.agent.tools_stored, 2u);
+
+    std::string session_key;
+    std::string tool_key;
+    ASSERT_TRUE(AgentRecordCodec::session_key("b", &session_key, &error))
+        << error;
+    ASSERT_TRUE(AgentRecordCodec::tool_key("b", "t000", &tool_key, &error))
+        << error;
+    EXPECT_TRUE(store->get(session_key).has_value());
+    EXPECT_TRUE(store->get(tool_key).has_value());
+
+    ASSERT_TRUE(manager.agent_gc_async(&error)) << error;
+    ASSERT_TRUE(pump.RunUntil(
+        [&]() { return manager.snapshot().agent.gc_runs == 2u; }));
+    snapshot = manager.snapshot();
+    EXPECT_EQ(snapshot.agent.gc_candidates, 2u);
+    EXPECT_EQ(snapshot.agent.gc_deleted, 132u);
+    EXPECT_EQ(snapshot.agent.sessions_stored, 0u);
+    EXPECT_EQ(snapshot.agent.tools_stored, 0u);
+    EXPECT_FALSE(store->get(session_key).has_value());
+    EXPECT_FALSE(store->get(tool_key).has_value());
+}
+
+TEST(PersistenceManagerTest, AgentGcSkipsPendingGroupsWithoutLosingCandidates) {
+    DatabasePaths paths("minidb_agent_pm_gc_pending_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    AgentRequest create_record;
+    ASSERT_TRUE(parse_agent_request(
+        "RECORD_CAS", {"r1", "0", "value-1", "gc-pending", "60000"},
+        &create_record, &error))
+        << error;
+    const auto created = mutate_agent_and_wait(&manager, &pump, create_record);
+    ASSERT_TRUE(created.has_value());
+    ASSERT_EQ(created->status, AgentRequestStatus::kCompleted)
+        << created->error;
+
+    ASSERT_TRUE(create_terminal_session_group(&manager, &pump, "s1", 1));
+    clock->advance(60000);
+
+    AgentRequest update_record;
+    ASSERT_TRUE(parse_agent_request(
+        "RECORD_CAS", {"r1", "1", "value-2", "gc-pending", "60000"},
+        &update_record, &error))
+        << error;
+
+    bool update_done = false;
+    AgentResult update_result;
+    const AgentResult update_admission =
+        manager.agent_mutate_async(update_record, [&](AgentResult result) {
+            update_result = std::move(result);
+            update_done = true;
+        });
+    ASSERT_EQ(update_admission.status, AgentRequestStatus::kAccepted)
+        << update_admission.error;
+    ASSERT_FALSE(update_done);
+    ASSERT_EQ(manager.snapshot().agent.gc_runs, 0u);
+
+    // The expired idempotency key from the first record write is now pending
+    // again for the record update. GC must skip that group without starving
+    // the independently removable terminal session group.
+    ASSERT_TRUE(manager.agent_gc_async(&error)) << error;
+    const bool completed = pump.RunUntil([&]() {
+        return update_done && manager.snapshot().agent.gc_runs == 1u;
+    });
+    const PersistenceSnapshot snapshot = manager.snapshot();
+    ASSERT_TRUE(completed) << "update_done=" << update_done
+                           << " runs=" << snapshot.agent.gc_runs
+                           << " candidates=" << snapshot.agent.gc_candidates
+                           << " deleted=" << snapshot.agent.gc_deleted
+                           << " failures=" << snapshot.agent.gc_failures
+                           << " sessions_live=" << snapshot.agent.sessions_live
+                           << " manager_failed=" << manager.failed();
+
+    ASSERT_EQ(update_result.status, AgentRequestStatus::kCompleted)
+        << update_result.error;
+    AgentRecordCodec::Response update_response;
+    ASSERT_TRUE(AgentRecordCodec::decode_response(
+        update_result.encoded_response, &update_response, &error))
+        << error;
+    EXPECT_EQ(update_response.status,
+              static_cast<std::uint8_t>(AgentRecordCodec::ResponseStatus::kOk));
+    EXPECT_EQ(update_response.revision, 2u);
+
+    EXPECT_EQ(snapshot.agent.gc_runs, 1u);
+    EXPECT_EQ(snapshot.agent.gc_candidates, 1u);
+    EXPECT_EQ(snapshot.agent.gc_deleted, 2u);
+    EXPECT_EQ(snapshot.agent.gc_failures, 0u);
+    EXPECT_EQ(snapshot.agent.sessions_stored, 0u);
+    EXPECT_EQ(snapshot.agent.tools_stored, 0u);
+
+    std::string session_key;
+    std::string tool_key;
+    std::string generic_key;
+    std::string idempotency_key;
+    ASSERT_TRUE(AgentRecordCodec::session_key("s1", &session_key, &error))
+        << error;
+    ASSERT_TRUE(AgentRecordCodec::tool_key("s1", "t000", &tool_key, &error))
+        << error;
+    ASSERT_TRUE(AgentRecordCodec::generic_key("r1", &generic_key, &error))
+        << error;
+    ASSERT_TRUE(AgentRecordCodec::idempotency_key("gc-pending",
+                                                  &idempotency_key, &error))
+        << error;
+    EXPECT_FALSE(store->get(session_key).has_value());
+    EXPECT_FALSE(store->get(tool_key).has_value());
+    EXPECT_TRUE(store->get(generic_key).has_value());
+    EXPECT_TRUE(store->get(idempotency_key).has_value());
+}
+
+TEST(PersistenceManagerTest, AgentGcIsSuppressedDuringShutdown) {
+    DatabasePaths paths("minidb_agent_pm_gc_shutdown_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    ASSERT_TRUE(create_terminal_session_group(&manager, &pump, "s1", 1));
+    const PersistenceSnapshot before = manager.snapshot();
+
+    bool shutdown_done = false;
+    RdbSaveResult shutdown_result = RdbSaveResult::Failed;
+    std::string shutdown_error;
+    ASSERT_TRUE(manager.shutdown_async(
+        [&](RdbSaveResult result, const std::string& completion_error) {
+            shutdown_result = result;
+            shutdown_error = completion_error;
+            shutdown_done = true;
+        },
+        &error))
+        << error;
+
+    // Once shutdown has been admitted, a timer tick must become a no-op rather
+    // than racing the final checkpoint or deleting state after it is captured.
+    ASSERT_TRUE(manager.agent_gc_async(&error)) << error;
+    ASSERT_TRUE(pump.RunUntil([&]() { return shutdown_done; }));
+    ASSERT_EQ(shutdown_result, RdbSaveResult::Ok) << shutdown_error;
+
+    const PersistenceSnapshot after = manager.snapshot();
+    EXPECT_EQ(after.agent.gc_runs, before.agent.gc_runs);
+    EXPECT_EQ(after.agent.gc_candidates, before.agent.gc_candidates);
+    EXPECT_EQ(after.agent.gc_deleted, before.agent.gc_deleted);
+    EXPECT_EQ(after.agent.gc_failures, before.agent.gc_failures);
+    EXPECT_EQ(after.agent.sessions_stored, 1u);
+    EXPECT_EQ(after.agent.tools_stored, 1u);
+
+    std::string session_key;
+    ASSERT_TRUE(AgentRecordCodec::session_key("s1", &session_key, &error))
+        << error;
+    EXPECT_TRUE(store->get(session_key).has_value());
 }
 
 } // namespace

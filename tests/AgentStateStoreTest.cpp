@@ -4,6 +4,7 @@
 #include "../src/storage/AgentRecordCodec.h"
 #include "../src/storage/KvStore.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <gtest/gtest.h>
@@ -426,6 +427,37 @@ TEST_F(AgentStateStoreTest, GcCandidateDeletesToolsBeforeSessionAndIsBounded) {
     ASSERT_TRUE(C::tool_key("s1", "t1", &tool_key, &error));
     EXPECT_EQ(candidates.front().keys.back(), session_key);
     EXPECT_EQ(candidates.front().keys.front(), tool_key);
+}
+
+TEST_F(AgentStateStoreTest, GcCollectsAllCandidatesBeyondOneBatch) {
+    C::Response response;
+    std::string error;
+    constexpr std::size_t kSessions = 65;
+    for (std::size_t index = 0; index < kSessions; ++index) {
+        std::string session_id = "s";
+        const std::string digits = std::to_string(index);
+        session_id.append(3 - std::min<std::size_t>(3, digits.size()), '0');
+        session_id += digits;
+        ASSERT_TRUE(mutate({"SESSION_CREATE", session_id, "60000", "state",
+                            "create-" + session_id},
+                           &response, &error))
+            << error;
+        ASSERT_TRUE(mutate({"SESSION_CLOSE", session_id, "1", "COMPLETED",
+                            "close-" + session_id},
+                           &response, &error))
+            << error;
+        ASSERT_EQ(response.status,
+                  static_cast<std::uint8_t>(C::ResponseStatus::kOk));
+    }
+
+    const auto candidates = state_->collect_gc_candidates();
+    ASSERT_EQ(candidates.size(), kSessions);
+    EXPECT_TRUE(std::is_sorted(candidates.begin(), candidates.end(),
+                               [](const AgentStateStore::GcCandidate& left,
+                                  const AgentStateStore::GcCandidate& right) {
+                                   return left.keys.front() <
+                                          right.keys.front();
+                               }));
 }
 
 } // namespace

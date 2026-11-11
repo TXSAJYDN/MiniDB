@@ -61,6 +61,7 @@ class KvServer {
     void on_connection(const TcpConnectionPtr& conn);
     void on_message(const TcpConnectionPtr& conn, Buffer* buf);
     void flush_interval();
+    void run_agent_gc();
     void try_start_persistence_shutdown();
     void finish_shutdown(RdbSaveResult result, const std::string& error);
 
@@ -71,6 +72,7 @@ class KvServer {
     DurabilityMode durability_mode_;
     std::unique_ptr<PersistenceManager> persistence_manager_;
     std::uint64_t interval_timer_id_ = 0;
+    std::uint64_t agent_gc_timer_id_ = 0;
     KvStore::ScannerLease scanner_lease_;
     bool started_ = false;
     bool shutdown_started_ = false;

@@ -6,6 +6,7 @@
 #include "../src/protocol/KvProtocol.h"
 #include "../src/protocol/KvServer.h"
 #include "../src/protocol/KvSession.h"
+#include "../src/storage/AgentRecordCodec.h"
 #include "../src/storage/KvStore.h"
 #include "RdbTestUtil.h"
 
@@ -432,6 +433,20 @@ class KvPersistenceIntegrationTest : public ::testing::Test {
         return false;
     }
 
+    bool WaitForAgent(
+        const std::function<bool(const AgentStateStore::Stats&)>& predicate,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            PersistenceManager* manager = persistence_manager_.load();
+            if (manager != nullptr && predicate(manager->snapshot().agent)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+
     std::thread server_thread_;
     std::atomic<EventLoop*> loop_pointer_{nullptr};
     std::atomic<KvServer*> server_pointer_{nullptr};
@@ -614,6 +629,189 @@ TEST_F(KvPersistenceIntegrationTest,
         }
     }
     EXPECT_EQ(visible, std::optional<std::string>("yes"));
+}
+
+TEST_F(KvPersistenceIntegrationTest,
+       AgentCreateGetAndIdempotentReplayUseMdOrEnvelopes) {
+    StartServer();
+    KvClient client;
+    client.ConnectTo(port_);
+
+    const std::vector<std::string> create_args = {
+        "SESSION_CREATE", "s1", "60000", "working", "create-s1"};
+    const auto created = Request(&client, KvProtocol::kAgent, create_args);
+    ExpectType(created, KvProtocol::kValue);
+    ASSERT_EQ(created.args.size(), 1u);
+
+    AgentRecordCodec::Response create_response;
+    std::string error;
+    ASSERT_TRUE(AgentRecordCodec::decode_response(created.args[0],
+                                                  &create_response, &error))
+        << error;
+    EXPECT_EQ(
+        create_response.status,
+        static_cast<std::uint8_t>(AgentRecordCodec::ResponseStatus::kCreated));
+    EXPECT_EQ(create_response.revision, 1u);
+    EXPECT_EQ(create_response.fence, 0u);
+    EXPECT_NE(create_response.lsn, 0u);
+
+    PersistenceManager* manager = persistence_manager_.load();
+    ASSERT_NE(manager, nullptr);
+    const std::uint64_t create_lsn = manager->snapshot().last_lsn;
+    EXPECT_EQ(create_response.lsn, create_lsn);
+
+    const auto fetched =
+        Request(&client, KvProtocol::kAgent, {"SESSION_GET", "s1"});
+    ExpectType(fetched, KvProtocol::kValue);
+    ASSERT_EQ(fetched.args.size(), 1u);
+    AgentRecordCodec::Response get_response;
+    ASSERT_TRUE(AgentRecordCodec::decode_response(fetched.args[0],
+                                                  &get_response, &error))
+        << error;
+    EXPECT_EQ(get_response.status,
+              static_cast<std::uint8_t>(AgentRecordCodec::ResponseStatus::kOk));
+    EXPECT_EQ(get_response.revision, 1u);
+    EXPECT_EQ(get_response.lsn, 0u);
+    EXPECT_FALSE(get_response.payload.empty());
+
+    std::string session_key;
+    ASSERT_TRUE(AgentRecordCodec::session_key("s1", &session_key, &error))
+        << error;
+    AgentRecordCodec::Record record;
+    ASSERT_TRUE(AgentRecordCodec::decode_typed_record(
+        session_key, get_response.payload, &record, nullptr, nullptr, nullptr,
+        &error))
+        << error;
+    EXPECT_EQ(record.type, AgentRecordCodec::RecordType::kSession);
+    EXPECT_EQ(record.status, static_cast<std::uint8_t>(
+                                 AgentRecordCodec::SessionStatus::kActive));
+    EXPECT_EQ(record.revision, 1u);
+
+    const auto replayed = Request(&client, KvProtocol::kAgent, create_args);
+    ExpectType(replayed, KvProtocol::kValue);
+    ASSERT_EQ(replayed.args.size(), 1u);
+    EXPECT_EQ(replayed.args[0], created.args[0]);
+    EXPECT_EQ(manager->snapshot().last_lsn, create_lsn);
+    EXPECT_TRUE(WaitForAgent([](const AgentStateStore::Stats& stats) {
+        return stats.idempotency_replays == 1u;
+    }));
+
+    const auto duplicate = Request(
+        &client, KvProtocol::kAgent,
+        {"SESSION_CREATE", "s1", "60000", "working", "create-s1-other"});
+    ExpectType(duplicate, KvProtocol::kValue);
+    ASSERT_EQ(duplicate.args.size(), 1u);
+    AgentRecordCodec::Response duplicate_response;
+    ASSERT_TRUE(AgentRecordCodec::decode_response(duplicate.args[0],
+                                                  &duplicate_response, &error))
+        << error;
+    EXPECT_EQ(duplicate_response.status,
+              static_cast<std::uint8_t>(
+                  AgentRecordCodec::ResponseStatus::kAlreadyExists));
+    EXPECT_EQ(manager->snapshot().last_lsn, create_lsn);
+
+    ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
+}
+
+TEST_F(KvPersistenceIntegrationTest,
+       AgentDisconnectCompletionIsSafeAndReplayStillSucceeds) {
+    StartServer();
+    const std::vector<std::string> create_args = {
+        "SESSION_CREATE", "crash-session", "60000", "working",
+        "create-after-disconnect"};
+    {
+        KvClient disconnected;
+        disconnected.ConnectTo(port_);
+        disconnected.SendFrame(Frame(KvProtocol::kAgent, create_args));
+    }
+
+    ASSERT_TRUE(WaitForAgent([](const AgentStateStore::Stats& stats) {
+        return stats.sessions_created == 1u;
+    }));
+
+    KvClient replay;
+    replay.ConnectTo(port_);
+    const auto response = Request(&replay, KvProtocol::kAgent, create_args);
+    ExpectType(response, KvProtocol::kValue);
+    ASSERT_EQ(response.args.size(), 1u);
+    AgentRecordCodec::Response decoded;
+    std::string error;
+    ASSERT_TRUE(
+        AgentRecordCodec::decode_response(response.args[0], &decoded, &error))
+        << error;
+    EXPECT_EQ(decoded.status, static_cast<std::uint8_t>(
+                                  AgentRecordCodec::ResponseStatus::kCreated));
+    EXPECT_NE(decoded.lsn, 0u);
+    ExpectType(Request(&replay, KvProtocol::kPing), KvProtocol::kOk);
+}
+
+TEST_F(KvPersistenceIntegrationTest,
+       AgentValidationErrorsAndTransactionIsolationKeepConnectionUsable) {
+    StartServer();
+    KvClient client;
+    client.ConnectTo(port_);
+
+    ExpectType(Request(&client, KvProtocol::kAgent), KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kAgent, {"UNKNOWN"}),
+               KvProtocol::kError);
+    ExpectType(
+        Request(&client, KvProtocol::kAgent,
+                {"SESSION_CREATE", "s1", "not-a-number", "state", "idem"}),
+        KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kAgent, {"SESSION_GET"}),
+               KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
+
+    ASSERT_GT(Begin(&client), 0u);
+    ExpectType(Request(&client, KvProtocol::kAgent, {"SESSION_GET", "s1"}),
+               KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kSet, {"inside", "ok"}),
+               KvProtocol::kOk);
+    ExpectType(Request(&client, KvProtocol::kCommit), KvProtocol::kOk);
+    ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
+}
+
+TEST_F(KvPersistenceIntegrationTest,
+       ReservedAgentKeysAreRejectedOutsideAndInsideTransactions) {
+    StartServer();
+    KvClient client;
+    client.ConnectTo(port_);
+
+    const std::string reserved =
+        std::string(AgentRecordCodec::kReservedPrefix) + "m";
+    const std::vector<
+        std::pair<KvProtocol::CommandType, std::vector<std::string>>>
+        reserved_commands = {
+            {KvProtocol::kSet, {reserved, "value"}},
+            {KvProtocol::kGet, {reserved}},
+            {KvProtocol::kDel, {reserved}},
+            {KvProtocol::kExpire, {reserved, "1000"}},
+            {KvProtocol::kTtl, {reserved}},
+        };
+
+    for (const auto& [command, args] : reserved_commands) {
+        const auto response = Request(&client, command, args);
+        ExpectType(response, KvProtocol::kError);
+        ASSERT_EQ(response.args.size(), 1u);
+        EXPECT_NE(response.args[0].find("reserved"), std::string::npos);
+    }
+    ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
+
+    ASSERT_GT(Begin(&client), 0u);
+    for (const auto& [command, args] : reserved_commands) {
+        const auto response = Request(&client, command, args);
+        ExpectType(response, KvProtocol::kError);
+        ASSERT_EQ(response.args.size(), 1u);
+        EXPECT_NE(response.args[0].find("reserved"), std::string::npos);
+    }
+    ExpectType(Request(&client, KvProtocol::kSet, {"ordinary", "kept"}),
+               KvProtocol::kOk);
+    ExpectType(Request(&client, KvProtocol::kCommit), KvProtocol::kOk);
+
+    const auto value = Request(&client, KvProtocol::kGet, {"ordinary"});
+    ExpectType(value, KvProtocol::kValue);
+    ASSERT_EQ(value.args.size(), 1u);
+    EXPECT_EQ(value.args[0], "kept");
 }
 
 TEST_F(KvSessionIntegrationTest, TransactionCommandsReportUnavailable) {

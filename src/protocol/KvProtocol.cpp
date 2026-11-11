@@ -123,6 +123,8 @@ std::string KvProtocol::command_type_to_string(uint8_t type) {
         return "COMMIT";
     case kRollback:
         return "ROLLBACK";
+    case kAgent:
+        return "AGENT";
     case kOk:
         return "OK";
     case kError:

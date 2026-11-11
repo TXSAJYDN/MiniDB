@@ -25,6 +25,7 @@ class KvProtocol {
         kBegin = 9,
         kCommit = 10,
         kRollback = 11,
+        kAgent = 12,
         kError = 100,
         kOk = 101,
         kValue = 102,

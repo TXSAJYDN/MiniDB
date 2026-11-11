@@ -122,6 +122,12 @@ bool KvSession::validate_key(const std::string& key, const char* command) {
                       {std::string(command) + " key must be 1..1024 bytes"});
         return false;
     }
+    if (AgentRecordCodec::is_reserved_key(key)) {
+        send_response(
+            KvProtocol::kError,
+            {std::string(command) + " key is in the reserved agent namespace"});
+        return false;
+    }
     return true;
 }
 
@@ -368,6 +374,63 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
         return send_response(KvProtocol::kOk, {});
     }
 
+    case KvProtocol::kAgent: {
+        if (cmd.args.empty()) {
+            send_response(KvProtocol::kError,
+                          {"AGENT requires at least one argument"});
+            return true;
+        }
+        if (active_txn_id_ != 0) {
+            send_response(
+                KvProtocol::kError,
+                {"AGENT is unavailable inside an explicit transaction"});
+            return true;
+        }
+        if (!persistence_manager_) {
+            send_response(KvProtocol::kError, {"AGENT is unavailable"});
+            return true;
+        }
+        const std::string& subcommand = cmd.args.front();
+        const std::vector<std::string> args(cmd.args.begin() + 1,
+                                            cmd.args.end());
+        AgentRequest request;
+        std::string parse_error;
+        if (!AgentStateStore::parse_request(subcommand, args, &request,
+                                            &parse_error)) {
+            send_response(
+                KvProtocol::kError,
+                {parse_error.empty() ? "Invalid AGENT request" : parse_error});
+            return true;
+        }
+        if (!AgentStateStore::is_mutation(request.command)) {
+            const AgentResult result =
+                persistence_manager_->agent_query(request);
+            if (result.status != AgentRequestStatus::kCompleted ||
+                result.encoded_response.empty()) {
+                send_agent_failure(result);
+                return true;
+            }
+            return send_response(KvProtocol::kValue, {result.encoded_response});
+        }
+        std::weak_ptr<KvSession> weak = weak_from_this();
+        const AgentResult admission = persistence_manager_->agent_mutate_async(
+            request, [weak](AgentResult result) {
+                if (auto self = weak.lock()) {
+                    self->on_agent_completed(std::move(result));
+                }
+            });
+        if (admission.status == AgentRequestStatus::kCompleted &&
+            !admission.encoded_response.empty()) {
+            return send_response(KvProtocol::kValue,
+                                 {admission.encoded_response});
+        }
+        if (admission.status != AgentRequestStatus::kAccepted) {
+            send_agent_failure(admission);
+            return true;
+        }
+        return true;
+    }
+
     case KvProtocol::kSave:
         if (!require_args(0, "SAVE takes no arguments")) {
             return true;
@@ -455,6 +518,18 @@ void KvSession::on_commit_completed(MutationOutcome outcome) {
     send_response(KvProtocol::kOk, {std::to_string(outcome.lsn)});
 }
 
+void KvSession::on_agent_completed(AgentResult result) {
+    if (closed_) {
+        return;
+    }
+    if (result.status != AgentRequestStatus::kCompleted ||
+        result.encoded_response.empty()) {
+        send_agent_failure(result);
+        return;
+    }
+    send_response(KvProtocol::kValue, {result.encoded_response});
+}
+
 bool KvSession::send_transaction_failure(MutationStatus status,
                                          const std::string& error) {
     // Resource and persistence failures abort the manager-side transaction.
@@ -540,6 +615,36 @@ void KvSession::send_mutation_failure(const MutationOutcome& outcome) {
         return;
     case MutationStatus::kIoError:
     case MutationStatus::kOk:
+        break;
+    }
+    send_response(KvProtocol::kError, {message});
+}
+
+void KvSession::send_agent_failure(const AgentResult& result) {
+    if (result.status == AgentRequestStatus::kConflict) {
+        send_response(KvProtocol::kConflict, {});
+        return;
+    }
+    std::string message = "Agent persistence request failed";
+    switch (result.status) {
+    case AgentRequestStatus::kInvalidArgument:
+        message = result.error.empty() ? "Invalid Agent request" : result.error;
+        break;
+    case AgentRequestStatus::kNotReady:
+        message = "Persistence is not accepting writes";
+        break;
+    case AgentRequestStatus::kShuttingDown:
+        message = "Persistence is shutting down";
+        break;
+    case AgentRequestStatus::kIoError:
+        message = "Agent persistence I/O failure";
+        break;
+    case AgentRequestStatus::kResourceLimit:
+        message = "Agent persistence resource limit exceeded";
+        break;
+    case AgentRequestStatus::kCompleted:
+    case AgentRequestStatus::kAccepted:
+    case AgentRequestStatus::kConflict:
         break;
     }
     send_response(KvProtocol::kError, {message});

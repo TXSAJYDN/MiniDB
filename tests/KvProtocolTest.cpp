@@ -198,6 +198,22 @@ TEST(KvProtocolTest, TransactionCommandCodesAndNamesAreFrozen) {
     }
 }
 
+TEST(KvProtocolTest, AgentCommandCodeNameAndFrameRoundTrip) {
+    EXPECT_EQ(static_cast<int>(KvProtocol::kAgent), 12);
+    EXPECT_EQ(KvProtocol::command_type_to_string(KvProtocol::kAgent), "AGENT");
+
+    const std::vector<std::string> args = {"SESSION_CREATE", "session-1",
+                                           "60000", "working", "create-1"};
+    const auto encoded = KvProtocol::encode_command(KvProtocol::kAgent, args);
+    KvProtocol::Command parsed;
+    ASSERT_EQ(
+        KvProtocol::parse_command(encoded.data(), encoded.size(), &parsed),
+        static_cast<int>(encoded.size()));
+    EXPECT_EQ(static_cast<int>(parsed.type),
+              static_cast<int>(KvProtocol::kAgent));
+    EXPECT_EQ(parsed.args, args);
+}
+
 TEST(KvProtocolTest, NullInputsAreRejected) {
     KvProtocol::Command parsed;
     const uint8_t byte = 0;

@@ -52,11 +52,13 @@ class KvSession : public std::enable_shared_from_this<KvSession> {
     void on_mutation_completed(MutationOutcome outcome,
                                KvProtocol::CommandType success_type);
     void on_commit_completed(MutationOutcome outcome);
+    void on_agent_completed(AgentResult result);
     void on_save_completed(RdbSaveResult result, const std::string& error);
     bool send_transaction_failure(MutationStatus status,
                                   const std::string& error);
     void send_mutation_failure(const MutationOutcome& outcome);
     void send_admission_failure(const MutationAdmission& admission);
+    void send_agent_failure(const AgentResult& result);
     void rollback_active_transaction();
     bool validate_key(const std::string& key, const char* command);
     bool send_response(KvProtocol::CommandType type,

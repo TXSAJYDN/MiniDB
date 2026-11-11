@@ -178,7 +178,37 @@ inline std::string persistence_stats_json(const PersistenceSnapshot& stats) {
         << ",\"needs_bootstrap\":"
         << (stats.recovery.needs_bootstrap ? "true" : "false")
         << ",\"manifest_present\":"
-        << (stats.recovery.manifest_present ? "true" : "false") << "}}";
+        << (stats.recovery.manifest_present ? "true" : "false")
+        << "},\"agent\":{\"sessions_stored\":" << stats.agent.sessions_stored
+        << ",\"sessions_live\":" << stats.agent.sessions_live
+        << ",\"sessions_created\":" << stats.agent.sessions_created
+        << ",\"sessions_completed\":" << stats.agent.sessions_completed
+        << ",\"sessions_failed\":" << stats.agent.sessions_failed
+        << ",\"sessions_cancelled\":" << stats.agent.sessions_cancelled
+        << ",\"sessions_purged\":" << stats.agent.sessions_purged
+        << ",\"tools_stored\":" << stats.agent.tools_stored
+        << ",\"tools_pending\":" << stats.agent.tools_pending
+        << ",\"tools_running\":" << stats.agent.tools_running
+        << ",\"tools_succeeded\":" << stats.agent.tools_succeeded
+        << ",\"tools_failed\":" << stats.agent.tools_failed
+        << ",\"tools_cancelled\":" << stats.agent.tools_cancelled
+        << ",\"records_stored\":" << stats.agent.records_stored
+        << ",\"idempotency_stored\":" << stats.agent.idempotency_stored
+        << ",\"logical_bytes\":" << stats.agent.logical_bytes
+        << ",\"logical_bytes_max\":" << stats.agent.logical_bytes_max
+        << ",\"idempotency_replays\":" << stats.agent.idempotency_replays
+        << ",\"idempotency_conflicts\":" << stats.agent.idempotency_conflicts
+        << ",\"revision_mismatches\":" << stats.agent.revision_mismatches
+        << ",\"lease_acquires\":" << stats.agent.lease_acquires
+        << ",\"lease_renews\":" << stats.agent.lease_renews
+        << ",\"lease_expiries\":" << stats.agent.lease_expiries
+        << ",\"fenced_rejections\":" << stats.agent.fenced_rejections
+        << ",\"gc_runs\":" << stats.agent.gc_runs
+        << ",\"gc_candidates\":" << stats.agent.gc_candidates
+        << ",\"gc_deleted\":" << stats.agent.gc_deleted
+        << ",\"gc_failures\":" << stats.agent.gc_failures
+        << ",\"gc_total_us\":" << stats.agent.gc_total_us
+        << ",\"gc_max_us\":" << stats.agent.gc_max_us << "}}";
     return out.str();
 }
 

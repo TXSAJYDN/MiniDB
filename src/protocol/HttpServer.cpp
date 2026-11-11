@@ -583,6 +583,10 @@ bool HttpServer::handle_kv(const HttpRequest& req, HttpResponse* resp,
         set_bad_request(resp, "KV key exceeds 1 KiB limit");
         return false;
     }
+    if (AgentRecordCodec::is_reserved_key(key)) {
+        set_bad_request(resp, "KV key is in the reserved agent namespace");
+        return false;
+    }
 
     if (req.method() == HttpRequest::kGet) {
         const auto value = kv_store_->get(key);

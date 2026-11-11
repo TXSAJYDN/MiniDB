@@ -35,6 +35,10 @@ HTTP_TTL = 6
 KV_DEL = 4
 KV_SAVE = 7
 KV_STATS = 8
+KV_BEGIN = 9
+KV_COMMIT = 10
+KV_ROLLBACK = 11
+KV_CONFLICT = 105
 
 
 class TestError(Exception):
@@ -456,7 +460,36 @@ def stats_for(protocol, port):
     return read_http_stats(port) if protocol == "http" else read_kv_stats(port)
 
 
+def check_transaction_contract(stats, label):
+    transactions = stats.get("transactions")
+    check(isinstance(transactions, dict),
+          f"{label} stats omitted transactions: {stats!r}")
+    required = (
+        "active", "started", "committed", "conflicted", "rolled_back",
+        "failed", "write_conflicts", "max_active", "versions_current",
+        "versions_max", "versions_reclaimed", "oldest_snapshot_lag_lsn",
+        "max_oldest_snapshot_lag_lsn", "commit_records", "commit_bytes",
+        "commit_total_us", "commit_max_us", "gc_total_us", "gc_max_us",
+    )
+    for name in required:
+        check(isinstance(transactions.get(name), int) and
+              transactions[name] >= 0,
+              f"{label} transaction field {name} is invalid: {stats!r}")
+    check(transactions["active"] <= transactions["max_active"],
+          f"{label} active transactions exceed max_active: {stats!r}")
+    check(transactions["versions_current"] <= transactions["versions_max"],
+          f"{label} current versions exceed versions_max: {stats!r}")
+    check(transactions["oldest_snapshot_lag_lsn"] <=
+          transactions["max_oldest_snapshot_lag_lsn"],
+          f"{label} snapshot lag exceeds its maximum: {stats!r}")
+    check(transactions["commit_total_us"] >= transactions["commit_max_us"],
+          f"{label} commit timing is inconsistent: {stats!r}")
+    check(transactions["gc_total_us"] >= transactions["gc_max_us"],
+          f"{label} GC timing is inconsistent: {stats!r}")
+
+
 def check_timing_contract(stats, label):
+    check_transaction_contract(stats, label)
     timing = stats.get("timing")
     check(isinstance(timing, dict), f"{label} stats omitted timing: {stats!r}")
     required = (
@@ -1661,6 +1694,224 @@ def test_http_disconnect_safety():
             server.cleanup()
 
 
+def connect_kv(port):
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    sock.settimeout(5.0)
+    return sock
+
+
+def kv_command(sock, command_type, args=()):
+    sock.sendall(kv_encode(command_type, args))
+    return kv_read_frame(sock)
+
+
+def test_transaction_contract():
+    with tempfile.TemporaryDirectory(
+            prefix="minidb-process-transactions-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "transactions.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, _ = kv_request(port, HTTP_SET, ["base", "before"])
+            check(command_type == 101,
+                  f"transaction setup SET returned {command_type}")
+            before = read_kv_stats(port)
+
+            writer = connect_kv(port)
+            reader = connect_kv(port)
+            try:
+                command_type, args = kv_command(writer, KV_BEGIN)
+                check(command_type == 101 and len(args) == 1,
+                      f"BEGIN returned type={command_type}, args={args!r}")
+                writer_id = int(args[0].decode("ascii"))
+                check(writer_id > 0, f"BEGIN returned invalid id {writer_id}")
+
+                command_type, _ = kv_command(writer, HTTP_SET, ["base", "tx1"])
+                check(command_type == 101,
+                      f"transaction SET returned {command_type}")
+                command_type, args = kv_command(writer, HTTP_GET, ["base"])
+                check(command_type == 102 and args == [b"tx1"],
+                      f"transaction did not read its own write: "
+                      f"type={command_type}, args={args!r}")
+
+                command_type, args = kv_command(reader, KV_BEGIN)
+                check(command_type == 101 and len(args) == 1,
+                      f"reader BEGIN returned type={command_type}, args={args!r}")
+                command_type, args = kv_command(reader, HTTP_GET, ["base"])
+                check(command_type == 102 and args == [b"before"],
+                      f"reader snapshot was not consistent: "
+                      f"type={command_type}, args={args!r}")
+
+                command_type, args = kv_command(writer, KV_COMMIT)
+                check(command_type == 101 and args and args[0] == b"2",
+                      f"COMMIT returned type={command_type}, args={args!r}")
+
+                command_type, args = kv_command(reader, HTTP_GET, ["base"])
+                check(command_type == 102 and args == [b"before"],
+                      f"repeatable read changed after commit: "
+                      f"type={command_type}, args={args!r}")
+                command_type, args = kv_command(reader, KV_COMMIT)
+                check(command_type == 101 and args == [b"0"],
+                      f"read-only COMMIT returned type={command_type}, "
+                      f"args={args!r}")
+
+                first = connect_kv(port)
+                second = connect_kv(port)
+                try:
+                    command_type, args = kv_command(first, KV_BEGIN)
+                    check(command_type == 101 and len(args) == 1,
+                          f"conflict BEGIN 1 returned {command_type}")
+                    command_type, args = kv_command(second, KV_BEGIN)
+                    check(command_type == 101 and len(args) == 1,
+                          f"conflict BEGIN 2 returned {command_type}")
+                    check(kv_command(first, HTTP_SET, ["race", "first"])[0] == 101,
+                          "first conflict write failed")
+                    check(kv_command(second, HTTP_SET, ["race", "second"])[0] == 101,
+                          "second conflict write failed")
+                    command_type, _ = kv_command(first, KV_COMMIT)
+                    check(command_type == 101,
+                          f"first conflict commit returned {command_type}")
+                    command_type, _ = kv_command(second, KV_COMMIT)
+                    check(command_type == KV_CONFLICT,
+                          f"second conflict commit returned {command_type}")
+                finally:
+                    first.close()
+                    second.close()
+
+                command_type, args = kv_command(reader, HTTP_GET, ["race"])
+                check(command_type == 102 and args == [b"first"],
+                      f"conflict winner is incorrect: "
+                      f"type={command_type}, args={args!r}")
+
+                rollback = connect_kv(port)
+                try:
+                    check(kv_command(rollback, KV_BEGIN)[0] == 101,
+                          "rollback BEGIN failed")
+                    check(kv_command(rollback, HTTP_SET,
+                                     ["rolled-back", "no"])[0] == 101,
+                          "rollback SET failed")
+                    check(kv_command(rollback, KV_ROLLBACK)[0] == 101,
+                          "ROLLBACK failed")
+                finally:
+                    rollback.close()
+                command_type, _ = kv_request(port, HTTP_GET, ["rolled-back"])
+                check(command_type == 103,
+                      f"rolled-back write became visible: {command_type}")
+
+                errors = connect_kv(port)
+                try:
+                    check(kv_command(errors, KV_COMMIT)[0] == 100,
+                          "COMMIT without a transaction was accepted")
+                    check(kv_command(errors, KV_ROLLBACK)[0] == 100,
+                          "ROLLBACK without a transaction was accepted")
+                    check(kv_command(errors, KV_BEGIN, ["unexpected"])[0] == 100,
+                          "BEGIN with an argument was accepted")
+                    command_type, args = kv_command(errors, KV_BEGIN)
+                    check(command_type == 101 and len(args) == 1,
+                          f"BEGIN after errors returned {command_type}")
+                    check(kv_command(errors, KV_BEGIN)[0] == 100,
+                          "nested BEGIN was accepted")
+                    check(kv_command(errors, HTTP_SET, ["only-one"])[0] == 100,
+                          "SET with invalid arity was accepted")
+                    check(kv_command(errors, HTTP_GET)[0] == 100,
+                          "GET with invalid arity was accepted")
+                    check(kv_command(errors, HTTP_SET,
+                                     ["kept", "value"])[0] == 101,
+                          "valid transaction SET failed")
+                    check(kv_command(errors, KV_COMMIT, ["unexpected"])[0] == 100,
+                          "COMMIT with an argument was accepted")
+                    command_type, _ = kv_command(errors, KV_COMMIT)
+                    check(command_type == 101,
+                          f"COMMIT after recoverable errors returned "
+                          f"{command_type}")
+                    command_type, args = kv_command(errors, HTTP_GET, ["kept"])
+                    check(command_type == 102 and args == [b"value"],
+                          f"transaction-state error discarded the write: "
+                          f"type={command_type}, args={args!r}")
+                    check(kv_command(errors, HTTP_PING)[0] == 101,
+                          "connection was unusable after transaction errors")
+                finally:
+                    errors.close()
+
+                abandoned = connect_kv(port)
+                try:
+                    check(kv_command(abandoned, KV_BEGIN)[0] == 101,
+                          "abandoned BEGIN failed")
+                    check(kv_command(abandoned, HTTP_SET,
+                                     ["abandoned", "no"])[0] == 101,
+                          "abandoned SET failed")
+                finally:
+                    abandoned.close()
+                wait_until(
+                    lambda: (read_kv_stats(port)["transactions"]["rolled_back"]
+                             >= before["transactions"]["rolled_back"] + 2),
+                    5.0,
+                    "disconnect did not roll back the active transaction",
+                )
+                command_type, _ = kv_request(port, HTTP_GET, ["abandoned"])
+                check(command_type == 103,
+                      f"disconnect-rollback write became visible: {command_type}")
+
+                committing = connect_kv(port)
+                try:
+                    check(kv_command(committing, KV_BEGIN)[0] == 101,
+                          "disconnect-commit BEGIN failed")
+                    check(kv_command(committing, HTTP_SET,
+                                     ["accepted", "yes"])[0] == 101,
+                          "disconnect-commit SET failed")
+                    committing.sendall(kv_encode(KV_COMMIT))
+                finally:
+                    committing.close()
+                wait_until(
+                    lambda: (read_kv_stats(port)["transactions"]["committed"]
+                             >= before["transactions"]["committed"] + 5),
+                    5.0,
+                    "accepted COMMIT did not complete after disconnect",
+                )
+                wait_until(
+                    lambda: kv_request(port, HTTP_GET, ["accepted"])[0] == 102,
+                    5.0,
+                    "accepted COMMIT did not publish its write",
+                )
+
+                stats = read_kv_stats(port)
+                check_transaction_contract(stats, "KV transaction")
+                transactions = stats["transactions"]
+                started = (transactions["started"]
+                           - before["transactions"]["started"])
+                committed = (transactions["committed"]
+                             - before["transactions"]["committed"])
+                check(started == 8,
+                      f"unexpected transaction start count: {transactions!r}")
+                check(committed == 5,
+                      f"unexpected transaction commit count: {transactions!r}")
+                check(transactions["conflicted"] -
+                      before["transactions"]["conflicted"] == 1,
+                      f"conflict counter is incorrect: {transactions!r}")
+                check(transactions["rolled_back"] -
+                      before["transactions"]["rolled_back"] == 2,
+                      f"rollback counter is incorrect: {transactions!r}")
+                check(transactions["write_conflicts"] >= 1,
+                      f"write conflict counter is incorrect: {transactions!r}")
+                check(transactions["active"] == 0,
+                      f"active transaction leaked: {transactions!r}")
+                check(transactions["max_active"] >= 2,
+                      f"max_active did not observe concurrency: {transactions!r}")
+                check(transactions["commit_records"] -
+                      before["transactions"]["commit_records"] == 4,
+                      f"commit record counter is incorrect: {transactions!r}")
+                check(transactions["commit_bytes"] >
+                      before["transactions"]["commit_bytes"],
+                      f"commit byte counter did not advance: {transactions!r}")
+            finally:
+                writer.close()
+                reader.close()
+            check(server.terminate_group(signal.SIGTERM) == 0,
+                  f"transaction server shutdown failed:\n{server.log}")
+        finally:
+            server.cleanup()
+
+
 def test_stats_contract():
     with tempfile.TemporaryDirectory(prefix="minidb-process-stats-") as temp_dir:
         http_rdb = os.path.join(temp_dir, "stats-http.rdb")
@@ -1753,6 +2004,7 @@ CASES = {
     "RandomKillSeed": test_random_kill_seed,
     "TtlCrashRecovery": test_ttl_crash_recovery,
     "StatsContract": test_stats_contract,
+    "TransactionContract": test_transaction_contract,
     "KvAsyncProtocol": test_kv_async_protocol,
     "KvDisconnectSafety": test_kv_disconnect_safety,
     "HttpAsyncProtocol": test_http_async_protocol,

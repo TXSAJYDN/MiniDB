@@ -108,6 +108,8 @@ void maybe_pause_after_checkpoint_rdb_publish() {
 const char* mutation_io_error = "persistence I/O failure";
 const char* group_commit_active_error =
     "group commit is active; use the asynchronous persistence API";
+constexpr std::size_t kMaxActiveTransactions = 64;
+constexpr std::size_t kMaxTransactionWriteKeys = WalFormat::MAX_TXN_OPS;
 
 std::uint64_t steady_now_us() {
     return static_cast<std::uint64_t>(
@@ -435,6 +437,641 @@ MutationOutcome PersistenceManager::expire_impl(const std::string& key,
     return append_and_apply(record);
 }
 
+PersistenceManager::TransactionBeginResult
+PersistenceManager::begin_transaction() {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    TransactionBeginResult result;
+    if (!opened_ || failed_) {
+        result.status =
+            failed_ ? MutationStatus::kIoError : MutationStatus::kNotReady;
+        result.error = failed_ ? mutation_io_error : "persistence is not open";
+        return result;
+    }
+    if (!group_commit_started_) {
+        result.status = MutationStatus::kNotReady;
+        result.error = "group commit writer is not started";
+        return result;
+    }
+    if (shutdown_requested_ || shutdown_complete_ || !accepting_mutations_) {
+        result.status = MutationStatus::kNotReady;
+        result.error = "persistence is not accepting transactions";
+        return result;
+    }
+    if (transactions_.size() >= kMaxActiveTransactions) {
+        result.status = MutationStatus::kResourceLimit;
+        result.error = "active transaction limit exceeded";
+        return result;
+    }
+    if (next_txn_id_ == std::numeric_limits<std::uint64_t>::max()) {
+        result.status = MutationStatus::kResourceLimit;
+        result.error = "transaction id space is exhausted";
+        return result;
+    }
+
+    TransactionState transaction;
+    transaction.txn_id = next_txn_id_++;
+    transaction.snapshot_lsn = last_lsn_;
+    transaction.started_us = steady_now_us();
+    transaction.write_bytes = WalFormat::TXN_HEADER_SIZE;
+    result.txn_id = transaction.txn_id;
+    result.snapshot_lsn = transaction.snapshot_lsn;
+    result.status = MutationStatus::kOk;
+    transactions_.emplace(result.txn_id, std::move(transaction));
+    ++transaction_stats_.started;
+    transaction_stats_.active = transactions_.size();
+    transaction_stats_.max_active = std::max<std::uint64_t>(
+        transaction_stats_.max_active, transaction_stats_.active);
+    observe_transaction_metrics_locked();
+    return result;
+}
+
+PersistenceManager::TransactionState*
+PersistenceManager::find_transaction_locked(std::uint64_t txn_id) {
+    const auto it = transactions_.find(txn_id);
+    return it == transactions_.end() ? nullptr : &it->second;
+}
+
+PersistenceManager::TransactionResult
+PersistenceManager::transaction_fail(MutationStatus status,
+                                     const std::string& error) const {
+    TransactionResult result;
+    result.status = status;
+    result.error = error;
+    return result;
+}
+
+PersistenceManager::TransactionResult
+PersistenceManager::abort_transaction_locked(std::uint64_t txn_id,
+                                             MutationStatus status,
+                                             const std::string& error) {
+    TransactionState* transaction = find_transaction_locked(txn_id);
+    if (transaction == nullptr) {
+        return transaction_fail(status, error);
+    }
+    if (transaction->reserved_versions <= reserved_versions_) {
+        reserved_versions_ -= transaction->reserved_versions;
+    } else {
+        reserved_versions_ = 0;
+    }
+    transactions_.erase(txn_id);
+    ++transaction_stats_.failed;
+    observe_transaction_metrics_locked();
+    return transaction_fail(status, error);
+}
+
+void PersistenceManager::finish_transaction_locked(std::uint64_t txn_id) {
+    const auto it = transactions_.find(txn_id);
+    if (it == transactions_.end()) {
+        return;
+    }
+    if (it->second.reserved_versions <= reserved_versions_) {
+        reserved_versions_ -= it->second.reserved_versions;
+    } else {
+        reserved_versions_ = 0;
+    }
+    transactions_.erase(it);
+    observe_transaction_metrics_locked();
+}
+
+void PersistenceManager::add_pending_key_lsn_locked(const std::string& key,
+                                                    std::uint64_t lsn) {
+    pending_key_lsns_[key].insert(lsn);
+}
+
+void PersistenceManager::remove_pending_keys_locked(
+    const std::vector<std::string>& keys, std::uint64_t lsn) {
+    for (const std::string& key : keys) {
+        const auto it = pending_key_lsns_.find(key);
+        if (it == pending_key_lsns_.end()) {
+            continue;
+        }
+        const auto range = it->second.equal_range(lsn);
+        it->second.erase(range.first, range.second);
+        if (it->second.empty()) {
+            pending_key_lsns_.erase(it);
+        }
+    }
+}
+
+std::uint64_t
+PersistenceManager::pending_key_lsn_locked(const std::string& key) const {
+    const auto it = pending_key_lsns_.find(key);
+    return it == pending_key_lsns_.end() || it->second.empty()
+               ? 0
+               : *it->second.rbegin();
+}
+
+std::vector<std::uint64_t> PersistenceManager::active_snapshots_locked() const {
+    std::vector<std::uint64_t> snapshots;
+    snapshots.reserve(transactions_.size());
+    for (const auto& [txn_id, transaction] : transactions_) {
+        (void)txn_id;
+        snapshots.push_back(transaction.snapshot_lsn);
+    }
+    return snapshots;
+}
+
+void PersistenceManager::observe_transaction_metrics_locked() {
+    transaction_stats_.active = transactions_.size();
+    if (transaction_stats_.active > transaction_stats_.max_active) {
+        transaction_stats_.max_active = transaction_stats_.active;
+    }
+
+    const std::uint64_t versions = store_ ? store_->version_count() : 0;
+    transaction_stats_.versions_current = versions;
+    if (versions > transaction_stats_.versions_max) {
+        transaction_stats_.versions_max = versions;
+    }
+
+    std::uint64_t oldest_snapshot = 0;
+    bool has_snapshot = false;
+    for (const auto& [txn_id, transaction] : transactions_) {
+        (void)txn_id;
+        if (!has_snapshot || transaction.snapshot_lsn < oldest_snapshot) {
+            oldest_snapshot = transaction.snapshot_lsn;
+            has_snapshot = true;
+        }
+    }
+    transaction_stats_.oldest_snapshot_lag_lsn =
+        has_snapshot && last_lsn_ > oldest_snapshot
+            ? last_lsn_ - oldest_snapshot
+            : 0;
+    if (transaction_stats_.oldest_snapshot_lag_lsn >
+        transaction_stats_.max_oldest_snapshot_lag_lsn) {
+        transaction_stats_.max_oldest_snapshot_lag_lsn =
+            transaction_stats_.oldest_snapshot_lag_lsn;
+    }
+}
+
+bool PersistenceManager::garbage_collect_locked(std::string* error) {
+    const std::uint64_t started_us = steady_now_us();
+    KvStore::GcResult gc;
+    const bool ok =
+        store_->garbage_collect(active_snapshots_locked(), &gc, error);
+    add_saturated(&transaction_stats_.versions_reclaimed,
+                  gc.versions_reclaimed);
+    const std::uint64_t finished_us = steady_now_us();
+    if (finished_us >= started_us) {
+        observe_timing(finished_us - started_us,
+                       &transaction_stats_.gc_total_us,
+                       &transaction_stats_.gc_max_us);
+    }
+    observe_transaction_metrics_locked();
+    return ok;
+}
+
+PersistenceManager::TransactionResult PersistenceManager::transaction_set(
+    std::uint64_t txn_id, const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    TransactionState* transaction = find_transaction_locked(txn_id);
+    if (transaction == nullptr ||
+        transaction->state != TransactionStateKind::kActive) {
+        return transaction_fail(MutationStatus::kNoTransaction,
+                                "transaction is not active");
+    }
+    if (key.empty() || key.size() > WalFormat::MAX_KEY_SIZE) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                "invalid key length");
+    }
+    if (value.size() > WalFormat::MAX_VALUE_SIZE) {
+        return transaction_fail(MutationStatus::kResourceLimit,
+                                "transaction value exceeds the size limit");
+    }
+
+    const auto it = transaction->writes.find(key);
+    if (it == transaction->writes.end() &&
+        transaction->writes.size() >= kMaxTransactionWriteKeys) {
+        return abort_transaction_locked(txn_id, MutationStatus::kResourceLimit,
+                                        "transaction write-key limit exceeded");
+    }
+    const std::size_t old_cost = it == transaction->writes.end()
+                                     ? 0
+                                     : WalFormat::TXN_OP_HEADER_SIZE +
+                                           key.size() + it->second.value.size();
+    const std::size_t new_cost =
+        WalFormat::TXN_OP_HEADER_SIZE + key.size() + value.size();
+    const std::size_t current_cost = transaction->write_bytes >= old_cost
+                                         ? transaction->write_bytes - old_cost
+                                         : 0;
+    if (new_cost > WalFormat::MAX_TXN_PAYLOAD_SIZE ||
+        current_cost > WalFormat::MAX_TXN_PAYLOAD_SIZE - new_cost) {
+        return abort_transaction_locked(
+            txn_id, MutationStatus::kResourceLimit,
+            "transaction payload exceeds the size limit");
+    }
+
+    PendingWrite write;
+    write.value = value;
+    transaction->writes[key] = std::move(write);
+    transaction->write_bytes = current_cost + new_cost;
+    TransactionResult result;
+    result.changed = true;
+    return result;
+}
+
+PersistenceManager::TransactionResult
+PersistenceManager::transaction_get(std::uint64_t txn_id,
+                                    const std::string& key) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    TransactionState* transaction = find_transaction_locked(txn_id);
+    if (transaction == nullptr ||
+        transaction->state != TransactionStateKind::kActive) {
+        return transaction_fail(MutationStatus::kNoTransaction,
+                                "transaction is not active");
+    }
+    if (key.empty() || key.size() > WalFormat::MAX_KEY_SIZE) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                "invalid key length");
+    }
+
+    const auto it = transaction->writes.find(key);
+    if (it != transaction->writes.end()) {
+        TransactionResult result;
+        if (it->second.deleted) {
+            return result;
+        }
+        if (it->second.absolute_expiry_ms > 0 &&
+            it->second.absolute_expiry_ms <= store_->wall_clock_now_ms()) {
+            return result;
+        }
+        result.found = true;
+        result.value = it->second.value;
+        return result;
+    }
+
+    const std::optional<std::string> value =
+        store_->get_at(key, transaction->snapshot_lsn);
+    TransactionResult result;
+    if (value.has_value()) {
+        result.found = true;
+        result.value = value.value();
+    }
+    return result;
+}
+
+PersistenceManager::TransactionResult
+PersistenceManager::transaction_del(std::uint64_t txn_id,
+                                    const std::string& key) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    TransactionState* transaction = find_transaction_locked(txn_id);
+    if (transaction == nullptr ||
+        transaction->state != TransactionStateKind::kActive) {
+        return transaction_fail(MutationStatus::kNoTransaction,
+                                "transaction is not active");
+    }
+    if (key.empty() || key.size() > WalFormat::MAX_KEY_SIZE) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                "invalid key length");
+    }
+
+    const auto it = transaction->writes.find(key);
+    bool exists = false;
+    if (it != transaction->writes.end()) {
+        exists = !it->second.deleted &&
+                 (it->second.absolute_expiry_ms == 0 ||
+                  it->second.absolute_expiry_ms > store_->wall_clock_now_ms());
+        if (!exists) {
+            return TransactionResult{};
+        }
+    } else {
+        exists = store_->get_at(key, transaction->snapshot_lsn).has_value();
+        if (!exists) {
+            return TransactionResult{};
+        }
+    }
+    if (it == transaction->writes.end() &&
+        transaction->writes.size() >= kMaxTransactionWriteKeys) {
+        return abort_transaction_locked(txn_id, MutationStatus::kResourceLimit,
+                                        "transaction write-key limit exceeded");
+    }
+
+    const std::size_t old_cost = it == transaction->writes.end()
+                                     ? 0
+                                     : WalFormat::TXN_OP_HEADER_SIZE +
+                                           key.size() + it->second.value.size();
+    const std::size_t new_cost = WalFormat::TXN_OP_HEADER_SIZE + key.size();
+    const std::size_t current_cost = transaction->write_bytes >= old_cost
+                                         ? transaction->write_bytes - old_cost
+                                         : 0;
+    if (new_cost > WalFormat::MAX_TXN_PAYLOAD_SIZE ||
+        current_cost > WalFormat::MAX_TXN_PAYLOAD_SIZE - new_cost) {
+        return abort_transaction_locked(
+            txn_id, MutationStatus::kResourceLimit,
+            "transaction payload exceeds the size limit");
+    }
+
+    PendingWrite write;
+    write.deleted = true;
+    transaction->writes[key] = std::move(write);
+    transaction->write_bytes = current_cost + new_cost;
+    TransactionResult result;
+    result.changed = true;
+    return result;
+}
+
+PersistenceManager::TransactionResult PersistenceManager::transaction_expire(
+    std::uint64_t txn_id, const std::string& key, std::int64_t ttl_ms) {
+    if (ttl_ms <= 0) {
+        return transaction_del(txn_id, key);
+    }
+
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    TransactionState* transaction = find_transaction_locked(txn_id);
+    if (transaction == nullptr ||
+        transaction->state != TransactionStateKind::kActive) {
+        return transaction_fail(MutationStatus::kNoTransaction,
+                                "transaction is not active");
+    }
+    if (key.empty() || key.size() > WalFormat::MAX_KEY_SIZE) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                "invalid key length");
+    }
+
+    const auto it = transaction->writes.find(key);
+    std::string value;
+    if (it != transaction->writes.end()) {
+        if (it->second.deleted ||
+            (it->second.absolute_expiry_ms > 0 &&
+             it->second.absolute_expiry_ms <= store_->wall_clock_now_ms())) {
+            return TransactionResult{};
+        }
+        value = it->second.value;
+    } else {
+        const std::optional<std::string> existing =
+            store_->get_at(key, transaction->snapshot_lsn);
+        if (!existing.has_value()) {
+            return TransactionResult{};
+        }
+        value = existing.value();
+    }
+    if (it == transaction->writes.end() &&
+        transaction->writes.size() >= kMaxTransactionWriteKeys) {
+        return abort_transaction_locked(txn_id, MutationStatus::kResourceLimit,
+                                        "transaction write-key limit exceeded");
+    }
+
+    const std::size_t old_cost = it == transaction->writes.end()
+                                     ? 0
+                                     : WalFormat::TXN_OP_HEADER_SIZE +
+                                           key.size() + it->second.value.size();
+    const std::size_t new_cost =
+        WalFormat::TXN_OP_HEADER_SIZE + key.size() + value.size();
+    const std::size_t current_cost = transaction->write_bytes >= old_cost
+                                         ? transaction->write_bytes - old_cost
+                                         : 0;
+    if (new_cost > WalFormat::MAX_TXN_PAYLOAD_SIZE ||
+        current_cost > WalFormat::MAX_TXN_PAYLOAD_SIZE - new_cost) {
+        return abort_transaction_locked(
+            txn_id, MutationStatus::kResourceLimit,
+            "transaction payload exceeds the size limit");
+    }
+
+    PendingWrite write;
+    write.value = std::move(value);
+    write.absolute_expiry_ms =
+        add_ttl_saturated(store_->wall_clock_now_ms(), ttl_ms);
+    transaction->writes[key] = std::move(write);
+    transaction->write_bytes = current_cost + new_cost;
+    TransactionResult result;
+    result.changed = true;
+    return result;
+}
+
+PersistenceManager::TransactionResult
+PersistenceManager::transaction_ttl(std::uint64_t txn_id,
+                                    const std::string& key) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    TransactionState* transaction = find_transaction_locked(txn_id);
+    if (transaction == nullptr ||
+        transaction->state != TransactionStateKind::kActive) {
+        return transaction_fail(MutationStatus::kNoTransaction,
+                                "transaction is not active");
+    }
+    if (key.empty() || key.size() > WalFormat::MAX_KEY_SIZE) {
+        return transaction_fail(MutationStatus::kInvalidArgument,
+                                "invalid key length");
+    }
+
+    TransactionResult result;
+    result.status = MutationStatus::kOk;
+    const auto it = transaction->writes.find(key);
+    if (it != transaction->writes.end()) {
+        if (it->second.deleted) {
+            return result;
+        }
+        const int64_t now_ms = store_->wall_clock_now_ms();
+        if (it->second.absolute_expiry_ms > 0 &&
+            it->second.absolute_expiry_ms <= now_ms) {
+            return result;
+        }
+        result.found = true;
+        if (it->second.absolute_expiry_ms == 0) {
+            result.ttl.state = KvStore::TtlState::kNoExpiry;
+            result.ttl.remaining_ms = -1;
+        } else {
+            result.ttl.state = KvStore::TtlState::kExpiring;
+            result.ttl.remaining_ms = it->second.absolute_expiry_ms - now_ms;
+        }
+        return result;
+    }
+
+    result.ttl = store_->ttl_info_at(key, transaction->snapshot_lsn);
+    result.found = result.ttl.state != KvStore::TtlState::kMissing;
+    return result;
+}
+
+MutationAdmission
+PersistenceManager::commit_transaction_async(std::uint64_t txn_id,
+                                             MutationCompletion completion) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    TransactionState* transaction = find_transaction_locked(txn_id);
+    if (transaction == nullptr ||
+        transaction->state != TransactionStateKind::kActive) {
+        return admission_fail(MutationAdmissionStatus::kNoTransaction,
+                              "transaction is not active");
+    }
+    if (!opened_ || failed_) {
+        abort_transaction_locked(txn_id, MutationStatus::kIoError,
+                                 failed_ ? mutation_io_error
+                                         : "persistence is not open");
+        return admission_fail(failed_ ? MutationAdmissionStatus::kIoError
+                                      : MutationAdmissionStatus::kNotReady,
+                              failed_ ? mutation_io_error
+                                      : "persistence is not open");
+    }
+    if (!group_commit_started_) {
+        abort_transaction_locked(txn_id, MutationStatus::kNotReady,
+                                 "group commit writer is not started");
+        return admission_fail(MutationAdmissionStatus::kNotReady,
+                              "group commit writer is not started");
+    }
+    if (shutdown_requested_ || shutdown_complete_ || !accepting_mutations_) {
+        abort_transaction_locked(txn_id, MutationStatus::kNotReady,
+                                 "persistence is not accepting commits");
+        return admission_fail(MutationAdmissionStatus::kShuttingDown,
+                              "persistence is not accepting commits");
+    }
+
+    const std::uint64_t commit_started_us = steady_now_us();
+    if (transaction->writes.empty()) {
+        ++transaction_stats_.committed;
+        finish_transaction_locked(txn_id);
+        MutationOutcome outcome;
+        outcome.lsn = 0;
+        if (completion) {
+            auto measured = [this, commit_started_us,
+                             completion = std::move(completion)](
+                                MutationOutcome committed) mutable {
+                {
+                    std::lock_guard<std::mutex> guard(operation_mutex_);
+                    const std::uint64_t now = steady_now_us();
+                    if (now >= commit_started_us) {
+                        observe_timing(now - commit_started_us,
+                                       &transaction_stats_.commit_total_us,
+                                       &transaction_stats_.commit_max_us);
+                    }
+                }
+                completion(std::move(committed));
+            };
+            dispatch_owner([measured = std::move(measured),
+                            outcome = std::move(outcome)]() mutable {
+                measured(std::move(outcome));
+            });
+        }
+        MutationAdmission admission;
+        admission.status = MutationAdmissionStatus::kAccepted;
+        return admission;
+    }
+
+    std::uint64_t conflicting_keys = 0;
+    for (const auto& [key, write] : transaction->writes) {
+        (void)write;
+        const std::uint64_t committed_lsn = store_->latest_committed_lsn(key);
+        const std::uint64_t pending_lsn = pending_key_lsn_locked(key);
+        if (std::max(committed_lsn, pending_lsn) > transaction->snapshot_lsn) {
+            ++conflicting_keys;
+        }
+    }
+    if (conflicting_keys != 0) {
+        finish_transaction_locked(txn_id);
+        ++transaction_stats_.conflicted;
+        add_saturated(&transaction_stats_.write_conflicts, conflicting_keys);
+        observe_transaction_metrics_locked();
+        return admission_fail(MutationAdmissionStatus::kConflict,
+                              "transaction write conflict");
+    }
+
+    if (transaction->writes.size() > store_->max_versions()) {
+        const std::string error =
+            "transaction version reservation exceeds the global limit";
+        abort_transaction_locked(txn_id, MutationStatus::kResourceLimit, error);
+        return admission_fail(MutationAdmissionStatus::kResourceLimit, error);
+    }
+    const std::size_t current_versions = store_->version_count();
+    const std::size_t version_limit = store_->max_versions();
+    const std::size_t requested_versions = transaction->writes.size();
+    if (current_versions > version_limit ||
+        reserved_versions_ > version_limit - current_versions ||
+        requested_versions >
+            version_limit - current_versions - reserved_versions_) {
+        abort_transaction_locked(txn_id, MutationStatus::kResourceLimit,
+                                 "global version limit exceeded");
+        return admission_fail(MutationAdmissionStatus::kResourceLimit,
+                              "global version limit exceeded");
+    }
+
+    std::string writer_error;
+    if (!ensure_group_commit_writer_locked(&writer_error)) {
+        abort_transaction_locked(txn_id,
+                                 failed_ ? MutationStatus::kIoError
+                                         : MutationStatus::kNotReady,
+                                 writer_error);
+        return admission_fail(failed_ ? MutationAdmissionStatus::kIoError
+                                      : MutationAdmissionStatus::kNotReady,
+                              writer_error);
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(transaction->writes.size());
+    for (const auto& [key, write] : transaction->writes) {
+        (void)write;
+        keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    std::vector<WalTxnOp> operations;
+    operations.reserve(keys.size());
+    for (const std::string& key : keys) {
+        const PendingWrite& write = transaction->writes.at(key);
+        WalTxnOp operation;
+        operation.key = key;
+        if (write.deleted) {
+            operation.op = WalOp::kDel;
+        } else {
+            operation.op = WalOp::kSet;
+            operation.value = write.value;
+            operation.expiry_ms = write.absolute_expiry_ms;
+        }
+        operations.push_back(std::move(operation));
+    }
+    std::string payload_error;
+    const std::vector<std::uint8_t> payload =
+        WalFormat::encode_transaction(operations, &payload_error);
+    if (payload.empty()) {
+        abort_transaction_locked(txn_id, MutationStatus::kResourceLimit,
+                                 payload_error.empty()
+                                     ? "transaction payload is invalid"
+                                     : payload_error);
+        return admission_fail(MutationAdmissionStatus::kResourceLimit,
+                              payload_error);
+    }
+
+    WalRecord record;
+    record.lsn = group_commit_writer_->next_lsn();
+    record.op = WalOp::kTxn;
+    record.key = "txn";
+    record.value.assign(reinterpret_cast<const char*>(payload.data()),
+                        payload.size());
+    transaction->state = TransactionStateKind::kCommitting;
+    transaction->reserved_versions = requested_versions;
+    reserved_versions_ += requested_versions;
+
+    const MutationAdmission admission =
+        admit_async(std::move(record), std::move(completion),
+                    PendingMutationKind::kTransaction, txn_id);
+    if (!admission.accepted()) {
+        TransactionState* failed_transaction = find_transaction_locked(txn_id);
+        if (failed_transaction != nullptr) {
+            if (failed_transaction->reserved_versions <= reserved_versions_) {
+                reserved_versions_ -= failed_transaction->reserved_versions;
+            } else {
+                reserved_versions_ = 0;
+            }
+            transactions_.erase(txn_id);
+            ++transaction_stats_.failed;
+            observe_transaction_metrics_locked();
+        }
+    }
+    return admission;
+}
+
+PersistenceManager::TransactionResult
+PersistenceManager::rollback_transaction(std::uint64_t txn_id) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    TransactionState* transaction = find_transaction_locked(txn_id);
+    if (transaction == nullptr ||
+        transaction->state != TransactionStateKind::kActive) {
+        return transaction_fail(MutationStatus::kNoTransaction,
+                                "transaction is not active");
+    }
+    finish_transaction_locked(txn_id);
+    ++transaction_stats_.rolled_back;
+    observe_transaction_metrics_locked();
+    TransactionResult result;
+    result.changed = true;
+    return result;
+}
+
 MutationOutcome PersistenceManager::append_and_apply(const WalRecord& record) {
     std::string bootstrap_error;
     if (!ensure_bootstrapped_locked(&bootstrap_error)) {
@@ -477,8 +1114,7 @@ MutationOutcome PersistenceManager::append_and_apply(const WalRecord& record) {
     }
     last_lsn_ = record.lsn;
 
-    KvStore::GcResult gc_result;
-    if (!store_->garbage_collect({}, &gc_result, &apply_error)) {
+    if (!garbage_collect_locked(&apply_error)) {
         mark_failed();
         return fail(MutationStatus::kIoError, apply_error);
     }
@@ -496,6 +1132,8 @@ MutationOutcome PersistenceManager::append_and_apply(const WalRecord& record) {
 
     MutationOutcome outcome;
     outcome.changed = changed;
+    outcome.lsn = record.lsn;
+    observe_transaction_metrics_locked();
     return outcome;
 }
 
@@ -841,23 +1479,60 @@ PersistenceManager::expire_async(std::string key, std::int64_t ttl_ms,
     return admit_async(std::move(record), std::move(completion));
 }
 
-MutationAdmission
-PersistenceManager::admit_async(WalRecord record,
-                                MutationCompletion completion) {
+MutationAdmission PersistenceManager::admit_async(WalRecord record,
+                                                  MutationCompletion completion,
+                                                  PendingMutationKind kind,
+                                                  std::uint64_t txn_id) {
     const std::uint64_t lsn = record.lsn;
     const std::uint64_t started_us = steady_now_us();
 
-    // Publish the bookkeeping entry before handing ownership to the writer.
-    // The owner dispatch contract prevents a drain from running inline, so
-    // the entry is always visible by the time its completion is delivered.
-    pending_mutations_.push_back({lsn, started_us, std::move(completion)});
+    std::vector<KvStore::AppliedMutation> mutations;
+    std::string decode_error;
+    if (!decode_record_mutations(record, &mutations, &decode_error)) {
+        return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                              decode_error);
+    }
+
+    PendingMutation pending;
+    pending.lsn = lsn;
+    pending.started_us = started_us;
+    pending.completion = std::move(completion);
+    pending.kind = kind;
+    pending.txn_id = txn_id;
+    pending.keys.reserve(mutations.size());
+    for (const KvStore::AppliedMutation& mutation : mutations) {
+        pending.keys.push_back(mutation.key);
+    }
+    std::sort(pending.keys.begin(), pending.keys.end());
+    pending.keys.erase(std::unique(pending.keys.begin(), pending.keys.end()),
+                       pending.keys.end());
+
+    // Publish both halves of the admission bookkeeping before handing the
+    // record to the writer.  Conflict detection must observe records that are
+    // queued but not yet applied.
+    for (const std::string& key : pending.keys) {
+        add_pending_key_lsn_locked(key, lsn);
+    }
+    pending_mutations_.push_back(std::move(pending));
 
     GroupCommitEntry entry;
     entry.record = std::move(record);
     entry.submitted_us = started_us;
     std::string submit_error;
     if (!group_commit_writer_->submit(std::move(entry), &submit_error)) {
+        const PendingMutation& rejected = pending_mutations_.back();
+        remove_pending_keys_locked(rejected.keys, rejected.lsn);
+        const PendingMutationKind rejected_kind = rejected.kind;
+        const std::uint64_t rejected_txn_id = rejected.txn_id;
         pending_mutations_.pop_back();
+
+        if (rejected_kind == PendingMutationKind::kTransaction &&
+            find_transaction_locked(rejected_txn_id) != nullptr) {
+            finish_transaction_locked(rejected_txn_id);
+            ++transaction_stats_.failed;
+            observe_transaction_metrics_locked();
+        }
+
         MutationAdmissionStatus status = MutationAdmissionStatus::kNotReady;
         const GroupCommitWriterState state = group_commit_writer_->state();
         if (state == GroupCommitWriterState::kFailed) {
@@ -1096,6 +1771,21 @@ bool PersistenceManager::start_checkpoint_locked(
             *error = control_error;
         }
         return false;
+    }
+
+    if (shutdown) {
+        std::vector<std::uint64_t> active_txn_ids;
+        active_txn_ids.reserve(transactions_.size());
+        for (const auto& [txn_id, transaction] : transactions_) {
+            if (transaction.state == TransactionStateKind::kActive) {
+                active_txn_ids.push_back(txn_id);
+            }
+        }
+        for (const std::uint64_t txn_id : active_txn_ids) {
+            finish_transaction_locked(txn_id);
+            ++transaction_stats_.rolled_back;
+        }
+        observe_transaction_metrics_locked();
     }
     return true;
 }
@@ -1722,8 +2412,23 @@ void PersistenceManager::on_group_commit_completion(
                 }
                 PendingMutation pending = std::move(pending_mutations_.front());
                 pending_mutations_.pop_front();
+                remove_pending_keys_locked(pending.keys, pending.lsn);
 
                 MutationOutcome outcome;
+                bool applied = false;
+                bool transaction_finished = false;
+                const bool is_transaction =
+                    pending.kind == PendingMutationKind::kTransaction;
+                const auto finish_pending_transaction = [&]() {
+                    if (!is_transaction || transaction_finished) {
+                        return;
+                    }
+                    if (find_transaction_locked(pending.txn_id) != nullptr) {
+                        finish_transaction_locked(pending.txn_id);
+                    }
+                    transaction_finished = true;
+                };
+
                 if (pending.lsn != result.record.lsn) {
                     mark_failed();
                     outcome.status = MutationStatus::kIoError;
@@ -1743,6 +2448,8 @@ void PersistenceManager::on_group_commit_completion(
                     outcome.error = "group commit apply LSN is not contiguous";
                 } else {
                     bool changed = false;
+                    std::string apply_error;
+                    bool apply_succeeded = false;
                     try {
                         std::vector<KvStore::AppliedMutation> mutations;
                         std::string decode_error;
@@ -1761,7 +2468,6 @@ void PersistenceManager::on_group_commit_completion(
                                 changed = changed ||
                                           mutation_changed(*store_, mutation);
                             }
-                            std::string apply_error;
                             const KvStore::ApplyStatus apply_status =
                                 store_->apply_committed_status(
                                     result.record.lsn, mutations, &apply_error);
@@ -1774,13 +2480,10 @@ void PersistenceManager::on_group_commit_completion(
                                         : MutationStatus::kIoError;
                                 outcome.error = apply_error;
                             } else {
-                                KvStore::GcResult gc_result;
-                                if (!store_->garbage_collect({}, &gc_result,
-                                                             &apply_error)) {
-                                    mark_failed();
-                                    outcome.status = MutationStatus::kIoError;
-                                    outcome.error = apply_error;
-                                }
+                                apply_succeeded = true;
+                                last_lsn_ = result.record.lsn;
+                                group_commit_writer_->observe_applied(
+                                    result, steady_now_us());
                             }
                         }
                     } catch (const std::exception& ex) {
@@ -1794,28 +2497,63 @@ void PersistenceManager::on_group_commit_completion(
                         outcome.error = "store apply failed";
                     }
 
-                    if (outcome.ok()) {
-                        last_lsn_ = result.record.lsn;
-                        if (after_apply_callback_) {
-                            after_apply_callback_(result.record);
-                        }
-                        group_commit_writer_->observe_applied(result,
-                                                              steady_now_us());
-                        ++stats_.mutations;
-                        if (durability_mode_ == DurabilityMode::kSync) {
-                            ++stats_.sync_mutations;
-                            const std::uint64_t now = steady_now_us();
-                            if (now >= pending.started_us) {
-                                observe_timing(now - pending.started_us,
-                                               &stats_.sync_mutation_total_us,
-                                               &stats_.sync_mutation_max_us);
-                            }
+                    if (apply_succeeded) {
+                        // A committing transaction has already built its WAL
+                        // record and can no longer read its snapshot.  Release
+                        // it before GC so the new commit is not artificially
+                        // pinned by its own snapshot.
+                        finish_pending_transaction();
+
+                        std::string gc_error;
+                        if (!garbage_collect_locked(&gc_error)) {
+                            mark_failed();
+                            outcome.status = MutationStatus::kIoError;
+                            outcome.error = gc_error.empty()
+                                                ? "version GC failed"
+                                                : gc_error;
                         } else {
-                            ++stats_.interval_mutations;
+                            if (after_apply_callback_) {
+                                after_apply_callback_(result.record);
+                            }
+                            const std::uint64_t now_us = steady_now_us();
+                            ++stats_.mutations;
+                            if (durability_mode_ == DurabilityMode::kSync) {
+                                ++stats_.sync_mutations;
+                                if (now_us >= pending.started_us) {
+                                    observe_timing(
+                                        now_us - pending.started_us,
+                                        &stats_.sync_mutation_total_us,
+                                        &stats_.sync_mutation_max_us);
+                                }
+                            } else {
+                                ++stats_.interval_mutations;
+                            }
+                            outcome.changed = changed;
+                            outcome.lsn = result.record.lsn;
+                            applied = true;
+
+                            if (is_transaction) {
+                                ++transaction_stats_.committed;
+                                ++transaction_stats_.commit_records;
+                                add_saturated(
+                                    &transaction_stats_.commit_bytes,
+                                    WalFormat::encoded_size(result.record));
+                                if (now_us >= pending.started_us) {
+                                    observe_timing(
+                                        now_us - pending.started_us,
+                                        &transaction_stats_.commit_total_us,
+                                        &transaction_stats_.commit_max_us);
+                                }
+                            }
                         }
-                        outcome.changed = changed;
                     }
                 }
+
+                finish_pending_transaction();
+                if (!applied && is_transaction) {
+                    ++transaction_stats_.failed;
+                }
+                observe_transaction_metrics_locked();
 
                 callbacks.push_back(
                     {std::move(pending.completion), std::move(outcome)});
@@ -2030,6 +2768,7 @@ PersistenceSnapshot PersistenceManager::snapshot() const {
     result.last_lsn = last_lsn_;
     result.recovery = recovery_stats_;
     result.persistence = stats_;
+    result.transactions = transaction_stats_;
     if (group_commit_writer_) {
         const GroupCommitWalSnapshot wal_snapshot =
             group_commit_writer_->wal_snapshot();
@@ -2079,6 +2818,10 @@ const char* mutation_status_name(MutationStatus status) {
         return "resource-limit";
     case MutationStatus::kNotReady:
         return "not-ready";
+    case MutationStatus::kNoTransaction:
+        return "no-transaction";
+    case MutationStatus::kConflict:
+        return "conflict";
     }
     return "unknown";
 }

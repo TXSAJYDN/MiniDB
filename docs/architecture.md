@@ -9,7 +9,10 @@ and startup recovery path.
 
 The project is a reliability engineering prototype, not a production database.
 It does not claim SQL or Redis compatibility, high concurrency, replication,
-transactions, or a production SLA.
+serializable transactions, distributed transactions, or a production SLA. The
+binary KV protocol provides bounded snapshot-isolation transactions with
+first-committer-wins conflict detection; HTTP mutations remain independent
+implicit transactions.
 
 Two independent server processes expose the same storage engine:
 
@@ -41,7 +44,21 @@ rejected by an advisory `flock` on `<rdb_path>.lock`.
 9. Recovery builds a temporary store and publishes it only after the RDB,
    manifest, and WAL chain all validate.
 10. Resource use is bounded by explicit connection, record, segment, recovery,
-    snapshot, admission-queue, batch, and completion limits.
+    snapshot, transaction, version, admission-queue, batch, and completion
+    limits.
+11. Explicit transactions use a BEGIN snapshot LSN. Reads first consult the
+    private write set, then the newest committed version at or below that LSN;
+    no dirty read is possible.
+12. The transaction table is owner-loop state. At COMMIT admission, a write to a
+    key whose committed or pending LSN is greater than the snapshot conflicts;
+    otherwise one `kTxn` record is committed under one LSN and applied
+    atomically.
+13. Active transaction private writes never enter the live store, checkpoint,
+    or manifest. Connection loss, session destruction, and shutdown roll back
+    uncommitted transactions.
+14. Version GC preserves every version required by an active snapshot and the
+    latest committed version; it fails closed at the version budget rather than
+    violating snapshot visibility.
 
 ## Process and thread model
 
@@ -57,11 +74,18 @@ publication cannot overlap a background mutation.
 
 The persistence manager coordinates one dedicated `GroupCommitWriter` thread for
 server write paths. The owner loop allocates strictly increasing LSNs, validates
-mutations, submits admission entries, and is the only thread that applies store
-mutations and invokes protocol completions. The writer consumes a contiguous LSN
-prefix, encodes a physical batch, appends it to the WAL, and performs one data
-fsync for the batch tail. It never touches `KvStore`, sessions, sockets, or user
-callbacks.
+mutations, manages the transaction table, submits admission entries, and is the
+only thread that applies store mutations and invokes protocol completions. The
+writer consumes a contiguous LSN prefix, encodes a physical batch, appends it to
+the WAL, and performs one data fsync for the batch tail. It never touches
+`KvStore`, the transaction table, sessions, sockets, or user callbacks.
+
+Explicit transaction lifecycle, snapshot reads, private write-set updates,
+conflict admission, and rollback also run on the owner loop. A `KvSession`
+stores only its transaction id; it does not hold a pointer into a version chain.
+COMMIT admission clears the session's transaction id immediately, so a later
+disconnect cannot revoke an accepted commit. The actual atomic apply occurs when
+the group-commit completion reaches the owner loop.
 
 Completion results return through one coalesced owner-loop drain callback. A
 backlog entry is not turned into an individual cross-thread callback. Accepted
@@ -91,7 +115,7 @@ been applied. Shutdown failure is propagated to a nonzero process exit code.
 | Base | src/base | RAII descriptors, Buffer, clocks, error values, logging |
 | Network | src/net | eventfd/timerfd/signalfd EventLoop, level-triggered epoll, Acceptor, TcpConnection, TcpServer |
 | Protocol | src/protocol | HTTP parser/session/routes and binary KV framing/session |
-| Storage | src/storage | thread-safe KvStore, RDB checkpoint, WAL, manifest, recovery, single-writer lock |
+| Storage | src/storage | thread-safe MVCC KvStore, transaction table/conflict admission, RDB checkpoint, WAL, manifest, recovery, single-writer lock |
 | Applications | app | CLI parsing, startup validation, signal-driven graceful shutdown |
 
 The dependency direction is approximately:
@@ -194,20 +218,32 @@ connection. The KV protocol has no idle timeout.
    incomplete, malformed, or complete without resynchronizing.
 4. KvSession validates argument counts, key sizes, and TTL text, then calls
    `PersistenceManager` for mutations and `KvStore` for reads.
-5. The response is encoded in the same frame layout and queued through
+5. `BEGIN`, `COMMIT`, and `ROLLBACK` use the owner-loop transaction table.
+   Inside a transaction, SET/GET/DEL/EXPIRE/TTL read or stage private writes;
+   COMMIT performs conflict admission before submitting one `kTxn` record.
+6. The response is encoded in the same frame layout and queued through
    TcpConnection.
-6. The connection remains usable for command-level errors; framing corruption
+7. The connection remains usable for command-level errors; framing corruption
    or an unknown command returns ERROR where possible and closes the connection.
+   An uncommitted transaction is rolled back on close.
 
 `STATS` (command code 8) returns the same persistence statistics JSON as the
-HTTP endpoint. `SAVE` (command code 7) runs the same two-phase background checkpoint state machine as HTTP POST /save.
+HTTP endpoint, including the top-level `transactions` object. `SAVE` (command
+code 7) runs the same two-phase background checkpoint state machine as HTTP POST
+/save. HTTP has no BEGIN/COMMIT/ROLLBACK handle: each HTTP KV mutation is an
+implicit one-operation transaction.
 
 One command is in flight per connection. Pipelined frames remain buffered and
 are resumed from write completion, not recursive callbacks.
 
 ## Storage and TTL semantics
 
-KvStore stores values in `std::unordered_map` under one mutex. TTL deadlines use
+KvStore stores keyed version chains under one mutex. Each committed mutation
+appends a version tagged with its commit LSN; tombstones represent deletes.
+Snapshot reads select the newest version with `commit_lsn <= snapshot_lsn`, and
+the transaction's private write set takes priority for read-your-writes. The
+standalone CRUD surface synthesizes a single committed version so existing
+in-memory users still observe one current value. TTL deadlines use
 `std::chrono::steady_clock` while the process is live. The WAL and RDB boundary
 converts those deadlines to absolute Unix epoch milliseconds, so restarting the
 process cannot extend a TTL.
@@ -218,6 +254,12 @@ process cannot extend a TTL.
   key, and a non-negative remaining duration otherwise.
 - Expired entries are removed lazily and by the optional periodic scanner.
 - An EXPIRE mutation is logged as an absolute deadline before it is applied.
+- An expired version is reported missing; snapshot reads do not fall back to an
+  older live version after the selected version's deadline passes.
+- Version GC retains the latest committed version and all versions still needed
+  by active snapshots, subject to the global 1,000,000-entry budget.
+- A transaction-visible SET/DEL/EXPIRE is folded into one final operation per
+  key before COMMIT emits the `kTxn` record.
 
 The exact wire rules are in [protocol-kv.md](protocol-kv.md).
 
@@ -240,8 +282,15 @@ wal-00000000000000000001.log
 
 ### Write path
 
-`PersistenceManager::set`, `del`, and `expire` validate the operation and
-submit it to the bounded group-commit writer with the next contiguous LSN.
+`PersistenceManager::set`, `del`, and `expire` validate a standalone operation
+and submit it as an implicit one-operation transaction to the bounded
+group-commit writer with the next contiguous LSN. Explicit `BEGIN`/COMMIT uses
+the same writer, but emits one `kTxn` record for the folded private write set.
+
+At COMMIT admission, the owner checks
+`max(committed_key_lsn, pending_key_lsn) > snapshot_lsn` for every written key.
+A conflict returns `CONFLICT` without WAL or an LSN. A successful commit gets
+exactly one LSN; read-only commits get LSN `0`, no WAL, and no LSN allocation.
 
 - `SYNC`: the writer appends a physical batch and fsyncs its tail. The owner
   loop receives the completion, applies the mutations in LSN order, and only
@@ -387,7 +436,12 @@ The local evidence suite covers:
   response ordering, SAVE/checkpoint barriers, and shutdown failure exits;
 - R4-A timing counters, fixed fsync buckets, the top-level `group_commit`
   contract, and protocol checks in both HTTP and KV paths;
-- the external G3 batch-formation experiment and its frozen gate checks.
+- the external G3 batch-formation experiment and its frozen gate checks;
+- snapshot isolation, read-your-writes, repeatable reads, no dirty reads,
+  first-committer-wins conflicts, pending-commit conflict windows, read-only
+  commits, transaction protocol framing, disconnect rollback, atomic `kTxn`
+  recovery, TTL/snapshot selection, version GC, resource limits, and the
+  top-level `transactions` stats contract.
 
 The acceptance matrix runs Debug, Release, ASan, UBSan, ASan+UBSan, and TSan
 from separate build directories. Passing it is local reproducibility evidence,
@@ -396,13 +450,17 @@ not a substitute for a public CI run or a production qualification.
 ## Deliberate non-goals
 
 - TLS, authentication, authorization, or multi-tenant isolation.
-- Replication, sharding, clustering, consensus, or transactions.
+- Replication, sharding, clustering, or consensus.
 - HTTP/2, WebSocket, chunked requests, or Expect/100-continue.
 - Multi-process sharing of one data directory.
 - A public `BATCHED` durability mode. Group commit is an internal `SYNC`
   optimization; its implementation contract is in
   [ADR-006](decisions/006-group-commit-implementation.md).
-- Background/incremental checkpoint, transactions, MVCC, or multiple writers.
+- Serializable isolation, predicate/range conflict detection, or prevention of
+  snapshot-isolation write skew.
+- HTTP cross-request transactions, distributed transactions, or multiple
+  writers.
+- Background/incremental checkpoint or automatic periodic checkpoint.
 - Power-loss, kernel-crash, firmware-cache, or media-failure proofs.
 - Production SLAs, capacity claims, or arbitrary client scaling.
 
@@ -412,3 +470,5 @@ These exclusions are part of the contract, not hidden implementation gaps.
 
 - [ADR-005: R4-A group-commit candidate design and evidence gates](decisions/005-group-commit.md)
 - [ADR-006: R4-A group-commit implementation](decisions/006-group-commit-implementation.md)
+- [ADR-007: R4-B background full checkpoint](decisions/007-background-checkpoint.md)
+- [ADR-008: R4-C MVCC and snapshot-isolation transactions](decisions/008-mvcc-transactions.md)

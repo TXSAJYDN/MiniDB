@@ -7,6 +7,7 @@
 #include "../storage/RdbManager.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 
@@ -50,9 +51,13 @@ class KvSession : public std::enable_shared_from_this<KvSession> {
     bool begin_async_operation(const MutationAdmission& admission);
     void on_mutation_completed(MutationOutcome outcome,
                                KvProtocol::CommandType success_type);
+    void on_commit_completed(MutationOutcome outcome);
     void on_save_completed(RdbSaveResult result, const std::string& error);
+    bool send_transaction_failure(MutationStatus status,
+                                  const std::string& error);
     void send_mutation_failure(const MutationOutcome& outcome);
     void send_admission_failure(const MutationAdmission& admission);
+    void rollback_active_transaction();
     bool validate_key(const std::string& key, const char* command);
     bool send_response(KvProtocol::CommandType type,
                        const std::vector<std::string>& args);
@@ -69,6 +74,7 @@ class KvSession : public std::enable_shared_from_this<KvSession> {
     bool closing_;
     bool closed_;
     bool drain_scheduled_;
+    std::uint64_t active_txn_id_ = 0;
 
     static constexpr size_t kMaxPendingBufferSize =
         TcpConnection::kMaxInputBufferSize;

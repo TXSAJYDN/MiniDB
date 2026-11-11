@@ -198,6 +198,7 @@ set(MINIDB_PROCESS_CASES
     RandomKillSeed
     TtlCrashRecovery
     StatsContract
+    TransactionContract
     KvAsyncProtocol
     KvDisconnectSafety
     HttpAsyncProtocol

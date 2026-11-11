@@ -7,7 +7,7 @@ MiniDB 是一个使用 C++20 实现的**面向有界资源的单机 crash-consis
 它通过两个独立前端访问同一类存储引擎：
 
 - 严格但范围有限的 HTTP/1.1 子集；
-- 二进制安全的 TCP KV 协议，支持 CRUD、TTL、SAVE 和 STATS。
+- 二进制安全的 TCP KV 协议，支持 CRUD、TTL、SAVE、STATS，以及 Snapshot Isolation 多 key 事务。
 
 项目当前的核心问题不是“再实现一个 Redis”，而是验证一条完整持久化闭环：
 
@@ -27,7 +27,9 @@ MiniDB 是可靠性工程原型，**不宣称生产可用**，不宣称 Redis/SQ
 - 启动时先构建临时恢复镜像，RDB、manifest 和 WAL 全部验证通过后才发布 Store；
 - WAL 尾部半写可截断到最后合法记录，中间损坏、LSN 断层或缺失 segment 拒绝启动；
 - TTL 在 WAL 中保存绝对 Unix 毫秒 deadline，重启不会重新延长 TTL；
-- `<rdb_path>.lock` 使用非阻塞 `flock`，阻止两个服务进程同时写同一数据目录。
+- `<rdb_path>.lock` 使用非阻塞 `flock`，阻止两个服务进程同时写同一数据目录；
+- KV 协议提供 `BEGIN/COMMIT/ROLLBACK`，采用 Snapshot Isolation + first-committer-wins，一次提交是一条原子 WAL 记录；
+- 活跃事务的私有写集不进 live store、checkpoint 或 manifest，断连/关机时回滚。
 
 ## Durability 语义
 
@@ -114,6 +116,9 @@ wal-00000000000000000001.log
 | group-commit admission queue | 4,096 entries / 64 MiB |
 | 单个物理 WAL batch | 256 records / 16 MiB |
 | group-commit completion backlog | 4,096 entries / 64 MiB |
+| 活跃显式事务 | 64 |
+| 单事务写 key / payload | 256 keys / 1 MiB |
+| 全局版本条目 | 1,000,000 |
 
 WAL 达到 segment 数或字节预算时，写路径会先触发同步 checkpoint；checkpoint 失败则拒绝写，不应无限增长。具体策略见 [ADR-004](docs/decisions/004-wal-resource-policy.md)。
 
@@ -149,6 +154,7 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 - WAL append、rotation、segment 清理和目录 fsync 计数；
 - 成功 append、data fsync 与 `SYNC` 持久化路径的累计/最大耗时，以及固定 fsync 延迟桶；
 - 顶层 `group_commit` 对象：queue/backlog 高水位、拒绝数、batch 数量与大小分布、data fsync 数、writer 各阶段耗时、失败计数和 writer 状态；
+- 顶层 `transactions` 对象：活跃/提交/冲突/回滚计数、版本高水位、snapshot lag、事务 WAL 记录与字节数、提交和 GC 耗时；
 - 启动恢复的 RDB 记录数、扫描/重放记录数、截断字节和遗留 residue；
 - legacy import 与 bootstrap 状态。
 
@@ -158,13 +164,14 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 
 ## 验证状态
 
-R4-A 组提交和 R4-B 后台全量 checkpoint 已实现，本地质量门禁及正式收益/延迟证据已完成：
+R4-A 组提交、R4-B 后台全量 checkpoint 和 R4-C Snapshot Isolation 事务已实现，本地质量门禁及对应证据已完成：
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种构建配置；
-- 每个配置 **348 项 CTest**，包含 25 个 `ProcessIntegrationTest.*` 进程级用例；
+- 每个配置 **395 项 CTest**，包含 26 个 `ProcessIntegrationTest.*` 进程级用例；
 - 组提交 writer 的顺序、batch 上限、queue/backlog full、append/fsync 失败、cleanup barrier、fail-stop 和 callback 恰好一次测试；
 - 后台 checkpoint 状态机、完整 live segment 保留、cleanup 失败重试、manager 析构回调安全，以及 rename 后/manifest 前崩溃恢复测试；
 - HTTP/KV 异步 mutation、断开连接安全、流水线响应顺序、SAVE/STATS 和 shutdown 失败退出码测试；
+- 事务快照读、read-your-writes、first-committer-wins、pending commit 冲突窗口、只读提交、断连回滚、原子 `kTxn` 恢复、TTL/GC、资源上限和事务 stats 契约测试；
 - HTTP、KV、WAL record、manifest 四个固定 seed fuzz target；
 - clang-format、clang-tidy 和 `git diff --check`；
 - 多 durability、多客户端、写/混合/TTL 的 5 轮可靠性 benchmark；
@@ -197,12 +204,12 @@ G3 的 pending 计数是批处理机会上界，不是服务器队列已有记�
 - 不提供 SQL；
 - 不追求完整 Redis 命令/协议兼容；
 - 不提供复制、Raft、集群或分片；
-- 不提供事务、MVCC 或隔离级别；
+- 不提供 serializable 隔离、范围/谓词冲突检测、write-skew 防止、HTTP 跨请求事务或分布式事务；
 - 不提供 TLS、认证或授权；
 - 不承诺生产 SLA、容量规划或高并发表现；
 - 不覆盖多进程共享数据目录、掉电一致性或设备故障证明；
 - 不提供公开 `BATCHED` durability mode；组提交只作为 `SYNC` 的内部优化存在；
-- 不提供自动周期 checkpoint、增量/COW checkpoint、事务或 MVCC；R4-B 的显式 SAVE/shutdown 使用后台全量快照；
+- 不提供自动周期 checkpoint 或增量/COW checkpoint；显式 SAVE/shutdown 使用后台全量快照；
 - 不提供多写者。
 
 ## 文档

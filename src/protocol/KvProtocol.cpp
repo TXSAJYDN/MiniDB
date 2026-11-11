@@ -117,6 +117,12 @@ std::string KvProtocol::command_type_to_string(uint8_t type) {
         return "SAVE";
     case kStats:
         return "STATS";
+    case kBegin:
+        return "BEGIN";
+    case kCommit:
+        return "COMMIT";
+    case kRollback:
+        return "ROLLBACK";
     case kOk:
         return "OK";
     case kError:
@@ -127,6 +133,8 @@ std::string KvProtocol::command_type_to_string(uint8_t type) {
         return "NOTFOUND";
     case kInteger:
         return "INTEGER";
+    case kConflict:
+        return "CONFLICT";
     default:
         return "UNKNOWN";
     }

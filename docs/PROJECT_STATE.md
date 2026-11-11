@@ -5,8 +5,8 @@
 - 权威开发工作树：`/home/win11/projects/miniDB`（WSL2 Ubuntu 24.04）
 - Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
-- 当前阶段：**R0-R3、R4-A 已完成；R4-B 后台全量 checkpoint 已实现并通过本地六配置、故障注入和正式证据采集**
-- 当前测试清单：**348 项 CTest**（以 R4-B 的六配置本地验证矩阵为准）
+- 当前阶段：**R0-R3、R4-A、R4-B 和 R4-C 已完成；下一步是 R4-D，先以 ADR-009 冻结设计**
+- 当前测试清单：**395 项 CTest**（以 R4-C 的六配置本地验证矩阵为准）
 
 ## 1. 当前结论
 
@@ -30,6 +30,8 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 - HTTP `/stats` 与 KV `STATS` 共享的持久化诊断快照；
 - R4-A 成功 append、data fsync、`SYNC` 持久化路径计时、固定 fsync 延迟桶和顶层 `group_commit` 指标；
 - R4-B checkpoint admission/capture/serialize/write/fsync/manifest/cleanup 分段指标及 `background_checkpoint_state`；
+- Snapshot Isolation + first-committer-wins 显式事务，per-key 版本链、私有写集和单条 `kTxn` 原子提交；
+- 事务活跃/版本/提交/冲突/GC 诊断指标及 `BEGIN/COMMIT/ROLLBACK` 协议；
 - C01-C14 崩溃点、固定 seed 随机 `kill -9`、尾部/中间损坏和故障注入测试；
 - HTTP、KV、WAL record、checkpoint manifest 四个 fuzz target；
 - 18 种配置的 durability/客户端/负载可靠性 benchmark。
@@ -49,7 +51,7 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 | R3 性能、恢复与公开证据 | DONE | 18 配置 × 5 轮 benchmark、恢复/暂停/RSS/写放大数据 |
 | R4-A 组提交 | DONE; G1-G7 PASS | ADR-006、writer/queue/batch/completion、异步协议、SAVE/shutdown barrier、338 项测试、完整质量门禁和正式 G4（5 轮，median QPS 2,858.989） |
 | R4-B 后台全量 checkpoint | DONE | ADR-007、两阶段 barrier、独立 snapshot capture、后台 RDB I/O、完整 live segment manifest、348 项测试和正式 artifact |
-| R4-C MVCC/事务 | NOT STARTED | 独立阶段，先以 ADR 冻结版本链、WAL 与 checkpoint barrier |
+| R4-C MVCC/事务 | DONE | ADR-008、版本链、Snapshot Isolation、first-committer-wins、单记录 `kTxn`、GC/TTL、事务协议和恢复；395 项测试 |
 
 ## 3. 新定位与范围
 
@@ -68,13 +70,13 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 - SQL 解析器/执行器；
 - 完整 Redis 命令和协议兼容；
 - 复制、Raft、集群、分片；
-- 事务、MVCC、隔离级别；
+- serializable 隔离、范围/谓词冲突检测或 write-skew 防止；
 - TLS、认证、授权、多租户；
 - 多进程共享一个数据目录；
 - 生产 SLA、容量规划或高并发宣传；
 - 公开 `BATCHED` durability mode；组提交仅作为 `SYNC` 的内部优化；
 - 自动周期 checkpoint、增量/COW checkpoint、多写者；R4-B 仅提供显式 SAVE/shutdown 的后台全量快照；
-- 事务、MVCC、隔离级别（R4-C 单独准入）。
+- HTTP 跨请求事务、分布式事务、多写者。
 
 ## 4. 持久化语义
 
@@ -144,16 +146,21 @@ manifest + 旧 WAL 仍是权威恢复输入。
 | group-commit admission queue | 4,096 entries / 64 MiB |
 | 单个物理 WAL batch | 256 records / 16 MiB |
 | group-commit completion backlog | 4,096 entries / 64 MiB |
+| 活跃显式事务 | 64 |
+| 单事务写 key / payload | 256 keys / 1 MiB |
+| 全局版本条目 | 1,000,000 |
 
 ## 6. 当前验证状态
 
-R4-A 组提交与 R4-B 后台 checkpoint 的本地质量门禁包括：
+R4-A 组提交、R4-B 后台 checkpoint 与 R4-C MVCC 事务的本地质量门禁包括：
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种配置；
-- 每个配置 **348 项 CTest**；
-- **25 个 `ProcessIntegrationTest.*` 进程级用例**，含后台 checkpoint、RDB rename 后/manifest 前崩溃、HTTP/KV 异步协议、客户端断开和 shutdown 失败退出码；
+- 每个配置 **395 项 CTest**；
+- **26 个 `ProcessIntegrationTest.*` 进程级用例**，含后台 checkpoint、RDB rename 后/manifest 前崩溃、HTTP/KV 异步协议、事务契约、客户端断开和 shutdown 失败退出码；
 - 后台 checkpoint 状态机、独立快照 capture、完整 live segment 保留、cleanup 失败重试和析构回调安全测试；
+- 版本链、Snapshot Isolation、read-your-writes、first-committer-wins、pending commit 冲突窗口、只读提交、断连回滚、原子 `kTxn` 恢复、TTL/GC 和资源上限测试；
 - HTTP、KV、WAL record、checkpoint manifest 四个 fuzz target，各 20,000 runs，seed `20261111`；
+- `transactions` JSON 契约和 HTTP/KV 双协议事务测试；
 - clang-format dry-run、clang-tidy、`git diff --check`；
 - 18 配置 × 5 轮 R3 可靠性 benchmark，seed `20261111`；
 - R4-A 的 `/stats`/`STATS` timing 契约、fsync 桶分区和 v2 可靠性 benchmark；
@@ -249,7 +256,9 @@ R4-A v2 clean baseline 则为 4.63x。吞吐和延迟改善伴随更高的 clien
 - `INTERVAL` 最近一个 flush 窗口内的已确认写可能丢失。
 - 只有单机单写者；`flock` 是 advisory lock，不能阻止第三方直接修改文件。
 - 32 连接上限保持不变；benchmark 的 32-client 配置是边界，不是扩展性结论。
-- 无 TLS、认证、授权、复制、集群、事务或 MVCC。
+- 无 TLS、认证、授权、复制或集群。
+- 事务固定为 Snapshot Isolation + first-committer-wins；不提供 serializable 隔离，允许 write skew。
+- HTTP 不提供跨请求事务；活跃事务只存在于单个 KV 连接和当前进程内。
 - WSL2 结果与硬件计数器限制必须随数据一起说明。
 - G3 的 `pending_count` 是外部请求重叠机会的上界；G4 才证明当前实现的实际收益。
 - G4 只代表 WSL2 同机 loopback、closed-loop、32 客户端和固定数据集；不是
@@ -282,14 +291,15 @@ R4-A v2 clean baseline 则为 4.63x。吞吐和延迟改善伴随更高的 clien
 
 ## 9. 后续工作
 
-R4-A 和 R4-B 已关闭：实现、本地门禁、正式 artifact、文档和发布门禁均已闭环。
+R4-A、R4-B 和 R4-C 已关闭：实现、本地门禁、文档和发布门禁均已闭环。
 
-1. R4-B 的最终证据提交必须先在自身 `main` HEAD 上通过 GitHub Actions 9/9；
-2. R4-C（MVCC/事务）是独立阶段：先写 ADR，只提交 ADR 并等待 9/9，之后才写实现；
-3. R4-C 实现必须重新通过 TSan、崩溃矩阵、fuzz 和资源上限验证，不能牺牲
-   “确认写不丢、恢复失败不发布部分 Store”的语义；
-4. R4-D（AI Agent 持久状态后端）同样先写 ADR、提交并等待 9/9，之后才实现；
-5. 许可证保持最后处理。
+1. R4-D（AI Agent 持久状态后端）是下一阶段：先写并单独提交 ADR-009，冻结
+   幂等键、lease、CAS/version、会话/工具调用状态恢复、有界资源和崩溃语义；
+2. ADR-009 必须在该提交自身的 `main` HEAD 上取得 GitHub Actions 9/9，之后才
+   允许修改实现代码；
+3. R4-D 实现必须重新通过 TSan、崩溃矩阵、fuzz、静态分析和资源上限验证，不能
+   牺牲“确认写不丢、恢复失败不发布部分 Store”的语义；
+4. 许可证保持最后处理，不在 ADR-009 或 R4-D 实现中修改 `LICENSE`/`COPYING`。
 
-> 注：R4-B 文档提交前，上面的远程 CI 9/9 尚未发生；必须以该提交自身的 checks
-> 为准，不能用实现提交 `fbfd6a6` 的结果替代。
+> 注：最终 R4-C 证据提交以自身 `main` HEAD 的 checks 为准，不能继承实现提交
+> `d659a66` 或任何更早提交的结果。

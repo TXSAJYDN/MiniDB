@@ -159,9 +159,21 @@ This rule applies to both in-process replay and startup recovery:
   the in-memory apply failed during normal operation. The process fail-stops,
   and the next recovery retries the complete record atomically.
 
-A read-only explicit transaction does not write a WAL record. Once the R4-C
-session layer is enabled, a synthetic empty transaction must never be encoded
-as MTXN because the format requires at least one operation.
+A read-only explicit transaction does not write a WAL record and does not
+allocate an LSN. COMMIT returns LSN `0` for that case. A synthetic empty
+transaction must never be encoded as MTXN because the format requires at least
+one operation.
+
+Explicit transaction state is memory-only. An active transaction's private
+write set is never written to a checkpoint and is discarded when the session
+closes, the server shuts down, or the process crashes. A committed transaction
+exists only as one complete `kTxn` record; recovery publishes all of its keys at
+one LSN or none of them. There is no partial-transaction recovery mode.
+
+Checkpoint capture includes committed state through `checkpoint_lsn` only. The
+manifest retains every live WAL segment needed to replay committed transaction
+records after that boundary. Rollback, conflict, BEGIN, and read-only COMMIT
+produce no WAL record, so restart cannot introduce an uncommitted write.
 
 ## Why old manifests can be valid
 
@@ -188,8 +200,10 @@ semantic effect.
 | Concurrent connections | 32 |
 | Key size | 1 KiB |
 | Value / standalone WAL payload | 1 MiB |
+| Active explicit transactions | 64 |
 | MTXN operations per transaction | 256 |
 | MTXN payload per transaction | 1 MiB |
+| Global version entries | 1,000,000 |
 | WAL segment | 16 MiB |
 | Total WAL bytes | 256 MiB |
 | Segments | 128 |
@@ -213,6 +227,7 @@ nonzero, does not listen, and does not publish a partial store.
 | WAL middle corruption | nonzero exit |
 | v1 transaction record | nonzero exit |
 | MTXN payload invalid or duplicate key | nonzero exit; no partial transaction |
+| Version budget exceeded during replay | nonzero exit; no partial store |
 | WAL tail partial outer record | truncate + fsync, then start |
 | Missing referenced segment | nonzero exit |
 | LSN gap or duplicate | nonzero exit |

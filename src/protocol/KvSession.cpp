@@ -18,7 +18,9 @@ KvSession::KvSession(const TcpConnectionPtr& conn,
       processing_(false), closing_(false), closed_(false),
       drain_scheduled_(false) {}
 
-KvSession::~KvSession() = default;
+KvSession::~KvSession() {
+    rollback_active_transaction();
+}
 
 void KvSession::start() {
     if (started_ || !conn_) {
@@ -149,6 +151,15 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
             !validate_key(cmd.args[0], "SET")) {
             return true;
         }
+        if (active_txn_id_ != 0) {
+            const PersistenceManager::TransactionResult result =
+                persistence_manager_->transaction_set(active_txn_id_,
+                                                      cmd.args[0], cmd.args[1]);
+            if (!result.ok()) {
+                return send_transaction_failure(result.status, result.error);
+            }
+            return send_response(KvProtocol::kOk, {});
+        }
         if (persistence_manager_) {
             std::weak_ptr<KvSession> weak = weak_from_this();
             const MutationAdmission admission = persistence_manager_->set_async(
@@ -167,7 +178,19 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
         if (!require_args(1, "GET requires 1 argument") ||
             !validate_key(cmd.args[0], "GET")) {
             return true;
-        } else {
+        }
+        if (active_txn_id_ != 0) {
+            const PersistenceManager::TransactionResult result =
+                persistence_manager_->transaction_get(active_txn_id_,
+                                                      cmd.args[0]);
+            if (!result.ok()) {
+                return send_transaction_failure(result.status, result.error);
+            }
+            return result.found
+                       ? send_response(KvProtocol::kValue, {result.value})
+                       : send_response(KvProtocol::kNotFound, {});
+        }
+        {
             const auto value = store_->get(cmd.args[0]);
             return value.has_value()
                        ? send_response(KvProtocol::kValue, {value.value()})
@@ -178,7 +201,18 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
         if (!require_args(1, "DEL requires 1 argument") ||
             !validate_key(cmd.args[0], "DEL")) {
             return true;
-        } else {
+        }
+        if (active_txn_id_ != 0) {
+            const PersistenceManager::TransactionResult result =
+                persistence_manager_->transaction_del(active_txn_id_,
+                                                      cmd.args[0]);
+            if (!result.ok()) {
+                return send_transaction_failure(result.status, result.error);
+            }
+            return send_response(KvProtocol::kInteger,
+                                 {result.changed ? "1" : "0"});
+        }
+        {
             if (persistence_manager_) {
                 std::weak_ptr<KvSession> weak = weak_from_this();
                 const MutationAdmission admission =
@@ -209,6 +243,15 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
             send_response(KvProtocol::kError, {"Invalid TTL"});
             return true;
         }
+        if (active_txn_id_ != 0) {
+            const PersistenceManager::TransactionResult result =
+                persistence_manager_->transaction_expire(active_txn_id_,
+                                                         cmd.args[0], ttl_ms);
+            if (!result.ok()) {
+                return send_transaction_failure(result.status, result.error);
+            }
+            return send_response(KvProtocol::kOk, {});
+        }
         if (persistence_manager_) {
             std::weak_ptr<KvSession> weak = weak_from_this();
             const MutationAdmission admission =
@@ -225,23 +268,105 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
         return send_response(KvProtocol::kOk, {});
     }
 
-    case KvProtocol::kTtl:
+    case KvProtocol::kTtl: {
         if (!require_args(1, "TTL requires 1 argument") ||
             !validate_key(cmd.args[0], "TTL")) {
             return true;
-        } else {
-            const auto info = store_->ttl_info(cmd.args[0]);
-            switch (info.state) {
-            case KvStore::TtlState::kMissing:
-                return send_response(KvProtocol::kInteger, {"-2"});
-            case KvStore::TtlState::kNoExpiry:
-                return send_response(KvProtocol::kInteger, {"-1"});
-            case KvStore::TtlState::kExpiring:
-                return send_response(KvProtocol::kInteger,
-                                     {std::to_string(info.remaining_ms)});
+        }
+        KvStore::TtlResult info;
+        if (active_txn_id_ != 0) {
+            const PersistenceManager::TransactionResult result =
+                persistence_manager_->transaction_ttl(active_txn_id_,
+                                                      cmd.args[0]);
+            if (!result.ok()) {
+                return send_transaction_failure(result.status, result.error);
             }
+            info = result.ttl;
+        } else {
+            info = store_->ttl_info(cmd.args[0]);
+        }
+        switch (info.state) {
+        case KvStore::TtlState::kMissing:
+            return send_response(KvProtocol::kInteger, {"-2"});
+        case KvStore::TtlState::kNoExpiry:
+            return send_response(KvProtocol::kInteger, {"-1"});
+        case KvStore::TtlState::kExpiring:
+            return send_response(KvProtocol::kInteger,
+                                 {std::to_string(info.remaining_ms)});
+        }
+        return true;
+    }
+
+    case KvProtocol::kBegin: {
+        if (!require_args(0, "BEGIN takes no arguments")) {
             return true;
         }
+        if (!persistence_manager_) {
+            send_response(KvProtocol::kError, {"Transactions are unavailable"});
+            return true;
+        }
+        if (active_txn_id_ != 0) {
+            send_response(KvProtocol::kError, {"Transaction already active"});
+            return true;
+        }
+        const PersistenceManager::TransactionBeginResult result =
+            persistence_manager_->begin_transaction();
+        if (!result.ok()) {
+            return send_transaction_failure(result.status, result.error);
+        }
+        active_txn_id_ = result.txn_id;
+        return send_response(KvProtocol::kOk, {std::to_string(result.txn_id)});
+    }
+
+    case KvProtocol::kCommit: {
+        if (!require_args(0, "COMMIT takes no arguments")) {
+            return true;
+        }
+        if (!persistence_manager_) {
+            send_response(KvProtocol::kError, {"Transactions are unavailable"});
+            return true;
+        }
+        if (active_txn_id_ == 0) {
+            send_response(KvProtocol::kError, {"No active transaction"});
+            return true;
+        }
+        const std::uint64_t txn_id = active_txn_id_;
+        // Once COMMIT is admitted the manager owns its completion.  In
+        // particular, clearing this id first ensures a disconnect cannot
+        // roll back a commit that already owns a WAL slot.
+        active_txn_id_ = 0;
+        std::weak_ptr<KvSession> weak = weak_from_this();
+        const MutationAdmission admission =
+            persistence_manager_->commit_transaction_async(
+                txn_id, [weak](MutationOutcome outcome) {
+                    if (auto self = weak.lock()) {
+                        self->on_commit_completed(std::move(outcome));
+                    }
+                });
+        return begin_async_operation(admission);
+    }
+
+    case KvProtocol::kRollback: {
+        if (!require_args(0, "ROLLBACK takes no arguments")) {
+            return true;
+        }
+        if (!persistence_manager_) {
+            send_response(KvProtocol::kError, {"Transactions are unavailable"});
+            return true;
+        }
+        if (active_txn_id_ == 0) {
+            send_response(KvProtocol::kError, {"No active transaction"});
+            return true;
+        }
+        const std::uint64_t txn_id = active_txn_id_;
+        active_txn_id_ = 0;
+        const PersistenceManager::TransactionResult result =
+            persistence_manager_->rollback_transaction(txn_id);
+        if (!result.ok()) {
+            return send_transaction_failure(result.status, result.error);
+        }
+        return send_response(KvProtocol::kOk, {});
+    }
 
     case KvProtocol::kSave:
         if (!require_args(0, "SAVE takes no arguments")) {
@@ -319,6 +444,63 @@ void KvSession::on_mutation_completed(MutationOutcome outcome,
     send_response(success_type, {});
 }
 
+void KvSession::on_commit_completed(MutationOutcome outcome) {
+    if (closed_) {
+        return;
+    }
+    if (!outcome.ok()) {
+        send_mutation_failure(outcome);
+        return;
+    }
+    send_response(KvProtocol::kOk, {std::to_string(outcome.lsn)});
+}
+
+bool KvSession::send_transaction_failure(MutationStatus status,
+                                         const std::string& error) {
+    // Resource and persistence failures abort the manager-side transaction.
+    // Invalid arguments are rejected before mutating its state.
+    if (active_txn_id_ != 0 && status != MutationStatus::kInvalidArgument) {
+        active_txn_id_ = 0;
+    }
+    if (status == MutationStatus::kConflict) {
+        return send_response(KvProtocol::kConflict, {});
+    }
+
+    std::string message = "Transaction failed";
+    switch (status) {
+    case MutationStatus::kInvalidArgument:
+        message = error.empty() ? "Invalid transaction argument" : error;
+        break;
+    case MutationStatus::kResourceLimit:
+        message = error.empty() ? "Transaction resource limit exceeded" : error;
+        break;
+    case MutationStatus::kNotReady:
+        message = "Transactions are not accepting writes";
+        break;
+    case MutationStatus::kIoError:
+        message = "Transaction persistence write failed";
+        break;
+    case MutationStatus::kNoTransaction:
+        message = "Transaction is not active";
+        break;
+    case MutationStatus::kConflict:
+    case MutationStatus::kOk:
+        break;
+    }
+    return send_response(KvProtocol::kError, {message});
+}
+
+void KvSession::rollback_active_transaction() {
+    if (active_txn_id_ == 0) {
+        return;
+    }
+    const std::uint64_t txn_id = active_txn_id_;
+    active_txn_id_ = 0;
+    if (persistence_manager_ != nullptr) {
+        (void)persistence_manager_->rollback_transaction(txn_id);
+    }
+}
+
 void KvSession::on_save_completed(RdbSaveResult result,
                                   const std::string& error) {
     if (closed_) {
@@ -350,6 +532,12 @@ void KvSession::send_mutation_failure(const MutationOutcome& outcome) {
     case MutationStatus::kNotReady:
         message = "Persistence is not accepting writes";
         break;
+    case MutationStatus::kNoTransaction:
+        message = "Transaction is not active";
+        break;
+    case MutationStatus::kConflict:
+        send_response(KvProtocol::kConflict, {});
+        return;
     case MutationStatus::kIoError:
     case MutationStatus::kOk:
         break;
@@ -370,6 +558,12 @@ void KvSession::send_admission_failure(const MutationAdmission& admission) {
     case MutationAdmissionStatus::kIoError:
         message = "Persistence write failed";
         break;
+    case MutationAdmissionStatus::kNoTransaction:
+        message = "Transaction is not active";
+        break;
+    case MutationAdmissionStatus::kConflict:
+        send_response(KvProtocol::kConflict, {});
+        return;
     case MutationAdmissionStatus::kNotReady:
     case MutationAdmissionStatus::kShuttingDown:
     case MutationAdmissionStatus::kAccepted:
@@ -381,6 +575,7 @@ void KvSession::send_admission_failure(const MutationAdmission& admission) {
 bool KvSession::send_response(KvProtocol::CommandType type,
                               const std::vector<std::string>& args) {
     if (!conn_ || closed_ || !conn_->connected()) {
+        rollback_active_transaction();
         closed_ = true;
         return false;
     }
@@ -403,6 +598,7 @@ bool KvSession::send_response(KvProtocol::CommandType type,
 }
 
 void KvSession::fail_and_close(const std::string& message) {
+    rollback_active_transaction();
     if (closed_ || closing_) {
         return;
     }
@@ -440,6 +636,7 @@ void KvSession::on_write_complete() {
     }
     processing_ = false;
     if (!conn_ || !conn_->connected()) {
+        rollback_active_transaction();
         closed_ = true;
         return;
     }

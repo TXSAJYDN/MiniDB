@@ -41,6 +41,13 @@ have completed. A complete record may reach the page cache before an fsync
 failure; recovery may therefore observe an unacknowledged write. That is allowed.
 An acknowledged write disappearing is not allowed.
 
+For explicit transactions, BEGIN, ROLLBACK, conflict, and a read-only COMMIT do
+not enter either set because they write no WAL. A complete COMMIT record may be
+in the possible set even if the client did not receive its success response.
+After recovery, that transaction must appear with every key update or not at all.
+In `SYNC` mode, a successful COMMIT response means the complete transaction is
+in the ack set and every key it wrote must survive a process crash.
+
 `INTERVAL` deliberately widens the possible set: an acknowledged write is not
 guaranteed durable until the next flush. The window is bounded by the 100 ms
 timer, checkpoint, or graceful-shutdown flush, subject to scheduling and I/O.
@@ -70,6 +77,30 @@ survives power loss. C09 uses an old manifest and the complete old WAL on a newe
 snapshot to exercise the publication ordering. C13 is deterministic because the
 seed and operation schedule are fixed; a failure can be reproduced from the seed
 and preserved files.
+
+## Transaction crash semantics
+
+R4-C adds these required properties:
+
+- one COMMIT is one WAL record and one LSN; recovery applies every operation in
+  that record atomically or rejects the record without publishing a prefix;
+- a crash after BEGIN or during transaction-local writes leaves no committed
+  state because the private write set is memory-only;
+- ROLLBACK and conflict produce no WAL and cannot resurrect an older value after
+  restart;
+- checkpoint capture excludes active transaction-private write sets; a crash may
+  discard those uncommitted writes while preserving every committed `kTxn`
+  record through manifest/WAL replay;
+- version GC must not remove a version required by an active snapshot or change
+  the state produced by replay;
+- a torn outer transaction record is truncatable only at the final WAL tail; a
+  complete record with an invalid MTXN payload is fatal and never partially
+  applied.
+
+The process suite exercises transaction commit/rollback, disconnect rollback,
+conflict handling, stats shape, and recovery after a committed transaction
+record. Unit tests cover malformed MTXN payloads, duplicate keys, atomic replay,
+snapshot visibility, TTL selection, and version-budget behavior.
 
 ## Checkpoint ordering under crash
 
@@ -135,7 +166,9 @@ The deterministic crash points are implemented in
 - missing WAL segment;
 - WAL middle corruption;
 - random fixed-seed `SIGKILL`;
-- TTL crash recovery.
+- TTL crash recovery;
+- explicit transaction contract, disconnect rollback, and committed `kTxn`
+  recovery.
 
 Four fuzz targets exercise the HTTP parser, KV frame parser, WAL record codec,
 and checkpoint manifest codec:

@@ -7,6 +7,11 @@ designed for MiniDB's single-node, bounded-resource environment. It is not a
 Redis wire-protocol implementation and does not provide a general command
 language.
 
+Explicit multi-key transactions are available on the binary protocol only.
+They provide snapshot isolation with first-committer-wins conflict detection;
+HTTP does not expose a transaction handle. See
+[ADR-008](decisions/008-mvcc-transactions.md) for the frozen semantics.
+
 ## Transport
 
 The KV server accepts TCP connections, normally on port 6379. The protocol is
@@ -61,10 +66,14 @@ value.
 | `TTL` | 6 | key | `INTEGER`, semantics below |
 | `SAVE` | 7 | 0 | `OK` if checkpoint publication is durable, else `ERROR` |
 | `STATS` | 8 | 0 | `VALUE` with one JSON argument |
+| `BEGIN` | 9 | 0 | `OK` with one ASCII transaction id |
+| `COMMIT` | 10 | 0 | `OK` with one ASCII commit LSN (`0` for a read-only transaction) |
+| `ROLLBACK` | 11 | 0 | `OK` with no arguments |
 
-Mutation commands are `SET`, `DEL`, and `EXPIRE`. Their response is sent only
-after the persistence manager accepts the mutation according to the selected
-durability mode.
+Mutation commands are `SET`, `DEL`, and `EXPIRE`. A standalone mutation is an
+implicit one-operation transaction. Its response is sent only after the
+persistence manager accepts the mutation according to the selected durability
+mode.
 
 ## Durability modes
 
@@ -86,6 +95,114 @@ failure.
 If a WAL append or required fsync fails, the persistence layer enters
 fail-stop. The operation returns `ERROR`, later mutations also fail, and the
 process does not pretend that an unpersisted mutation succeeded.
+
+## Explicit transactions
+
+`BEGIN`, `COMMIT`, and `ROLLBACK` are valid only on a connection that does not
+already have an active transaction:
+
+- `BEGIN` with a transaction already active returns `ERROR`; it does not replace
+  or commit the existing transaction.
+- `COMMIT` or `ROLLBACK` without an active transaction returns `ERROR`.
+- `BEGIN` returns a decimal ASCII transaction id. The id is scoped to the
+  current connection and server process; it is not a reconnect token.
+- Argument, key, or TTL validation errors inside a transaction return `ERROR`
+  but keep the transaction active so the client can correct the command.
+- Resource-limit and persistence failures end the transaction. The client must
+  not assume that an earlier private write is still usable.
+
+Inside a transaction, `SET`, `GET`, `DEL`, `EXPIRE`, and `TTL` operate on the
+transaction's private write set and snapshot. `SAVE` and `STATS` are not
+transaction-local data operations. A second `ROLLBACK` after a successful
+rollback returns `ERROR`.
+
+### Isolation and visibility
+
+MiniDB implements snapshot isolation with first-committer-wins:
+
+1. `BEGIN` records `snapshot_lsn`, the greatest LSN already applied at that
+   moment.
+2. A read first checks the transaction's private write set, then the newest
+   committed version with `commit_lsn <= snapshot_lsn`. This provides
+   read-your-writes, repeatable reads for keys not written by the transaction,
+   and no dirty reads.
+3. A missing or tombstone version is returned as missing/not found. If the
+   selected version is expired, the transaction sees a missing key; it never
+   falls back to an older version.
+4. At `COMMIT`, admission checks every key in the private write set. A conflict
+   exists when either the last committed write or an accepted-but-not-yet-applied
+   pending commit for that key has an LSN greater than `snapshot_lsn`:
+
+   ~~~text
+   max(committed_key_lsn, pending_key_lsn) > snapshot_lsn
+   ~~~
+
+   If any key conflicts, the whole transaction returns `CONFLICT` and publishes
+   nothing. Otherwise one `kTxn` WAL record represents the complete transaction
+   under one LSN and is applied atomically.
+
+This is not serializable isolation. Concurrent transactions can read and write
+different keys and produce write skew; there is no predicate, range, or
+serializability conflict check. Applications that need serializable behavior
+must serialize the relevant decision themselves.
+
+### Commit, rollback, and connection loss
+
+- A successful `COMMIT` for a transaction with at least one write receives one
+  new LSN and follows the selected durability mode. In `SYNC` mode the response
+  is sent only after the WAL batch containing the transaction record is fsynced
+  and the complete transaction has been applied.
+- A read-only transaction commits without writing WAL and without allocating an
+  LSN. Its response is `OK` with argument `0`.
+- `ROLLBACK` discards the private write set, does not write WAL, and does not
+  allocate an LSN.
+- A write conflict returns `CONFLICT`, discards the transaction, does not write
+  WAL, and does not allocate an LSN.
+- Once a `COMMIT` is accepted and the response is successful, disconnecting does
+  not undo it. If the connection closes before a successful response, the client
+  must treat the outcome as unknown and reconcile on reconnect.
+- An uncommitted transaction is rolled back when the connection closes, the
+  session is destroyed, or the server shuts down. Private writes are never
+  included in a checkpoint and are never visible to another connection.
+
+### Transaction resource limits
+
+| Item | Hard limit |
+|---|---:|
+| Active transactions | 64 |
+| Distinct write keys per transaction | 256 |
+| Transaction payload | 1 MiB |
+| Global version entries | 1,000,000 |
+| Value | 1 MiB |
+| Key | 1 KiB |
+
+Version garbage collection may retain history needed by active snapshots. If it
+cannot respect the hard version budget, the server rejects the operation rather
+than silently breaking snapshot reads. Long-running or abandoned snapshots can
+therefore cause bounded resource rejections.
+
+### Wire examples
+
+`BEGIN` request and response for transaction id `1`:
+
+~~~text
+00 00 00 02 09 00
+00 00 00 07 65 01 00 00 00 01 31
+~~~
+
+`COMMIT` request and response for LSN `42`:
+
+~~~text
+00 00 00 02 0a 00
+00 00 00 08 65 01 00 00 00 02 34 32
+~~~
+
+Conflict response:
+
+~~~text
+00 00 00 02 69 00
+~~~
+
 
 ## `SET`
 
@@ -176,6 +293,27 @@ shape as the HTTP `/stats` response and is produced from one coherent
   "next_lsn": 43,
   "wal_bytes": 4096,
   "wal_segment_count": 1,
+  "transactions": {
+    "active": 0,
+    "started": 5,
+    "committed": 4,
+    "conflicted": 0,
+    "rolled_back": 1,
+    "failed": 0,
+    "write_conflicts": 0,
+    "max_active": 2,
+    "versions_current": 42,
+    "versions_max": 84,
+    "versions_reclaimed": 0,
+    "oldest_snapshot_lag_lsn": 0,
+    "max_oldest_snapshot_lag_lsn": 7,
+    "commit_records": 3,
+    "commit_bytes": 512,
+    "commit_total_us": 12000,
+    "commit_max_us": 9000,
+    "gc_total_us": 0,
+    "gc_max_us": 0
+  },
   "persistence": {
     "mutations": 42,
     "sync_mutations": 42,
@@ -297,11 +435,23 @@ end-to-end latency. A SAVE response arrives only after manifest publication;
 cleanup failure after that point leaves safe residue and does not erase the
 published checkpoint.
 
+An active explicit transaction is not part of the checkpoint. Its private write
+set is discarded on shutdown or crash, while committed `kTxn` records after the
+captured checkpoint LSN are retained by the manifest and replayed on startup.
+
 The top-level `group_commit` object reports admission queue entries/bytes and
 rejections, successful batch counts and size distribution, physical data fsyncs,
 writer/completion timings, completion backlog high-water marks, failure counters,
 and `writer_state`. Batch-size bucket bounds are `1,2,4,8,16,32,64,128`; the
 ninth count is the `129..256` overflow bucket.
+
+The top-level `transactions` object reports transaction counts, active and
+version high-water marks, snapshot lag, successful transaction-WAL records and
+bytes, commit admission-to-apply timings, and GC timings. `active` includes
+transactions in the committing window. `versions_current` counts physical
+version entries, including tombstones; `oldest_snapshot_lag_lsn` is zero when
+there is no active snapshot. These are bounded diagnostic counters, not SLOs or
+arbitrary-latency quantiles.
 
 ## Response commands
 
@@ -312,6 +462,7 @@ ninth count is the `129..256` overflow bucket.
 | `VALUE` | 102 | One raw value argument |
 | `NOTFOUND` | 103 | No arguments |
 | `INTEGER` | 104 | One decimal ASCII integer argument |
+| `CONFLICT` | 105 | No arguments; the transaction was discarded without WAL |
 
 Responses use exactly the same frame layout as requests.
 
@@ -320,6 +471,11 @@ Responses use exactly the same frame layout as requests.
 - Invalid argument count, invalid key size/length, invalid TTL text, or `SAVE`
   failure returns `ERROR` but leaves the connection usable unless the failure is
   a persisted fail-stop condition.
+- Invalid transaction command sequences and argument errors leave an existing
+  transaction active. `CONFLICT`, transaction resource exhaustion, or a
+  persistence failure ends it.
+- A connection close rolls back its uncommitted transaction. Once COMMIT is
+  accepted, connection loss does not revoke it.
 - An unknown command code returns `ERROR` and closes the connection.
 - A malformed frame, oversized declared frame, truncated final frame that
   exceeds the pending budget, or response that cannot be represented within the
@@ -414,3 +570,4 @@ python3 test_kv_client.py 6379
 - [Recovery model](recovery.md)
 - [Crash consistency](crash-consistency.md)
 - [HTTP protocol](protocol-http.md)
+- [ADR-008: MVCC and snapshot-isolation transactions](decisions/008-mvcc-transactions.md)

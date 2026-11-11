@@ -14,6 +14,7 @@ class HttpResponse {
         k200Ok = 200,
         k400BadRequest = 400,
         k404NotFound = 404,
+        k409Conflict = 409,
         k405MethodNotAllowed = 405,
         k408RequestTimeout = 408,
         k413RequestEntityTooLarge = 413,

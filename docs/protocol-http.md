@@ -17,6 +17,11 @@ The parser rejects HTTP/1.0 and other well-formed versions with 505, malformed
 versions with 400, and unsupported transfer framing rather than guessing at a
 message boundary.
 
+HTTP does not expose explicit transactions. Every `POST /kv/<key>` and
+`DELETE /kv/<key>` is an implicit one-operation transaction; there is no
+cross-request transaction handle, snapshot, or rollback token. Use the binary KV
+protocol when multi-key atomicity or snapshot isolation is required.
+
 ## Durability context
 
 The HTTP server wraps the same persistence engine as the binary KV server. The
@@ -127,8 +132,11 @@ For `/kv/<key>`:
 - the key must be 1..1024 bytes;
 - values are binary-safe and may be empty;
 - POST clears any existing TTL for the key;
-- HTTP does not expose EXPIRE or TTL operations; use the binary protocol for
-  those commands.
+- HTTP does not expose EXPIRE, TTL, BEGIN, COMMIT, or ROLLBACK; use the binary
+  protocol for those commands.
+- Each HTTP KV mutation is an independent implicit transaction. Two requests
+  cannot be committed atomically together, and an HTTP connection cannot pin a
+  snapshot across requests.
 
 A known path with the wrong method returns 405 with an `Allow` header. A known
 method on an unknown path returns 404. A valid extension method returns 501.
@@ -179,6 +187,27 @@ checkpoint: residue is safe and a later SAVE retries cleanup.
   "next_lsn": 43,
   "wal_bytes": 4096,
   "wal_segment_count": 1,
+  "transactions": {
+    "active": 0,
+    "started": 5,
+    "committed": 4,
+    "conflicted": 0,
+    "rolled_back": 1,
+    "failed": 0,
+    "write_conflicts": 0,
+    "max_active": 2,
+    "versions_current": 42,
+    "versions_max": 84,
+    "versions_reclaimed": 0,
+    "oldest_snapshot_lag_lsn": 0,
+    "max_oldest_snapshot_lag_lsn": 7,
+    "commit_records": 3,
+    "commit_bytes": 512,
+    "commit_total_us": 12000,
+    "commit_max_us": 9000,
+    "gc_total_us": 0,
+    "gc_max_us": 0
+  },
   "persistence": {
     "mutations": 42,
     "sync_mutations": 42,
@@ -311,6 +340,13 @@ The top-level `group_commit` object reports:
 - completion backlog high-water marks;
 - `writer_failures`, `append_failures`, `fsync_failures`, and `writer_state`
   (`disabled`, `running`, `paused`, `draining`, `stopped`, or `failed`).
+
+The top-level `transactions` object reports binary-KV explicit transaction
+counts, active/version high-water marks, snapshot lag, transaction-WAL records
+and bytes, commit timings, and GC timings. HTTP requests cannot create explicit
+transactions, but a KV client connected to the same persistence manager may
+contribute to these counters. `active` includes transactions in the committing
+window. The fields are diagnostic counters, not SLOs.
 
 If the persistence manager was never opened, `/stats` returns 503 with the
 plain-text body `Persistence is not open\n`. Once a manager exists and has

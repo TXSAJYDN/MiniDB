@@ -20,7 +20,28 @@ inline std::string persistence_stats_json(const PersistenceSnapshot& stats) {
         << ",\"next_lsn\":" << stats.next_lsn
         << ",\"wal_bytes\":" << stats.wal_bytes
         << ",\"wal_segment_count\":" << stats.wal_segment_count
-        << ",\"persistence\":{\"mutations\":" << stats.persistence.mutations
+        << ",\"transactions\":{\"active\":" << stats.transactions.active
+        << ",\"started\":" << stats.transactions.started
+        << ",\"committed\":" << stats.transactions.committed
+        << ",\"conflicted\":" << stats.transactions.conflicted
+        << ",\"rolled_back\":" << stats.transactions.rolled_back
+        << ",\"failed\":" << stats.transactions.failed
+        << ",\"write_conflicts\":" << stats.transactions.write_conflicts
+        << ",\"max_active\":" << stats.transactions.max_active
+        << ",\"versions_current\":" << stats.transactions.versions_current
+        << ",\"versions_max\":" << stats.transactions.versions_max
+        << ",\"versions_reclaimed\":" << stats.transactions.versions_reclaimed
+        << ",\"oldest_snapshot_lag_lsn\":"
+        << stats.transactions.oldest_snapshot_lag_lsn
+        << ",\"max_oldest_snapshot_lag_lsn\":"
+        << stats.transactions.max_oldest_snapshot_lag_lsn
+        << ",\"commit_records\":" << stats.transactions.commit_records
+        << ",\"commit_bytes\":" << stats.transactions.commit_bytes
+        << ",\"commit_total_us\":" << stats.transactions.commit_total_us
+        << ",\"commit_max_us\":" << stats.transactions.commit_max_us
+        << ",\"gc_total_us\":" << stats.transactions.gc_total_us
+        << ",\"gc_max_us\":" << stats.transactions.gc_max_us
+        << "},\"persistence\":{\"mutations\":" << stats.persistence.mutations
         << ",\"sync_mutations\":" << stats.persistence.sync_mutations
         << ",\"interval_mutations\":" << stats.persistence.interval_mutations
         << ",\"checkpoints\":" << stats.persistence.checkpoints

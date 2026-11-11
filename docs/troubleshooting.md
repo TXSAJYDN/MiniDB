@@ -1,6 +1,6 @@
 # Troubleshooting
 
-This guide targets the current R0-R4-B reliability implementation: WAL + RDB
+This guide targets the current R0-R4-C reliability implementation: WAL + RDB
 checkpoint + manifest recovery, `SYNC` and `INTERVAL` durability, the
 single-writer lock, and the bounded group-commit writer. It is diagnostic
 guidance for a local engineering prototype, not a production runbook.
@@ -21,7 +21,7 @@ clang++ --version
 ctest --test-dir build/release -N | tail -n 3
 ~~~
 
-The final local acceptance inventory is 348 CTest cases, including 25
+The final local acceptance inventory is 395 CTest cases, including 26
 `ProcessIntegrationTest.*` cases. Always identify the build directory and
 configuration you are actually using; an old or partial build can report a
 different count.
@@ -51,19 +51,20 @@ cmake --build build/debug -j2
 ctest --test-dir build/debug -N | tail -n 3
 ~~~
 
-The current inventory is 348 tests. A lower count usually means an old build
+The current inventory is 395 tests. A lower count usually means an old build
 directory or an incomplete build. The 214 count in
 `docs/A_H_ACCEPTANCE_REPORT.md` is historical pre-WAL evidence and is not the
 current inventory.
 
 ## A process integration test is missing
 
-The current process suite has 25 cases and covers CLI validation, HTTP/KV
+The current process suite has 26 cases and covers CLI validation, HTTP/KV
 persistence, TTL scanner lifecycle, corrupt startup, save failure, crash
 recovery, interval flush, writer-lock conflict, WAL tail truncation, manifest
 corruption, missing WAL segment, middle-of-file WAL corruption, legacy import,
 random kill replay, TTL crash recovery, async mutation ordering, group-commit
-stats, shutdown failure exit codes, the stats contract, and the background-checkpoint rename-before-manifest crash.
+stats, shutdown failure exit codes, the stats contract, the transaction
+contract, and the background-checkpoint rename-before-manifest crash.
 
 Run only that suite in Release:
 
@@ -71,7 +72,7 @@ Run only that suite in Release:
 ctest --preset release -R '^ProcessIntegrationTest\.' --output-on-failure
 ~~~
 
-If fewer than 25 are discovered, rebuild the full test target rather than
+If fewer than 26 are discovered, rebuild the full test target rather than
 running `process_integration_test.py` ad hoc outside CTest.
 
 ## TSan fails with unexpected memory mapping
@@ -249,6 +250,36 @@ A limit breach is a startup error, not a reason to raise the limit blindly.
 Check for a runaway workload, a checkpoint that never completed, or an
 unexpectedly large WAL directory. Increase a limit only in code, after reviewing
 the matching resource-policy decision and adding tests.
+
+## A transaction returns CONFLICT
+
+`CONFLICT=105` is a normal snapshot-isolation write-write conflict, not an I/O
+failure. The conflicting transaction ended without allocating an LSN or writing
+a WAL record. Re-run the business operation from a new `BEGIN` against a fresh
+snapshot; do not retry `COMMIT` on the old transaction handle.
+
+First-committer-wins checks both the latest applied key LSN and accepted pending
+commits. Consequently, a conflict can include a write that has not yet appeared
+in the latest visible value because its COMMIT is still queued behind group
+commit. Check the `transactions.write_conflicts` and
+`transactions.conflicted` counters in `STATS`/`/stats`; they are expected to
+change under concurrent writers.
+
+## A transaction command reports a state or resource error
+
+One connection can own at most one active transaction. Nested `BEGIN`,
+`COMMIT`/`ROLLBACK` without an active transaction, or mutations with an invalid
+transaction state return a protocol error without damaging the connection.
+
+Parameter and state errors keep an active transaction open so the caller can
+correct the request. Exceeding the 64-active-transaction, 256-write-key, 1-MiB
+transaction-payload, or 1,000,000-version limit terminates the affected
+transaction; the client must `BEGIN` again. Persistence and allocation failures
+are fail-stop conditions rather than retryable transaction errors.
+
+An accepted `COMMIT` still finishes if the client disconnects. An uncommitted
+transaction is rolled back on disconnect, session destruction, or shutdown, and
+none of its private writes are included in an RDB checkpoint.
 
 ## Persistence entered fail-stop
 

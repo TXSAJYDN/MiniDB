@@ -173,6 +173,31 @@ TEST(KvProtocolTest, PreservesUnknownCommandTypeForSessionValidation) {
     EXPECT_TRUE(parsed.args.empty());
 }
 
+TEST(KvProtocolTest, TransactionCommandCodesAndNamesAreFrozen) {
+    EXPECT_EQ(static_cast<int>(KvProtocol::kBegin), 9);
+    EXPECT_EQ(static_cast<int>(KvProtocol::kCommit), 10);
+    EXPECT_EQ(static_cast<int>(KvProtocol::kRollback), 11);
+    EXPECT_EQ(static_cast<int>(KvProtocol::kConflict), 105);
+    EXPECT_EQ(KvProtocol::command_type_to_string(KvProtocol::kBegin), "BEGIN");
+    EXPECT_EQ(KvProtocol::command_type_to_string(KvProtocol::kCommit),
+              "COMMIT");
+    EXPECT_EQ(KvProtocol::command_type_to_string(KvProtocol::kRollback),
+              "ROLLBACK");
+    EXPECT_EQ(KvProtocol::command_type_to_string(KvProtocol::kConflict),
+              "CONFLICT");
+
+    for (const auto type :
+         {KvProtocol::kBegin, KvProtocol::kCommit, KvProtocol::kRollback}) {
+        const auto encoded = KvProtocol::encode_command(type, {});
+        KvProtocol::Command parsed;
+        EXPECT_EQ(
+            KvProtocol::parse_command(encoded.data(), encoded.size(), &parsed),
+            static_cast<int>(encoded.size()));
+        EXPECT_EQ(static_cast<int>(parsed.type), static_cast<int>(type));
+        EXPECT_TRUE(parsed.args.empty());
+    }
+}
+
 TEST(KvProtocolTest, NullInputsAreRejected) {
     KvProtocol::Command parsed;
     const uint8_t byte = 0;

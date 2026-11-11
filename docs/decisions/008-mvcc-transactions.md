@@ -1,6 +1,6 @@
 # ADR-008：R4-C MVCC 与快照隔离事务
 
-- 状态：Proposed — 仅冻结设计；实现尚未开始，必须在本 ADR 单独提交并取得自身 9/9 CI 后才能落地
+- 状态：Accepted — 已按本 ADR 实现并通过本地六配置门禁；远程验收以实现提交自身的 9/9 CI 为准
 - 日期：2026-11-11
 - 关联：`docs/MiniDB-可靠性与持久化升级计划书.md`、ADR-002、ADR-003、ADR-004、ADR-006、ADR-007、`docs/wal-format.md`、`docs/recovery.md`、`docs/protocol-kv.md`
 - 决策范围：R4-C 的版本链、隔离级别、冲突检测、事务 WAL、协议、资源上限、GC、TTL、checkpoint 与恢复语义
@@ -476,6 +476,7 @@ shutdown 先拒绝新事务/外部 mutation，再等待已受理的 COMMIT 和 s
 
 指标是诊断数据，不是 SLA；没有任意分位数。字段名和嵌套位置一旦进入实现，
 必须由 JSON 契约测试锁定。
+
 ## 12. 代码落点
 
 - `src/storage/KvStore.{h,cpp}`：版本链、snapshot read、原子
@@ -561,3 +562,22 @@ WAL 记录被静默跳过或无界版本增长，立即冻结 R4-C，不允许�
 本 ADR 单独提交、推送 `main` 并通过该提交自身的完整 GitHub Actions 9/9 前，
 不得开始修改实现代码。实现开始后如果本 ADR 的格式、隔离级别或失败语义发生
 变化，必须更新 ADR 并重新经过同等 CI/证据门禁。
+
+## 17. 实现与验证记录
+
+R4-C 的实现落在 KvStore 版本链、PersistenceManager 事务表、WAL v2 kTxn
+编解码、KvSession 事务路由和 stats JSON 契约中；具体文件见第 12 节。下列
+结果来自本次实现工作树的本地门禁，不替代远程 CI：
+
+- Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种配置均为 395/395
+  CTest 通过；
+- 进程级套件包含 26 个 ProcessIntegrationTest 用例，覆盖事务契约、异步
+  HTTP/KV、断连安全和 checkpoint/恢复路径；
+- git diff --check、Python 语法检查、clang-format dry-run 通过；
+- clang-tidy 运行完成，未产生用户代码错误；现有性能类警告不作为构建失败；
+- minidb_http_parser_fuzz、minidb_kv_protocol_fuzz、minidb_wal_record_fuzz、
+  minidb_checkpoint_manifest_fuzz 各以 seed 20261111 运行 20,000 次，均正常
+  结束且 artifact 目录为空；
+- ASan/UBSan/ASan+UBSan 未报告内存错误或未定义行为，TSan 未报告数据竞争；
+- 实现提交推送 main 后，必须在该提交自身取得 GitHub Actions 9/9；本记录不
+  预填或继承其他提交的 run ID。

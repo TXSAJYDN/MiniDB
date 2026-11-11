@@ -4,8 +4,10 @@
 #include "../src/net/InetAddress.h"
 #include "../src/net/TcpServer.h"
 #include "../src/protocol/KvProtocol.h"
+#include "../src/protocol/KvServer.h"
 #include "../src/protocol/KvSession.h"
 #include "../src/storage/KvStore.h"
+#include "RdbTestUtil.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -18,9 +20,11 @@
 #include <atomic>
 #include <exception>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <map>
 #include <memory>
@@ -330,6 +334,302 @@ class KvSessionIntegrationTest : public ::testing::Test {
     std::atomic<RdbSaveResult> save_result_{RdbSaveResult::Ok};
     uint16_t port_ = 0;
 };
+
+class KvPersistenceIntegrationTest : public ::testing::Test {
+  protected:
+    void StartServer() {
+        temp_dir_ = minidb_test::make_unique_temp_dir("minidb_kv_txn_");
+        rdb_path_ = temp_dir_ + "/db.rdb";
+        std::promise<uint16_t> ready;
+        auto port = ready.get_future();
+        server_thread_ =
+            std::thread([this, ready = std::move(ready)]() mutable {
+                bool published = false;
+                try {
+                    EventLoop loop;
+                    loop_pointer_.store(&loop);
+                    KvServer server(&loop, InetAddress(0, true), rdb_path_,
+                                    DurabilityMode::kSync);
+                    if (!server.load_rdb()) {
+                        throw std::runtime_error("failed to open persistence");
+                    }
+                    server.start();
+                    server_pointer_.store(&server);
+                    persistence_manager_.store(server.persistence_manager());
+                    ready.set_value(server.listen_address().port());
+                    published = true;
+                    loop.loop();
+                    persistence_manager_.store(nullptr);
+                    server_pointer_.store(nullptr);
+                    loop_pointer_.store(nullptr);
+                } catch (...) {
+                    persistence_manager_.store(nullptr);
+                    server_pointer_.store(nullptr);
+                    loop_pointer_.store(nullptr);
+                    if (!published) {
+                        ready.set_exception(std::current_exception());
+                    }
+                }
+            });
+
+        ASSERT_EQ(port.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        port_ = port.get();
+        ASSERT_NE(port_, 0);
+    }
+
+    void TearDown() override {
+        EventLoop* loop = loop_pointer_.load();
+        KvServer* server = server_pointer_.load();
+        if (loop != nullptr && server != nullptr) {
+            loop->queue_in_loop([server]() { server->begin_shutdown(); });
+        } else if (loop != nullptr) {
+            loop->quit();
+        }
+        if (server_thread_.joinable()) {
+            server_thread_.join();
+        }
+        if (!temp_dir_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(temp_dir_, ec);
+        }
+    }
+
+    KvProtocol::Command Request(KvClient* client, KvProtocol::CommandType type,
+                                const std::vector<std::string>& args = {}) {
+        client->SendFrame(Frame(type, args));
+        return client->ReadFrame();
+    }
+
+    std::uint64_t Begin(KvClient* client) {
+        const auto response = Request(client, KvProtocol::kBegin);
+        EXPECT_EQ(static_cast<int>(response.type),
+                  static_cast<int>(KvProtocol::kOk));
+        EXPECT_EQ(response.args.size(), 1u);
+        std::uint64_t txn_id = 0;
+        if (response.args.size() == 1) {
+            const std::string& text = response.args[0];
+            const auto parsed =
+                std::from_chars(text.data(), text.data() + text.size(), txn_id);
+            EXPECT_EQ(parsed.ec, std::errc());
+            EXPECT_EQ(parsed.ptr, text.data() + text.size());
+        }
+        return txn_id;
+    }
+
+    bool WaitForTransactions(
+        const std::function<bool(const TransactionStats&)>& predicate,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            PersistenceManager* manager = persistence_manager_.load();
+            if (manager != nullptr &&
+                predicate(manager->snapshot().transactions)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+
+    std::thread server_thread_;
+    std::atomic<EventLoop*> loop_pointer_{nullptr};
+    std::atomic<KvServer*> server_pointer_{nullptr};
+    std::atomic<PersistenceManager*> persistence_manager_{nullptr};
+    std::string temp_dir_;
+    std::string rdb_path_;
+    uint16_t port_ = 0;
+};
+
+TEST_F(KvPersistenceIntegrationTest,
+       TransactionsReadTheirWritesAndKeepTheirBeginSnapshot) {
+    StartServer();
+    KvClient setup;
+    setup.ConnectTo(port_);
+    ExpectType(Request(&setup, KvProtocol::kSet, {"key", "before"}),
+               KvProtocol::kOk);
+
+    KvClient writer;
+    writer.ConnectTo(port_);
+    const std::uint64_t writer_id = Begin(&writer);
+    ASSERT_GT(writer_id, 0u);
+    ExpectType(Request(&writer, KvProtocol::kSet, {"key", "inside"}),
+               KvProtocol::kOk);
+    const auto own_read = Request(&writer, KvProtocol::kGet, {"key"});
+    ExpectType(own_read, KvProtocol::kValue);
+    ASSERT_EQ(own_read.args.size(), 1u);
+    EXPECT_EQ(own_read.args[0], "inside");
+
+    KvClient reader;
+    reader.ConnectTo(port_);
+    const std::uint64_t reader_id = Begin(&reader);
+    ASSERT_GT(reader_id, 0u);
+    const auto before_commit = Request(&reader, KvProtocol::kGet, {"key"});
+    ExpectType(before_commit, KvProtocol::kValue);
+    ASSERT_EQ(before_commit.args.size(), 1u);
+    EXPECT_EQ(before_commit.args[0], "before");
+
+    const auto committed = Request(&writer, KvProtocol::kCommit);
+    ExpectType(committed, KvProtocol::kOk);
+    ASSERT_EQ(committed.args.size(), 1u);
+    std::uint64_t commit_lsn = 0;
+    const auto parsed_lsn = std::from_chars(
+        committed.args[0].data(),
+        committed.args[0].data() + committed.args[0].size(), commit_lsn);
+    ASSERT_EQ(parsed_lsn.ec, std::errc());
+    EXPECT_EQ(parsed_lsn.ptr,
+              committed.args[0].data() + committed.args[0].size());
+    EXPECT_EQ(commit_lsn, 2u);
+
+    const auto repeated = Request(&reader, KvProtocol::kGet, {"key"});
+    ExpectType(repeated, KvProtocol::kValue);
+    ASSERT_EQ(repeated.args.size(), 1u);
+    EXPECT_EQ(repeated.args[0], "before");
+
+    const auto read_only_commit = Request(&reader, KvProtocol::kCommit);
+    ExpectType(read_only_commit, KvProtocol::kOk);
+    ASSERT_EQ(read_only_commit.args.size(), 1u);
+    EXPECT_EQ(read_only_commit.args[0], "0");
+
+    const auto visible = Request(&setup, KvProtocol::kGet, {"key"});
+    ExpectType(visible, KvProtocol::kValue);
+    ASSERT_EQ(visible.args.size(), 1u);
+    EXPECT_EQ(visible.args[0], "inside");
+}
+
+TEST_F(KvPersistenceIntegrationTest,
+       ConflictingWriterGetsConflictAndRollbackDiscardsWrites) {
+    StartServer();
+    KvClient first;
+    KvClient second;
+    first.ConnectTo(port_);
+    second.ConnectTo(port_);
+
+    const std::uint64_t first_id = Begin(&first);
+    const std::uint64_t second_id = Begin(&second);
+    ASSERT_GT(first_id, 0u);
+    ASSERT_GT(second_id, 0u);
+    EXPECT_NE(first_id, second_id);
+    ExpectType(Request(&first, KvProtocol::kSet, {"race", "first"}),
+               KvProtocol::kOk);
+    ExpectType(Request(&second, KvProtocol::kSet, {"race", "second"}),
+               KvProtocol::kOk);
+    ExpectType(Request(&first, KvProtocol::kCommit), KvProtocol::kOk);
+    ExpectType(Request(&second, KvProtocol::kCommit), KvProtocol::kConflict);
+
+    const auto winner = Request(&first, KvProtocol::kGet, {"race"});
+    ExpectType(winner, KvProtocol::kValue);
+    ASSERT_EQ(winner.args.size(), 1u);
+    EXPECT_EQ(winner.args[0], "first");
+
+    const std::uint64_t rollback_id = Begin(&first);
+    ASSERT_GT(rollback_id, 0u);
+    ExpectType(Request(&first, KvProtocol::kSet, {"rollback", "value"}),
+               KvProtocol::kOk);
+    ExpectType(Request(&first, KvProtocol::kRollback), KvProtocol::kOk);
+    ExpectType(Request(&first, KvProtocol::kGet, {"rollback"}),
+               KvProtocol::kNotFound);
+
+    EXPECT_TRUE(WaitForTransactions([](const TransactionStats& stats) {
+        return stats.started == 3u && stats.committed == 1u &&
+               stats.conflicted == 1u && stats.rolled_back == 1u &&
+               stats.active == 0u;
+    }));
+}
+
+TEST_F(KvPersistenceIntegrationTest,
+       TransactionStateErrorsKeepTheConnectionAndActiveTransactionUsable) {
+    StartServer();
+    KvClient client;
+    client.ConnectTo(port_);
+
+    ExpectType(Request(&client, KvProtocol::kCommit), KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kRollback), KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kBegin, {"unexpected"}),
+               KvProtocol::kError);
+
+    const std::uint64_t txn_id = Begin(&client);
+    ASSERT_GT(txn_id, 0u);
+    ExpectType(Request(&client, KvProtocol::kBegin), KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kSet, {"invalid-args"}),
+               KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kGet), KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kGet, {"missing"}),
+               KvProtocol::kNotFound);
+    ExpectType(Request(&client, KvProtocol::kSet, {"kept", "value"}),
+               KvProtocol::kOk);
+    ExpectType(Request(&client, KvProtocol::kCommit, {"unexpected"}),
+               KvProtocol::kError);
+    ExpectType(Request(&client, KvProtocol::kCommit), KvProtocol::kOk);
+
+    const auto value = Request(&client, KvProtocol::kGet, {"kept"});
+    ExpectType(value, KvProtocol::kValue);
+    ASSERT_EQ(value.args.size(), 1u);
+    EXPECT_EQ(value.args[0], "value");
+    ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
+}
+
+TEST_F(KvPersistenceIntegrationTest,
+       DisconnectRollsBackAndAcceptedCommitStillCompletes) {
+    StartServer();
+    {
+        KvClient abandoned;
+        abandoned.ConnectTo(port_);
+        const std::uint64_t txn_id = Begin(&abandoned);
+        ASSERT_GT(txn_id, 0u);
+        ExpectType(Request(&abandoned, KvProtocol::kSet, {"abandoned", "no"}),
+                   KvProtocol::kOk);
+    }
+    EXPECT_TRUE(WaitForTransactions([](const TransactionStats& stats) {
+        return stats.rolled_back == 1u && stats.active == 0u;
+    }));
+
+    KvClient observer;
+    observer.ConnectTo(port_);
+    ExpectType(Request(&observer, KvProtocol::kGet, {"abandoned"}),
+               KvProtocol::kNotFound);
+
+    {
+        KvClient committing;
+        committing.ConnectTo(port_);
+        const std::uint64_t txn_id = Begin(&committing);
+        ASSERT_GT(txn_id, 0u);
+        ExpectType(Request(&committing, KvProtocol::kSet, {"accepted", "yes"}),
+                   KvProtocol::kOk);
+        committing.SendFrame(Frame(KvProtocol::kCommit, {}));
+    }
+    EXPECT_TRUE(WaitForTransactions(
+        [](const TransactionStats& stats) { return stats.committed == 1u; }));
+    const auto committed = WaitForTransactions(
+        [](const TransactionStats& stats) { return stats.committed == 1u; });
+    ASSERT_TRUE(committed);
+    std::optional<std::string> visible;
+    for (int attempt = 0; attempt < 100 && !visible.has_value(); ++attempt) {
+        const auto value = Request(&observer, KvProtocol::kGet, {"accepted"});
+        ExpectType(value, KvProtocol::kValue);
+        if (value.args.size() == 1) {
+            visible = value.args[0];
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    EXPECT_EQ(visible, std::optional<std::string>("yes"));
+}
+
+TEST_F(KvSessionIntegrationTest, TransactionCommandsReportUnavailable) {
+    StartServer();
+    KvClient client;
+    client.ConnectTo(port_);
+
+    for (const auto command :
+         {KvProtocol::kBegin, KvProtocol::kCommit, KvProtocol::kRollback}) {
+        const auto response = Request(&client, command);
+        ExpectType(response, KvProtocol::kError);
+        ASSERT_EQ(response.args.size(), 1u);
+        EXPECT_NE(response.args[0].find("unavailable"), std::string::npos);
+    }
+    ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
+}
 
 TEST_F(KvSessionIntegrationTest, LargeKeyAndValueSurviveFragmentedWireInput) {
     StartServer();

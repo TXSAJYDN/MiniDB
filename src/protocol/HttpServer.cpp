@@ -49,6 +49,14 @@ void set_service_unavailable(HttpResponse* resp, const std::string& message) {
     resp->set_body("{\"status\":\"error\",\"message\":\"" + message + "\"}\n");
 }
 
+void set_conflict(HttpResponse* resp) {
+    resp->set_status_code(HttpResponse::k409Conflict);
+    resp->set_status_message("Conflict");
+    resp->set_content_type("application/json");
+    resp->set_body(
+        "{\"status\":\"error\",\"message\":\"Transaction conflict\"}\n");
+}
+
 void set_mutation_failure(HttpResponse* resp, MutationStatus status,
                           const std::string& error) {
     switch (status) {
@@ -64,6 +72,12 @@ void set_mutation_failure(HttpResponse* resp, MutationStatus status,
         return;
     case MutationStatus::kNotReady:
         set_service_unavailable(resp, "Persistence is not accepting writes");
+        return;
+    case MutationStatus::kNoTransaction:
+        set_internal_error(resp, "Transaction is not active");
+        return;
+    case MutationStatus::kConflict:
+        set_conflict(resp);
         return;
     case MutationStatus::kIoError:
     case MutationStatus::kOk:
@@ -88,6 +102,12 @@ void set_admission_failure(HttpResponse* resp,
         return;
     case MutationAdmissionStatus::kIoError:
         set_internal_error(resp, "Persistence write failed");
+        return;
+    case MutationAdmissionStatus::kNoTransaction:
+        set_internal_error(resp, "Transaction is not active");
+        return;
+    case MutationAdmissionStatus::kConflict:
+        set_conflict(resp);
         return;
     case MutationAdmissionStatus::kNotReady:
     case MutationAdmissionStatus::kShuttingDown:

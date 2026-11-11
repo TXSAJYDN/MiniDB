@@ -1272,6 +1272,435 @@ TEST(PersistenceManagerTest,
     EXPECT_FALSE(checkpoint_completed);
 }
 
+std::optional<MutationOutcome> commit_and_wait(PersistenceManager* manager,
+                                               OwnerPump* pump,
+                                               std::uint64_t txn_id,
+                                               int* callback_count = nullptr) {
+    bool done = false;
+    MutationOutcome outcome;
+    const MutationAdmission admission = manager->commit_transaction_async(
+        txn_id, [&](MutationOutcome committed) {
+            outcome = std::move(committed);
+            if (callback_count != nullptr) {
+                ++*callback_count;
+            }
+            done = true;
+        });
+    EXPECT_TRUE(admission.accepted()) << admission.error;
+    if (!admission.accepted()) {
+        return std::nullopt;
+    }
+    EXPECT_TRUE(pump->RunUntil([&]() { return done; }));
+    return outcome;
+}
+
+TEST(PersistenceManagerTest,
+     TransactionsProvideSnapshotIsolationRepeatableReadAndReadYourWrites) {
+    DatabasePaths paths("minidb_transaction_isolation_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    ASSERT_TRUE(manager.set("key", "before").ok());
+    ASSERT_TRUE(manager.set("other", "stable").ok());
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    const auto writer = manager.begin_transaction();
+    ASSERT_TRUE(writer.ok()) << writer.error;
+    const auto reader = manager.begin_transaction();
+    ASSERT_TRUE(reader.ok()) << reader.error;
+
+    ASSERT_TRUE(manager.transaction_set(writer.txn_id, "key", "tx1").ok());
+    const auto own_read = manager.transaction_get(writer.txn_id, "key");
+    ASSERT_TRUE(own_read.ok()) << own_read.error;
+    ASSERT_TRUE(own_read.found);
+    EXPECT_EQ(own_read.value, "tx1");
+
+    const auto committed = commit_and_wait(&manager, &pump, writer.txn_id);
+    ASSERT_TRUE(committed.has_value());
+    ASSERT_TRUE(committed->ok()) << committed->error;
+    EXPECT_EQ(store->get("key"), std::optional<std::string>("tx1"));
+
+    const auto repeated = manager.transaction_get(reader.txn_id, "key");
+    ASSERT_TRUE(repeated.ok()) << repeated.error;
+    ASSERT_TRUE(repeated.found);
+    EXPECT_EQ(repeated.value, "before");
+    const auto stable = manager.transaction_get(reader.txn_id, "other");
+    ASSERT_TRUE(stable.ok()) << stable.error;
+    ASSERT_TRUE(stable.found);
+    EXPECT_EQ(stable.value, "stable");
+
+    int reader_callbacks = 0;
+    const auto read_only =
+        commit_and_wait(&manager, &pump, reader.txn_id, &reader_callbacks);
+    ASSERT_TRUE(read_only.has_value());
+    ASSERT_TRUE(read_only->ok()) << read_only->error;
+    EXPECT_EQ(read_only->lsn, 0u);
+    EXPECT_EQ(reader_callbacks, 1);
+}
+
+TEST(PersistenceManagerTest,
+     TwoTransactionsWritingOneKeyHaveExactlyOneCommittedWinner) {
+    DatabasePaths paths("minidb_transaction_conflict_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    const auto first = manager.begin_transaction();
+    const auto second = manager.begin_transaction();
+    ASSERT_TRUE(first.ok()) << first.error;
+    ASSERT_TRUE(second.ok()) << second.error;
+    ASSERT_TRUE(manager.transaction_set(first.txn_id, "same", "first").ok());
+    ASSERT_TRUE(manager.transaction_set(second.txn_id, "same", "second").ok());
+
+    const auto first_outcome = commit_and_wait(&manager, &pump, first.txn_id);
+    ASSERT_TRUE(first_outcome.has_value());
+    ASSERT_TRUE(first_outcome->ok()) << first_outcome->error;
+
+    const MutationAdmission second_outcome =
+        manager.commit_transaction_async(second.txn_id, {});
+    EXPECT_EQ(second_outcome.status, MutationAdmissionStatus::kConflict);
+    EXPECT_EQ(manager.transaction_get(second.txn_id, "same").status,
+              MutationStatus::kNoTransaction);
+    EXPECT_EQ(store->get("same"), std::optional<std::string>("first"));
+
+    const PersistenceSnapshot snapshot = manager.snapshot();
+    EXPECT_EQ(snapshot.transactions.started, 2u);
+    EXPECT_EQ(snapshot.transactions.committed, 1u);
+    EXPECT_EQ(snapshot.transactions.conflicted, 1u);
+    EXPECT_EQ(snapshot.transactions.write_conflicts, 1u);
+    EXPECT_EQ(snapshot.transactions.active, 0u);
+}
+
+TEST(PersistenceManagerTest,
+     PendingCommitConflictWindowRejectsASecondWriterBeforeApply) {
+    DatabasePaths paths("minidb_transaction_pending_conflict_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    const auto first = manager.begin_transaction();
+    const auto second = manager.begin_transaction();
+    ASSERT_TRUE(first.ok()) << first.error;
+    ASSERT_TRUE(second.ok()) << second.error;
+    ASSERT_TRUE(manager.transaction_set(first.txn_id, "pending", "one").ok());
+    ASSERT_TRUE(manager.transaction_set(second.txn_id, "pending", "two").ok());
+
+    int callback_count = 0;
+    MutationOutcome first_completed;
+    ASSERT_TRUE(manager
+                    .commit_transaction_async(first.txn_id,
+                                              [&](MutationOutcome outcome) {
+                                                  first_completed =
+                                                      std::move(outcome);
+                                                  ++callback_count;
+                                              })
+                    .accepted());
+    const MutationAdmission second_admission =
+        manager.commit_transaction_async(second.txn_id, {});
+    EXPECT_EQ(second_admission.status, MutationAdmissionStatus::kConflict);
+    EXPECT_EQ(store->get("pending"), std::nullopt);
+
+    ASSERT_TRUE(pump.RunUntil([&]() { return callback_count != 0; }));
+    pump.RunPending();
+    EXPECT_EQ(callback_count, 1);
+    EXPECT_TRUE(first_completed.ok()) << first_completed.error;
+    EXPECT_EQ(first_completed.lsn, 1u);
+    EXPECT_EQ(store->get("pending"), std::optional<std::string>("one"));
+}
+
+TEST(PersistenceManagerTest,
+     TransactionWriteSetFoldsSetDeleteExpireTtlAndSetClearsTtl) {
+    DatabasePaths paths("minidb_transaction_write_set_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    ASSERT_TRUE(manager.set("ttl", "old").ok());
+    ASSERT_TRUE(manager.expire("ttl", 5000).ok());
+    ASSERT_TRUE(manager.set("deleted", "remove").ok());
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    const auto transaction = manager.begin_transaction();
+    ASSERT_TRUE(transaction.ok()) << transaction.error;
+    ASSERT_TRUE(
+        manager.transaction_set(transaction.txn_id, "ttl", "temporary").ok());
+    auto ttl = manager.transaction_ttl(transaction.txn_id, "ttl");
+    ASSERT_TRUE(ttl.ok()) << ttl.error;
+    EXPECT_EQ(ttl.ttl.state, KvStore::TtlState::kNoExpiry);
+
+    ASSERT_TRUE(
+        manager.transaction_expire(transaction.txn_id, "ttl", 2000).ok());
+    ttl = manager.transaction_ttl(transaction.txn_id, "ttl");
+    ASSERT_TRUE(ttl.ok()) << ttl.error;
+    EXPECT_EQ(ttl.ttl.state, KvStore::TtlState::kExpiring);
+    EXPECT_EQ(ttl.ttl.remaining_ms, 2000);
+
+    ASSERT_TRUE(
+        manager.transaction_set(transaction.txn_id, "ttl", "final").ok());
+    ttl = manager.transaction_ttl(transaction.txn_id, "ttl");
+    ASSERT_TRUE(ttl.ok()) << ttl.error;
+    EXPECT_EQ(ttl.ttl.state, KvStore::TtlState::kNoExpiry);
+
+    auto deleted = manager.transaction_del(transaction.txn_id, "deleted");
+    ASSERT_TRUE(deleted.ok()) << deleted.error;
+    EXPECT_TRUE(deleted.changed);
+    deleted = manager.transaction_del(transaction.txn_id, "deleted");
+    ASSERT_TRUE(deleted.ok()) << deleted.error;
+    EXPECT_FALSE(deleted.changed);
+    EXPECT_FALSE(manager.transaction_get(transaction.txn_id, "deleted").found);
+
+    ASSERT_TRUE(
+        manager.transaction_set(transaction.txn_id, "expired", "value").ok());
+    ASSERT_TRUE(
+        manager.transaction_expire(transaction.txn_id, "expired", 0).ok());
+    EXPECT_FALSE(manager.transaction_get(transaction.txn_id, "expired").found);
+
+    const std::uint64_t before_commit = manager.snapshot().last_lsn;
+    const auto committed = commit_and_wait(&manager, &pump, transaction.txn_id);
+    ASSERT_TRUE(committed.has_value());
+    ASSERT_TRUE(committed->ok()) << committed->error;
+    EXPECT_EQ(committed->lsn, before_commit + 1);
+
+    EXPECT_EQ(store->get("ttl"), std::optional<std::string>("final"));
+    EXPECT_EQ(store->ttl_info("ttl").state, KvStore::TtlState::kNoExpiry);
+    EXPECT_EQ(store->get("deleted"), std::nullopt);
+    EXPECT_EQ(store->get("expired"), std::nullopt);
+    const PersistenceSnapshot snapshot = manager.snapshot();
+    EXPECT_EQ(snapshot.transactions.commit_records, 1u);
+    EXPECT_GT(snapshot.transactions.commit_bytes, 0u);
+}
+
+TEST(PersistenceManagerTest, ReadOnlyCommitAndRollbackWriteNoWalRecords) {
+    DatabasePaths paths("minidb_transaction_no_wal_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    const PersistenceSnapshot before = manager.snapshot();
+    const auto read_only = manager.begin_transaction();
+    ASSERT_TRUE(read_only.ok()) << read_only.error;
+    const auto read = manager.transaction_get(read_only.txn_id, "missing");
+    ASSERT_TRUE(read.ok()) << read.error;
+    EXPECT_FALSE(read.found);
+
+    int callbacks = 0;
+    const auto committed =
+        commit_and_wait(&manager, &pump, read_only.txn_id, &callbacks);
+    ASSERT_TRUE(committed.has_value());
+    ASSERT_TRUE(committed->ok()) << committed->error;
+    EXPECT_EQ(committed->lsn, 0u);
+    EXPECT_EQ(callbacks, 1);
+
+    const auto rolled_back = manager.begin_transaction();
+    ASSERT_TRUE(rolled_back.ok()) << rolled_back.error;
+    ASSERT_TRUE(
+        manager.transaction_set(rolled_back.txn_id, "unused", "value").ok());
+    const auto rollback = manager.rollback_transaction(rolled_back.txn_id);
+    ASSERT_TRUE(rollback.ok()) << rollback.error;
+
+    const PersistenceSnapshot after = manager.snapshot();
+    EXPECT_EQ(after.last_lsn, before.last_lsn);
+    EXPECT_EQ(after.wal.appends, before.wal.appends);
+    EXPECT_EQ(after.persistence.mutations, before.persistence.mutations);
+    EXPECT_EQ(after.transactions.commit_records, 0u);
+    EXPECT_EQ(after.transactions.committed, 1u);
+    EXPECT_EQ(after.transactions.rolled_back, 1u);
+    EXPECT_EQ(after.transactions.active, 0u);
+}
+
+TEST(PersistenceManagerTest, ActiveSnapshotPinsVersionsUntilRollback) {
+    DatabasePaths paths("minidb_transaction_gc_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    ASSERT_TRUE(manager.set("gc-key", "v1").ok());
+    ASSERT_TRUE(manager.set("gc-key", "v2").ok());
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    const auto reader = manager.begin_transaction();
+    ASSERT_TRUE(reader.ok()) << reader.error;
+    ASSERT_EQ(reader.snapshot_lsn, 2u);
+
+    bool write_done = false;
+    ASSERT_TRUE(manager
+                    .set_async("gc-key", "v3",
+                               [&](MutationOutcome outcome) {
+                                   ASSERT_TRUE(outcome.ok()) << outcome.error;
+                                   write_done = true;
+                               })
+                    .accepted());
+    ASSERT_TRUE(pump.RunUntil([&]() { return write_done; }));
+    EXPECT_EQ(store->version_count(), 2u);
+    const auto isolated = manager.transaction_get(reader.txn_id, "gc-key");
+    ASSERT_TRUE(isolated.ok()) << isolated.error;
+    ASSERT_TRUE(isolated.found);
+    EXPECT_EQ(isolated.value, "v2");
+
+    ASSERT_TRUE(manager.rollback_transaction(reader.txn_id).ok());
+    write_done = false;
+    ASSERT_TRUE(manager
+                    .set_async("gc-key", "v4",
+                               [&](MutationOutcome outcome) {
+                                   ASSERT_TRUE(outcome.ok()) << outcome.error;
+                                   write_done = true;
+                               })
+                    .accepted());
+    ASSERT_TRUE(pump.RunUntil([&]() { return write_done; }));
+    EXPECT_EQ(store->version_count(), 1u);
+    EXPECT_EQ(store->get("gc-key"), std::optional<std::string>("v4"));
+    EXPECT_GE(manager.snapshot().transactions.versions_reclaimed, 2u);
+}
+
+TEST(PersistenceManagerTest,
+     VersionReservationRejectsCommitBeforeAssigningWalLsn) {
+    DatabasePaths paths("minidb_transaction_version_limit_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    KvStore::Limits limits;
+    limits.max_versions = 2;
+    auto store = std::make_shared<KvStore>(clock, limits);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    ASSERT_TRUE(manager.set("base", "value").ok());
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    const auto transaction = manager.begin_transaction();
+    ASSERT_TRUE(transaction.ok()) << transaction.error;
+    ASSERT_TRUE(manager.transaction_set(transaction.txn_id, "a", "1").ok());
+    ASSERT_TRUE(manager.transaction_set(transaction.txn_id, "b", "2").ok());
+    const std::uint64_t before = manager.snapshot().last_lsn;
+    const MutationAdmission admission =
+        manager.commit_transaction_async(transaction.txn_id, {});
+    EXPECT_EQ(admission.status, MutationAdmissionStatus::kResourceLimit);
+    EXPECT_EQ(manager.snapshot().last_lsn, before);
+    EXPECT_EQ(manager.transaction_get(transaction.txn_id, "a").status,
+              MutationStatus::kNoTransaction);
+    EXPECT_EQ(store->version_count(), 1u);
+    EXPECT_EQ(manager.snapshot().transactions.failed, 1u);
+    EXPECT_EQ(manager.snapshot().transactions.active, 0u);
+}
+
+TEST(PersistenceManagerTest,
+     ShutdownRollsBackOpenTransactionsAndDrainsAcceptedCommit) {
+    DatabasePaths paths("minidb_transaction_shutdown_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    const auto active = manager.begin_transaction();
+    const auto committing = manager.begin_transaction();
+    ASSERT_TRUE(active.ok()) << active.error;
+    ASSERT_TRUE(committing.ok()) << committing.error;
+    ASSERT_TRUE(
+        manager.transaction_set(active.txn_id, "uncommitted", "no").ok());
+    ASSERT_TRUE(
+        manager.transaction_set(committing.txn_id, "committed", "yes").ok());
+    ASSERT_TRUE(
+        manager.commit_transaction_async(committing.txn_id, {}).accepted());
+
+    bool shutdown_done = false;
+    RdbSaveResult shutdown_result = RdbSaveResult::Failed;
+    std::string shutdown_error;
+    ASSERT_TRUE(manager.shutdown_async(
+        [&](RdbSaveResult result, const std::string& completion_error) {
+            shutdown_result = result;
+            shutdown_error = completion_error;
+            shutdown_done = true;
+        },
+        &error))
+        << error;
+    ASSERT_TRUE(pump.RunUntil([&]() { return shutdown_done; }));
+    EXPECT_EQ(shutdown_result, RdbSaveResult::Ok) << shutdown_error;
+    EXPECT_TRUE(manager.shutdown_complete());
+    EXPECT_EQ(store->get("committed"), std::optional<std::string>("yes"));
+    EXPECT_EQ(store->get("uncommitted"), std::nullopt);
+    const PersistenceSnapshot snapshot = manager.snapshot();
+    EXPECT_EQ(snapshot.transactions.active, 0u);
+    EXPECT_EQ(snapshot.transactions.committed, 1u);
+    EXPECT_EQ(snapshot.transactions.rolled_back, 1u);
+}
+
+TEST(PersistenceManagerTest,
+     MultiKeyTransactionRecoversAtomicallyAfterRestart) {
+    DatabasePaths paths("minidb_transaction_restart_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    {
+        auto store = std::make_shared<KvStore>(clock);
+        PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+        std::string error;
+        ASSERT_TRUE(manager.open(&error)) << error;
+        OwnerPump pump;
+        ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error))
+            << error;
+
+        const auto transaction = manager.begin_transaction();
+        ASSERT_TRUE(transaction.ok()) << transaction.error;
+        ASSERT_TRUE(
+            manager.transaction_set(transaction.txn_id, "left", "l").ok());
+        ASSERT_TRUE(
+            manager.transaction_set(transaction.txn_id, "right", "r").ok());
+        const auto committed =
+            commit_and_wait(&manager, &pump, transaction.txn_id);
+        ASSERT_TRUE(committed.has_value());
+        ASSERT_TRUE(committed->ok()) << committed->error;
+        ASSERT_EQ(committed->lsn, 1u);
+
+        bool shutdown_done = false;
+        ASSERT_TRUE(manager.shutdown_async(
+            [&](RdbSaveResult result, const std::string& shutdown_error) {
+                EXPECT_EQ(result, RdbSaveResult::Ok) << shutdown_error;
+                shutdown_done = true;
+            },
+            &error))
+            << error;
+        ASSERT_TRUE(pump.RunUntil([&]() { return shutdown_done; }));
+    }
+
+    auto recovered = std::make_shared<KvStore>(clock);
+    PersistenceManager restarted(recovered, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(restarted.open(&error)) << error;
+    EXPECT_EQ(recovered->get("left"), std::optional<std::string>("l"));
+    EXPECT_EQ(recovered->get("right"), std::optional<std::string>("r"));
+    EXPECT_EQ(restarted.snapshot().recovery.checkpoint_lsn, 1u);
+    EXPECT_EQ(restarted.snapshot().recovery.wal_records_replayed, 0u);
+    EXPECT_EQ(restarted.snapshot().last_lsn, 1u);
+}
+
 TEST(PersistenceManagerTest,
      WriterFailureCompletesTheAcceptedMutationAndFailsClosed) {
     DatabasePaths paths("minidb_persistence_writer_failure_");

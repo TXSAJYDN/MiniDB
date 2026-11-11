@@ -15,8 +15,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace minidb {
@@ -31,11 +33,16 @@ enum class MutationStatus : std::uint8_t {
     kIoError,
     kResourceLimit,
     kNotReady,
+    kNoTransaction,
+    kConflict,
 };
 
 struct MutationOutcome {
     MutationStatus status = MutationStatus::kOk;
     bool changed = false;
+    // Assigned for an accepted persistence write.  A read-only transaction
+    // commit deliberately reports zero.
+    std::uint64_t lsn = 0;
     std::string error;
 
     bool ok() const noexcept {
@@ -53,6 +60,8 @@ enum class MutationAdmissionStatus : std::uint8_t {
     kResourceLimit,
     kNotReady,
     kShuttingDown,
+    kNoTransaction,
+    kConflict,
 };
 
 struct MutationAdmission {
@@ -79,6 +88,31 @@ enum class BackgroundCheckpointState : std::uint8_t {
 
 const char*
 background_checkpoint_state_name(BackgroundCheckpointState state) noexcept;
+
+// Transaction counters and resource observations.  Every field is copied under
+// operation_mutex_ into PersistenceSnapshot so diagnostics cannot combine
+// values from unrelated admissions, applies, or GC passes.
+struct TransactionStats {
+    std::uint64_t active = 0;
+    std::uint64_t started = 0;
+    std::uint64_t committed = 0;
+    std::uint64_t conflicted = 0;
+    std::uint64_t rolled_back = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t write_conflicts = 0;
+    std::uint64_t max_active = 0;
+    std::uint64_t versions_current = 0;
+    std::uint64_t versions_max = 0;
+    std::uint64_t versions_reclaimed = 0;
+    std::uint64_t oldest_snapshot_lag_lsn = 0;
+    std::uint64_t max_oldest_snapshot_lag_lsn = 0;
+    std::uint64_t commit_records = 0;
+    std::uint64_t commit_bytes = 0;
+    std::uint64_t commit_total_us = 0;
+    std::uint64_t commit_max_us = 0;
+    std::uint64_t gc_total_us = 0;
+    std::uint64_t gc_max_us = 0;
+};
 
 struct PersistenceStats {
     std::uint64_t mutations = 0;
@@ -134,6 +168,7 @@ struct PersistenceSnapshot {
     RecoveryStats recovery;
     WalManagerStats wal;
     PersistenceStats persistence;
+    TransactionStats transactions;
     GroupCommitStats group_commit;
 };
 
@@ -165,6 +200,50 @@ class PersistenceManager {
     MutationOutcome set(const std::string& key, const std::string& value);
     MutationOutcome del(const std::string& key);
     MutationOutcome expire(const std::string& key, std::int64_t ttl_ms);
+
+    struct TransactionBeginResult {
+        MutationStatus status = MutationStatus::kNotReady;
+        std::uint64_t txn_id = 0;
+        std::uint64_t snapshot_lsn = 0;
+        std::string error;
+
+        bool ok() const noexcept {
+            return status == MutationStatus::kOk;
+        }
+    };
+
+    struct TransactionResult {
+        MutationStatus status = MutationStatus::kOk;
+        bool changed = false;
+        bool found = false;
+        std::string value;
+        KvStore::TtlResult ttl;
+        std::string error;
+
+        bool ok() const noexcept {
+            return status == MutationStatus::kOk;
+        }
+    };
+
+    // Explicit transactions use the same owner-loop admission discipline as
+    // standalone writes.  Read helpers are synchronous because they only touch
+    // the immutable snapshot plus the private write set.
+    TransactionBeginResult begin_transaction();
+    TransactionResult transaction_set(std::uint64_t txn_id,
+                                      const std::string& key,
+                                      const std::string& value);
+    TransactionResult transaction_get(std::uint64_t txn_id,
+                                      const std::string& key);
+    TransactionResult transaction_del(std::uint64_t txn_id,
+                                      const std::string& key);
+    TransactionResult transaction_expire(std::uint64_t txn_id,
+                                         const std::string& key,
+                                         std::int64_t ttl_ms);
+    TransactionResult transaction_ttl(std::uint64_t txn_id,
+                                      const std::string& key);
+    MutationAdmission commit_transaction_async(std::uint64_t txn_id,
+                                               MutationCompletion completion);
+    TransactionResult rollback_transaction(std::uint64_t txn_id);
 
     // Bootstraps a writable WAL (if needed), then starts the dedicated writer
     // thread.  The dispatch must enqueue work on the owner EventLoop and must
@@ -225,10 +304,39 @@ class PersistenceManager {
     }
 
   private:
+    enum class PendingMutationKind : std::uint8_t {
+        kStandalone,
+        kTransaction,
+    };
+
     struct PendingMutation {
         std::uint64_t lsn = 0;
         std::uint64_t started_us = 0;
         MutationCompletion completion;
+        PendingMutationKind kind = PendingMutationKind::kStandalone;
+        std::uint64_t txn_id = 0;
+        std::vector<std::string> keys;
+    };
+
+    enum class TransactionStateKind : std::uint8_t {
+        kActive,
+        kCommitting,
+    };
+
+    struct PendingWrite {
+        bool deleted = false;
+        std::string value;
+        std::int64_t absolute_expiry_ms = 0; // 0 means no expiry
+    };
+
+    struct TransactionState {
+        std::uint64_t txn_id = 0;
+        std::uint64_t snapshot_lsn = 0;
+        std::uint64_t started_us = 0;
+        TransactionStateKind state = TransactionStateKind::kActive;
+        std::unordered_map<std::string, PendingWrite> writes;
+        std::size_t write_bytes = 0;
+        std::size_t reserved_versions = 0;
     };
 
     enum class CheckpointPhase : std::uint8_t {
@@ -266,11 +374,27 @@ class PersistenceManager {
     MutationOutcome del_impl(const std::string& key);
     MutationOutcome expire_impl(const std::string& key, std::int64_t ttl_ms);
     MutationOutcome append_and_apply(const WalRecord& record);
-    MutationAdmission admit_async(WalRecord record,
-                                  MutationCompletion completion);
+    MutationAdmission
+    admit_async(WalRecord record, MutationCompletion completion,
+                PendingMutationKind kind = PendingMutationKind::kStandalone,
+                std::uint64_t txn_id = 0);
     MutationAdmission admission_fail(MutationAdmissionStatus status,
                                      const std::string& error) const;
     MutationOutcome fail(MutationStatus status, const std::string& error);
+    TransactionResult transaction_fail(MutationStatus status,
+                                       const std::string& error) const;
+    TransactionState* find_transaction_locked(std::uint64_t txn_id);
+    TransactionResult abort_transaction_locked(std::uint64_t txn_id,
+                                               MutationStatus status,
+                                               const std::string& error);
+    void finish_transaction_locked(std::uint64_t txn_id);
+    bool garbage_collect_locked(std::string* error);
+    std::vector<std::uint64_t> active_snapshots_locked() const;
+    void observe_transaction_metrics_locked();
+    void add_pending_key_lsn_locked(const std::string& key, std::uint64_t lsn);
+    void remove_pending_keys_locked(const std::vector<std::string>& keys,
+                                    std::uint64_t lsn);
+    std::uint64_t pending_key_lsn_locked(const std::string& key) const;
 
     bool ensure_bootstrapped_locked(std::string* error);
     bool ensure_group_commit_writer_locked(std::string* error);
@@ -320,8 +444,14 @@ class PersistenceManager {
     bool shutdown_requested_ = false;
     bool shutdown_complete_ = false;
     std::deque<PendingMutation> pending_mutations_;
+    std::unordered_map<std::uint64_t, TransactionState> transactions_;
+    std::unordered_map<std::string, std::multiset<std::uint64_t>>
+        pending_key_lsns_;
+    std::uint64_t next_txn_id_ = 1;
+    std::size_t reserved_versions_ = 0;
     std::unique_ptr<CheckpointOperation> checkpoint_operation_;
     PersistenceStats stats_;
+    TransactionStats transaction_stats_;
     std::function<void(const WalRecord&)> after_apply_callback_;
     std::thread checkpoint_worker_;
 };

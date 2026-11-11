@@ -4,8 +4,8 @@
 
 This document records the R0-R3 baseline, the R4-A instrumentation and G3
 batch-formation experiments, the implemented group-commit validation, and the
-R4-B background full-checkpoint validation for MiniDB's crash-consistent
-persistence work. It is deliberately a statement about a tested engineering
+R4-B background full-checkpoint validation, and the R4-C snapshot-isolation
+MVCC transaction validation for MiniDB's crash-consistent persistence work. It is deliberately a statement about a tested engineering
 prototype, not a production qualification.
 
 The evidence covers:
@@ -20,6 +20,9 @@ The evidence covers:
   group-commit writer, and its clean-HEAD G4 benefit run;
 - the implemented two-phase background checkpoint, its phase timings under a
   concurrent-writer probe, and its clean-HEAD formal artifact;
+- per-key MVCC version chains, snapshot isolation, first-committer-wins,
+  single-record transaction WAL commits, bounded GC/TTL behavior, and their
+  protocol/recovery evidence;
 - explicit limits and non-claims.
 
 ## Source and environment
@@ -42,19 +45,21 @@ is about that baseline commit, not a claim about every later commit.
 
 ## Test matrix
 
-The local matrix for R4-B runs each configuration from its own CMake build
+The local matrix for R4-C runs each configuration from its own CMake build
 directory:
 
 | Configuration | CTest |
 |---|---:|
-| Debug | 348/348 |
-| Release | 348/348 |
-| ASan | 348/348 |
-| UBSan | 348/348 |
-| ASan + UBSan | 348/348 |
-| TSan (`setarch x86_64 -R`) | 348/348 |
+| Debug | 395/395 |
+| Release | 395/395 |
+| ASan | 395/395 |
+| UBSan | 395/395 |
+| ASan + UBSan | 395/395 |
+| TSan (`setarch x86_64 -R`) | 395/395 |
 
-Each configuration includes the 25 `ProcessIntegrationTest.*` cases. The R4-A historical matrix was 338 tests and 24 process cases.
+Each configuration includes the 26 `ProcessIntegrationTest.*` cases. The R4-A
+historical matrix was 338 tests and 24 process cases; the R4-B historical
+matrix was 348 tests and 25 process cases.
 
 ~~~text
 CliContract
@@ -78,6 +83,7 @@ LegacyImport
 RandomKillSeed
 TtlCrashRecovery
 StatsContract
+TransactionContract
 KvAsyncProtocol
 KvDisconnectSafety
 HttpAsyncProtocol
@@ -101,13 +107,24 @@ The unit and integration inventory also includes:
 - background-checkpoint state transitions, independent snapshot capture,
   complete live WAL-segment retention, cleanup retry, manager-destruction
   callback safety, and crash recovery between RDB rename and manifest publish;
+- per-key MVCC visibility at a snapshot LSN, read-your-writes, TTL expiry without
+  old-version resurrection, version GC, and global version/transaction/write-set
+  limits;
+- transaction-table lifecycle, first-committer-wins conflicts including the
+  accepted-but-not-applied pending-commit window, resource errors, and exactly
+  one callback after session destruction;
+- WAL v2 transaction codec/replay, atomic recovery of committed `kTxn` records,
+  v1/v2 coexistence, and no WAL allocation for read-only commits, rollbacks, or
+  conflicts;
+- BEGIN/COMMIT/ROLLBACK protocol validation, `CONFLICT=105` mapping, transaction
+  stats schema, disconnect rollback, and process-level transaction persistence;
 - C01-C14 deterministic crash points.
 
 This is local reproducibility evidence. It is not a substitute for a public CI
 run. The R0-R3 baseline commit `cfbda60` and the R4-A implementation commit
-`a06d7c2` both passed 9/9 GitHub Actions jobs. The R4-A G4 evidence commit and
-the R4-B evidence commit must each pass their own full CI run; status must be read from the GitHub checks for that
-commit, not inherited from an earlier one.
+`a06d7c2` both passed 9/9 GitHub Actions jobs. The R4-A G4 evidence commit, the R4-B evidence commit, and each R4-C
+implementation/evidence commit must pass its own full CI run; status must be
+read from the GitHub checks for that commit, not inherited from an earlier one.
 
 ## Fuzz evidence
 
@@ -299,6 +316,52 @@ Limits specific to this probe:
   storage-cache violations, or media corruption.
 - It does not establish automatic checkpointing, incremental/COW checkpointing,
   multi-writer operation, or bounded SAVE latency for arbitrary datasets.
+
+## R4-C snapshot-isolation transaction evidence
+
+R4-C replaces the single current-value store view with a per-key version chain
+and adds one explicit transaction layer at the owner-loop boundary. The design
+details are frozen in ADR-008. The implemented semantics are:
+
+- a transaction fixes `snapshot_lsn` at BEGIN and reads its private write set
+  first, then the newest committed version with `commit_lsn <= snapshot_lsn`;
+- writes remain private until COMMIT and are never visible as dirty writes;
+- first-committer-wins checks both applied key LSNs and accepted-but-not-yet
+  applied pending commits, so a queued commit cannot be silently overwritten;
+- COMMIT allocates one LSN and emits one WAL v2 `kTxn` record for all keys; the
+  record is applied atomically by the owner loop;
+- read-only COMMIT, ROLLBACK, and CONFLICT allocate no LSN and write no WAL;
+- an accepted COMMIT completes even if its client disconnects, while an
+  uncommitted transaction rolls back on disconnect, session destruction, or
+  shutdown;
+- checkpoint export contains only committed live state and never a private
+  transaction write set.
+
+The isolation level is snapshot isolation, not serializable isolation. Write
+skew and predicate/range conflicts are explicitly outside the contract. HTTP
+`/kv` mutations remain implicit one-operation transactions; there is no
+cross-request HTTP transaction handle.
+
+The bounded transaction surface is:
+
+| Resource | Limit |
+|---|---:|
+| Active transactions | 64 |
+| Write keys per transaction | 256 |
+| Transaction payload | 1 MiB |
+| Global version entries | 1,000,000 |
+
+Protocol transaction opcodes are `BEGIN=9`, `COMMIT=10`, and `ROLLBACK=11`;
+write-write conflicts return `CONFLICT=105`. The top-level `transactions` stats
+object reports active/started/committed/conflicted/rolled-back/failed counts,
+write conflicts, version high-water marks and reclamation, oldest-snapshot lag,
+commit records/bytes/latency, and GC latency.
+
+The R4-C local gate is the same six-configuration matrix shown above
+(395/395 in each configuration), including 26 process-level cases, plus TSan,
+ASan, UBSan, four 20,000-run fuzz targets, formatting, and static analysis. The
+committed implementation and evidence commits must each obtain their own 9/9
+GitHub Actions result before release status is claimed.
 
 ## R4-A G3 batch-formation experiment
 
@@ -519,7 +582,8 @@ Total successful requests: 340,240. Total errors: 0. Wall-clock collection time:
 - durability when the storage device or firmware violates fsync semantics;
 - behavior under media corruption;
 - production capacity or open-loop saturation;
-- multi-node, replicated, transactional, or multi-writer operation;
+- multi-node, replicated, serially-isolated, distributed, or multi-writer
+  transaction operation;
 - any Redis or SQL compatibility;
 - a production SLA;
 - that the G4 result generalizes to other hardware, power modes, datasets, or

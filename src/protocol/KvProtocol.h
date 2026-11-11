@@ -22,11 +22,15 @@ class KvProtocol {
         kTtl = 6,
         kSave = 7,
         kStats = 8,
+        kBegin = 9,
+        kCommit = 10,
+        kRollback = 11,
         kError = 100,
         kOk = 101,
         kValue = 102,
         kNotFound = 103,
         kInteger = 104,
+        kConflict = 105,
     };
 
     struct Command {

@@ -1,6 +1,6 @@
 # ADR-005：R4-A 组提交候选设计与证据门槛
 
-- 状态：Proposed — evidence-gated；G1/G2 PASS，G3 NOT TESTED；未实现
+- 状态：Proposed — evidence-gated；G1/G2 PASS，G3 实验协议已冻结、结果待采集；未实现
 - 日期：2026-11-11
 - 关联：`docs/MiniDB-可靠性与持久化升级计划书.md`、`docs/architecture.md`、`docs/reliability-evidence.md`
 - 决策范围：R4-A 的设计、观测口径和准入条件；不包含组提交实现
@@ -126,6 +126,77 @@ R4-A 只有在以下条件全部满足后才能进入实现：
   环境的一次 fsync 窗口内能稳定形成至少 **8 条**连续的待提交记录；
 - 若只能形成 1 条记录，组提交没有吞吐价值，应否决；
 - 该实验不得把未实现的 writer/queue 合并到主线，也不得宣称已实现组提交。
+
+#### G3 冻结实验协议（正式采集前）
+
+本协议在正式采集前固定，不能根据结果调整参数或阈值。实现位于
+`bench/run_r4a_batch_formation.py`，只调用未修改的 Release
+`minidb_kv_server -d sync` 和 `strace`，不进入服务器生产写路径，不增加
+writer、queue、batch、completion 或 `BATCHED`。固定参数为：
+
+| 项目 | 固定值 |
+|---|---:|
+| 轮数 | 5 |
+| 客户端 | 32 |
+| 每轮测量时长 | 2.0 s |
+| 数据集 | 128 keys |
+| value 大小 | 64 B |
+| seed | 20261111 |
+| durability mode | `SYNC` |
+
+每轮启动全新服务器和 WAL 目录。预加载和连接预热不进入测量窗口；测量窗口内
+32 个 closed-loop 客户端各自最多有一个在途 `SET`。服务器在
+`strace -f -ttt -T -yy -e trace=fsync` 下运行。客户端用
+`CLOCK_REALTIME` 纳秒时钟记录每个成功 `SET` 的发送开始、发送完成和收到
+确认时间。只把路径匹配 `wal-[0-9]{20}\.log` 的成功 `fsync` 视为 WAL data
+fsync；目录 fsync、RDB fsync、预加载内部 fsync 和 shutdown checkpoint 不进入
+窗口。`strace` 的入口时间加上 `-T` duration 定义为 fsync 窗口。
+
+主指标是保守的 `pending_count`：
+
+~~~text
+pending_count =
+  count(SET where send_completed_ns <= fsync_start_ns
+             and acknowledged_ns >= fsync_end_ns)
+~~~
+
+它只统计在 fsync 开始前已经完整交给内核、并且到 fsync 结束后仍未被客户端确认的
+`SET`。辅助指标保留 `pending_at_start_count`、`pending_at_end_count`、
+`arrivals_during_count` 和 `overlap_count`。每轮还验证：
+
+~~~text
+successes
+  == measured STATS wal.appends
+  == measured STATS wal.data_fsyncs
+  == measured STATS persistence.sync_mutations
+  == parsed WAL data fsync windows
+~~~
+
+正式 G3 PASS 必须同时满足：
+
+| 条件 | 固定门槛 |
+|---|---:|
+| 轮数正好为 5 | 必须 |
+| 每轮成功 `SET` | >= 400 |
+| 每轮 WAL data fsync 窗口 | >= 200 |
+| 总错误数 | 0 |
+| 上述计数器与 trace 窗口一致 | 每轮必须 |
+| 每轮 `pending_count` P50 | >= 8 |
+| 每轮 `pending_count` P90 | >= 8 |
+| 每轮 `pending_count >= 8` 的窗口比例 | >= 0.80 |
+| 汇总所有窗口的 `pending_count >= 8` 比例 | >= 0.90 |
+
+artifact 保留冻结 policy、Git HEAD、clean-tree 标记、环境、二进制和 harness
+SHA-256、每轮客户端延迟与 fsync 延迟摘要、每个窗口的原始时间戳和五类计数，
+以及每个成功请求的发送/确认时间三元组。临时 trace 文件删除，但保留其大小、
+行数和 SHA-256。正式采集必须从已提交的 clean HEAD 开始；采集期间工作树变脏
+即中止，已产生的部分结果不得用于 PASS。任何解析、关联或门禁代码修改后必须
+重跑全部 5 轮，不能拼接旧轮次。
+
+该实验只证明外部请求层面存在 batch 形成机会。它不证明未来服务器队列已经含有
+这些记录，不证明 writer/completion 实现的开销，也不测试 G4 收益、G5 正确性、
+G6 资源上限或 G7 实现记录。即使 G3 PASS，下一步也只能另写实现级 ADR，组提交
+仍不得直接进入生产写路径。
 
 ### G4：收益足够大
 

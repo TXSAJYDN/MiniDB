@@ -2,9 +2,10 @@
 
 ## Scope
 
-This document records the local R0-R3 evidence and the R4-A instrumentation
-baseline for MiniDB's crash-consistent persistence work. It is deliberately a
-statement about a tested engineering prototype, not a production qualification.
+This document records the local R0-R3 evidence, the R4-A instrumentation
+baseline, and the R4-A G3 batch-formation experiment for MiniDB's
+crash-consistent persistence work. It is deliberately a statement about a
+tested engineering prototype, not a production qualification.
 
 The evidence covers:
 
@@ -13,6 +14,7 @@ The evidence covers:
 - sanitizer, fuzz, format, and static-analysis gates;
 - durability-mode performance, checkpoint pause, recovery time, and RSS;
 - R4-A diagnostic timing fields and fixed WAL data-fsync buckets;
+- an external, non-production batch-formation opportunity experiment;
 - explicit limits and non-claims.
 
 ## Source and environment
@@ -179,15 +181,78 @@ latency sample retained by the compact artifact.
   persistence path. The median data-fsync count per successful mutation is
   1.0. Pooled P50/P99 are 46,229.579/90,371.772 us at 617.673 median QPS;
   recovery median is 0.022041 s and server RSS peak is 4,612 KiB.
-- **G3 NOT TESTED.** The 32-client rows show contention and connection-cap
-  behavior, not evidence that at least eight consecutive records can be formed
-  per fsync window. A separate non-production batch-formation experiment is
-  still required.
+- **G3 PASS.** A separate non-production experiment observed the unmodified
+  `SYNC` server across 2,985 successful WAL data-fsync windows. Every round had
+  P50/P90 pending count 32, and the pooled fraction with at least eight pending
+  requests was **0.987605**, above the frozen thresholds. This is evidence of
+  an external batch-formation opportunity, not of a server queue or group
+  commit.
 - **G4-G7 NOT STARTED.** No writer, queue, batch, completion, or `BATCHED`
-  mode exists. An implementation-level ADR is required only after G3 passes.
+  mode exists. The next permitted step is a separate implementation-level ADR;
+  it is not authorization to merge group commit into the production write path.
 
 See [ADR-005](decisions/005-group-commit.md) for the candidate boundaries and
 remaining gates.
+
+## R4-A G3 batch-formation experiment
+
+This experiment is external to the production write path. It starts the
+unmodified Release `minidb_kv_server -d sync`, drives 32 closed-loop persistent
+KV clients with one in-flight `SET` each, and runs the server under
+`strace -f -ttt -T -yy -qq -e trace=fsync`. Client timestamps use
+`CLOCK_REALTIME` nanoseconds and are correlated only with successful fsyncs to
+WAL segment files.
+
+The primary metric is deliberately conservative:
+
+~~~text
+pending_count =
+  count(SET where send_completed_ns <= fsync_start_ns
+             and acknowledged_ns >= fsync_end_ns)
+~~~
+
+It counts requests fully sent before fsync entry that were still unacknowledged
+after fsync exit. Each round must reconcile successful requests, measured
+`STATS` append/fsync/`SYNC` mutation deltas, and parsed WAL data-fsync windows.
+Directory fsyncs, RDB fsyncs, preload, and shutdown checkpoint fsyncs are
+excluded.
+
+Artifact:
+
+- `bench/results/r4a-batch-formation-20261111.json`
+- 1,435,200 bytes
+- SHA-256:
+  `f68b485204600ba83d88dd04834ee2df08595776af150cdfb164846ae6b4439d`
+- `git_head=5d26f0be1dba0ff7e383d9660999c50204aa831f`
+- `working_tree_dirty_at_collection=false`
+- harness SHA-256:
+  `8eafe2b777de7da6413086a18e84d920375c9ea227132c9df96a98d15b77f629`
+- server binary SHA-256:
+  `5eb7f8055489bc9bfb792a219bdc7c685760fa4020fe16ff7c15de53c2f60d38`
+- frozen policy: 5 rounds, 32 clients, 2.0 s per round, 128 keys,
+  64-byte values, seed `20261111`
+
+| Round | Successful SET | Windows | Pending P50 | Pending P90 | `>=8` fraction |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 597 | 597 | 32 | 32 | 0.988275 |
+| 2 | 618 | 618 | 32 | 32 | 0.988673 |
+| 3 | 607 | 607 | 32 | 32 | 0.988468 |
+| 4 | 576 | 576 | 32 | 32 | 0.986111 |
+| 5 | 587 | 587 | 32 | 32 | 0.986371 |
+
+Across all rounds: 2,985 successful `SET`s, 2,985 WAL data-fsync windows,
+0 errors; pending P50/P90/P99 all 32, mean 31.146, and 2,948/2,985 =
+**0.987605** windows with at least eight pending requests. Every round satisfied
+`successes == wal.appends == wal.data_fsyncs == persistence.sync_mutations ==
+trace windows`. WAL data-fsync duration was P50 1,898.000 us, P90 2,270.000 us,
+and P99 2,716.800 us; client latency was P50 111,990.761 us and P99
+133,233.279 us.
+
+The median traced throughput was 283.293 ops/s. Because tracing overhead is
+present and the clients are closed-loop, this value is not a G4 performance
+result. The experiment does not prove that a future queue contains those
+requests, that a writer can batch them without overhead, or that G4-G7 will
+pass.
 
 ## R3 reliability benchmark
 
@@ -278,6 +343,8 @@ Total successful requests: 340,240. Total errors: 0. Wall-clock collection time:
 - any Redis or SQL compatibility;
 - a production SLA;
 - group-commit implementation or performance benefit;
+- that external pending overlap proves a future server queue can batch those
+  requests without changing durability, ordering, or resource bounds;
 - that every later commit inherited the baseline CI result without its own
   checks.
 
@@ -297,6 +364,19 @@ For the reliability benchmark, rebuild Release and run
 `bench/run_reliability_benchmark.py` with the same seed, round count, client
 set, workloads, and a fresh work directory. Compare only runs from the same
 machine, power mode, kernel, compiler, build configuration, and background load.
+
+For the frozen G3 batch-formation experiment, first run its self-test, then use
+a new output path so the retained artifact is never overwritten:
+
+~~~bash
+python3 bench/run_r4a_batch_formation.py --self-test
+python3 bench/run_r4a_batch_formation.py \
+  --out /tmp/r4a-batch-formation-reproduction.json
+~~~
+
+The experiment requires `strace`, a Release `minidb_kv_server`, and a clean
+source commit for formal evidence. A failed gate verdict is retained as
+negative evidence; it is not converted into a PASS by changing thresholds.
 
 ## Related documents
 

@@ -152,7 +152,7 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 
 ## 验证状态
 
-当前 R0-R3 已完成实现与本地验收；R4-A 已完成 ADR 和 baseline instrumentation，
+当前 R0-R3 已完成实现与本地验收；R4-A 已通过 G1-G3，并停在实现级 ADR 前，
 组提交实现尚未开始：
 
 - 六种构建配置的真实 CTest 矩阵；
@@ -161,13 +161,19 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 - HTTP、KV、WAL record、manifest 四个固定 seed fuzz target；
 - 多 durability、多客户端、写/混合/TTL 的 5 轮可靠性 benchmark；
 - R4-A v2 baseline：18 配置 × 5 轮、414,688 次成功请求、0 错误；32 客户端
-  `SYNC` write 的 fsync 占持久化耗时中位数 99.06%，G1/G2 达标，G3 尚未验证；
+  `SYNC` write 的 fsync 占持久化耗时中位数 99.06%，G1/G2 PASS；
+- R4-A G3 独立非生产 batch formation 实验：5 轮、2,985 次成功 `SET`、
+  2,985 个 WAL data fsync 窗口、0 错误；每轮 pending P50/P90 均为 32，汇总
+  `>=8` 比例 **0.987605**，G3 PASS；artifact 为
+  [`bench/results/r4a-batch-formation-20261111.json`](bench/results/r4a-batch-formation-20261111.json)；
 - R4-A timing 字段、固定 fsync 桶和 v2 benchmark 采集契约；
 - clang-format、clang-tidy 和 `git diff --check`。
 
 具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。R0-R3 基线
 `cfbda60` 的远程 GitHub Actions 已 9/9 通过；R4-A 提交的最终状态以推送后的
-GitHub checks 为准。本项目的 R4-A 只做证据采集，不实现组提交。
+GitHub checks 为准。G3 的 pending 计数是外部观测到的批处理机会上界；`strace`
+下的吞吐不能用于评价 G4。下一步实现级 ADR 不是组提交实现，当前没有任何
+writer、queue、batch、completion 或 `BATCHED` 代码路径。
 
 ## 明确的非目标
 
@@ -178,9 +184,9 @@ GitHub checks 为准。本项目的 R4-A 只做证据采集，不实现组提交
 - 不提供 TLS、认证或授权；
 - 不承诺生产 SLA、容量规划或高并发表现；
 - 不覆盖多进程共享数据目录、掉电一致性或设备故障证明；
-- 不实现 `BATCHED`、组提交或后台 checkpoint；R4-A 只完成
-  [ADR-005](docs/decisions/005-group-commit.md) 和指标采集，组提交实现仍为
-  NOT STARTED。
+- 不实现 `BATCHED`、组提交或后台 checkpoint；R4-A 已完成
+  [ADR-005](docs/decisions/005-group-commit.md)、指标采集和 G3 非生产实验，
+  实现级 ADR 待写，组提交实现仍为 **NOT IMPLEMENTED**。
 
 ## 文档
 

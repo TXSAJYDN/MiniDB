@@ -1,6 +1,6 @@
 # ADR-005：R4-A 组提交候选设计与证据门槛
 
-- 状态：Proposed — evidence-gated；G1/G2 PASS，G3 实验协议已冻结、结果待采集；未实现
+- 状态：Proposed — evidence-gated；G1-G3 PASS，等待实现级 ADR；组提交未实现
 - 日期：2026-11-11
 - 关联：`docs/MiniDB-可靠性与持久化升级计划书.md`、`docs/architecture.md`、`docs/reliability-evidence.md`
 - 决策范围：R4-A 的设计、观测口径和准入条件；不包含组提交实现
@@ -198,6 +198,37 @@ SHA-256、每轮客户端延迟与 fsync 延迟摘要、每个窗口的原始时
 G6 资源上限或 G7 实现记录。即使 G3 PASS，下一步也只能另写实现级 ADR，组提交
 仍不得直接进入生产写路径。
 
+#### G3 正式结果（2026-11-11）
+
+正式采集从 clean HEAD `5d26f0be1dba0ff7e383d9660999c50204aa831f`
+开始，执行 `python3 bench/run_r4a_batch_formation.py`，判定 **PASS**。
+artifact 为 `bench/results/r4a-batch-formation-20261111.json`：
+1,435,200 bytes，SHA-256
+`f68b485204600ba83d88dd04834ee2df08595776af150cdfb164846ae6b4439d`；
+harness SHA-256
+`8eafe2b777de7da6413086a18e84d920375c9ea227132c9df96a98d15b77f629`；
+采集所用二进制 SHA-256
+`5eb7f8055489bc9bfb792a219bdc7c685760fa4020fe16ff7c15de53c2f60d38`。
+
+5 轮共 2,985 次成功 `SET`、2,985 个 WAL data fsync 窗口、0 错误。每轮均满足
+`successes == wal.appends == wal.data_fsyncs == persistence.sync_mutations
+== trace windows`。汇总 `pending_count`：P50/P90/P99 均为 32，mean 31.146，
+`>=8` 为 2,948/2,985 = **0.987605**。
+
+| Round | Successful SET | Windows | P50 | P90 | `>=8` fraction |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 597 | 597 | 32 | 32 | 0.988275 |
+| 2 | 618 | 618 | 32 | 32 | 0.988673 |
+| 3 | 607 | 607 | 32 | 32 | 0.988468 |
+| 4 | 576 | 576 | 32 | 32 | 0.986111 |
+| 5 | 587 | 587 | 32 | 32 | 0.986371 |
+
+同次采集的 WAL data fsync 时长为 P50 1,898.000 us、P90 2,270.000 us、
+P99 2,716.800 us；客户端延迟 P50 111,990.761 us、P99 133,233.279 us。
+`strace` 下 median QPS 为 283.293，只用于说明采集环境，不能用于评价 G4。
+实验为 WSL2 loopback、closed-loop、单客户端单在途请求的外部观测；pending
+计数是未来批处理机会的上界，不是服务器队列已有记录的证据。G4-G7 尚未开始。
+
 ### G4：收益足够大
 
 在相同数据集、相同机器和至少 5 轮下：
@@ -244,11 +275,17 @@ G6 资源上限或 G7 实现记录。即使 G3 PASS，下一步也只能另写�
   `sync_mutation_us_mean` 中位数 1,567.930 us，
   `wal_append_us_mean` 中位数 9.238 us；每条成功 `SYNC` mutation 的 data fsync
   中位数为 1.0。
-- **G3：NOT TESTED。** 基线确认 32 个并发客户端触及连接上限且排队延迟明显，
-  但没有证明一次 fsync 窗口可稳定形成至少 8 条连续待提交记录；仍需要独立的、
-  非生产路径的 batch 形成实验。
-- **G4-G7：NOT APPLICABLE。** 在 G3 满足并另写实现级 ADR 前，不启动 writer、
-  queue、batch 或异步 completion 实现。
+- **G3：PASS。** 独立、非生产路径的 batch formation 实验从 clean HEAD
+  `5d26f0b` 采集 5 轮，共 2,985 次成功 `SET`、2,985 个 WAL data fsync 窗口、
+  0 错误。每轮 `pending_count` P50/P90 均为 32，`>=8` 比例均高于 0.986；
+  汇总 `>=8` 比例为 **0.987605**，高于 0.90 门槛。artifact
+  `bench/results/r4a-batch-formation-20261111.json` 为 1,435,200 bytes，
+  SHA-256
+  `f68b485204600ba83d88dd04834ee2df08595776af150cdfb164846ae6b4439d`。
+  该实验只证明外部请求层面存在 batch 形成机会。
+- **G4-G7：NOT STARTED。** 在另写实现级 ADR 前，不启动 writer、queue、
+  batch、completion 或 `BATCHED` 实现；G4 收益、G5 正确性、G6 资源上限和
+  G7 实现记录均尚无证据。
 
 ## 明确非目标
 
@@ -271,8 +308,8 @@ G6 资源上限或 G7 实现记录。即使 G3 PASS，下一步也只能另写�
 
 ## 后果
 
-- R4-A 当前只增加诊断能力和设计门槛，主线仍保持简单、可审计的每写一 fsync
-  路径。
-- 如果 G1/G2/G3 不成立，项目可以明确地停在当前架构，而不是为了“看起来更
-  高级”引入不必要的并发。
+- R4-A 当前只增加诊断能力、设计门槛和外部非生产实验，主线仍保持简单、可审计
+  的每写一 fsync 路径；G1-G3 已 PASS。
+- 下一步必须另写实现级 ADR；如果 writer/completion、资源上限或失败矩阵无法
+  被清晰定义，项目应停在当前架构，而不是为了“看起来更高级”引入不必要的并发。
 - 如果进入实现，收益必须用同一环境下的可复现实验和完整正确性矩阵证明。

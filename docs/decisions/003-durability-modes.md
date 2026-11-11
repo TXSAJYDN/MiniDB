@@ -24,9 +24,10 @@ MiniDB 选择少量、可验证的模式，而不是提供一组名称好听但�
 窗口受调度、I/O 和事件循环停顿影响，不能理解为一个精确的 100 ms 承诺。
 
 `BATCHED` 未实现。[ADR-005](005-group-commit.md) 已把 R4-A 定义为
-evidence-gated 的组提交设计、诊断指标和准入条件；当前只完成 ADR 与 baseline
-instrumentation，writer thread、有界队列、批量 fsync 和 completion 顺序均未
-实现。只有 G1-G7 门槛满足后才进入实现。
+evidence-gated 的组提交设计、诊断指标和准入条件；当前已完成 ADR、baseline
+instrumentation 和外部非生产 G3 batch formation 实验，G1-G3 PASS。实现级 ADR
+仍待编写，writer thread、有界队列、批量 fsync 和 completion 顺序均未实现；
+只有实现级 ADR 和 G4-G7 后续验证完成，才能讨论该模式。
 
 ## fsync 失败语义
 

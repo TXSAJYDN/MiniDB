@@ -5,7 +5,7 @@
 - 权威开发工作树：`/home/win11/projects/miniDB`（WSL2 Ubuntu 24.04）
 - Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
-- 当前阶段：**R0-R3 已完成实现与本地验收；R4-A ADR 与 baseline instrumentation 已完成；组提交实现未开始**
+- 当前阶段：**R0-R3 已完成实现与本地验收；R4-A G1-G3 PASS，实现级 ADR 待写；组提交实现未开始**
 - 当前测试清单：**305 项 CTest**（以最终本地验证矩阵为准）
 
 ## 1. 当前结论
@@ -42,7 +42,7 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 | R1 WAL + RDB checkpoint 正确性基线 | DONE | WAL/manifest 编解码、轮转、恢复、checkpoint、legacy import、单写者锁 |
 | R2 崩溃一致性与恢复模型闭环 | DONE | C01-C14、随机 kill、故障注入、四个 fuzz target、19 个进程用例 |
 | R3 性能、恢复与公开证据 | DONE | 18 配置 × 5 轮 benchmark、恢复/暂停/RSS/写放大数据 |
-| R4-A 组提交候选 | G1/G2 PASS; G3 NOT TESTED; IMPLEMENTATION NOT STARTED | ADR-005、v2 指标契约、clean baseline；无 writer/queue/batch |
+| R4-A 组提交候选 | G1-G3 PASS; IMPLEMENTATION ADR PENDING; IMPLEMENTATION NOT STARTED | ADR-005、v2 指标契约、clean baseline、非生产 G3 batch formation 实验；无 writer/queue/batch |
 | R4-B 后台/增量 checkpoint | NOT STARTED | 需要独立证据和原子发布语义回归 |
 | R4-C MVCC/事务 | NOT STARTED | 独立阶段，不与 WAL 基线混合 |
 
@@ -130,7 +130,7 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 
 ## 6. 当前验证状态
 
-R0-R3 与 R4-A baseline instrumentation 的最终本地验证包括：
+R0-R3、R4-A baseline instrumentation 与 G3 batch formation 实验的最终本地验证包括：
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种配置；
 - 每个配置 305 项 CTest；
@@ -139,8 +139,10 @@ R0-R3 与 R4-A baseline instrumentation 的最终本地验证包括：
 - clang-format dry-run、clang-tidy、`git diff --check`；
 - 18 配置 × 5 轮 R3 可靠性 benchmark，seed `20261111`；
 - R4-A 的 `/stats`/`STATS` timing 契约、fsync 桶分区和 v2 可靠性 benchmark；
-- v2 baseline：18 配置 × 5 轮、414,688 次成功请求、0 错误；G1/G2 PASS，
-  G3 NOT TESTED；
+- v2 baseline：18 配置 × 5 轮、414,688 次成功请求、0 错误；G1/G2 PASS；
+- G3：独立非生产 batch formation 实验 5 轮、2,985 次成功 `SET`、2,985 个
+  WAL data fsync 窗口、0 错误；每轮 `pending_count` P50/P90 均为 32，汇总
+  `>=8` 比例 **0.987605**，判定 PASS；
 - 远程 CI：R0-R3 基线 `cfbda60` 的 GitHub Actions 9/9 通过；后续最终 HEAD
   状态以 GitHub checks 为准；
 - 本地证据不替代远程 CI，也不构成生产验收。
@@ -157,6 +159,14 @@ bytes: 310,067
 sha256: 55bcad4ead05fcba26e44cecf17e71df6ffd7dba17e54a128398c5b65820fe84
 git_head: 964ba8446a71f6c491cd1241e5479632465b9835
 working_tree_dirty_at_collection: false
+
+R4-A G3: bench/results/r4a-batch-formation-20261111.json
+bytes: 1,435,200
+sha256: f68b485204600ba83d88dd04834ee2df08595776af150cdfb164846ae6b4439d
+git_head: 5d26f0be1dba0ff7e383d9660999c50204aa831f
+working_tree_dirty_at_collection: false
+harness_sha256: 8eafe2b777de7da6413086a18e84d920375c9ea227132c9df96a98d15b77f629
+binary_sha256: 5eb7f8055489bc9bfb792a219bdc7c685760fa4020fe16ff7c15de53c2f60d38
 ~~~
 
 以下为历史 R3 artifact 的汇总；R3 数据采集自未提交工作树，环境为 WSL2 同机
@@ -181,6 +191,8 @@ baseline 的对应数字见上文。
 - 32 连接上限保持不变；benchmark 的 32-client 配置是边界，不是扩展性结论。
 - 无 TLS、认证、授权、复制、集群、事务或 MVCC。
 - WSL2 结果与硬件计数器限制必须随数据一起说明。
+- G3 的 `pending_count` 是外部请求重叠机会的上界；它不证明未来服务器队列中已有
+  这些记录，也不证明 writer/completion 的实现开销或 G4 吞吐收益。
 - 许可证仍由所有者决定；仓库未创建 `LICENSE`/`COPYING`。
 
 ## 8. 文档入口
@@ -204,14 +216,14 @@ baseline 的对应数字见上文。
 
 ## 9. 后续工作
 
-R4-A 的 G1/G2 已通过，当前停在 G3 前，不直接实现并发写路径：
+R4-A 的 G1-G3 已通过，当前停在实现前，不直接改动并发写路径：
 
-1. 设计独立的非生产 batch 形成实验，验证一次 fsync 窗口内能否稳定形成至少
-   8 条连续待提交记录；该实验不得把 writer/queue 合并到主线；
-2. 若 G3 不成立，将 ADR-005 标记为 Rejected 或 Deferred，保留 negative
-   evidence，不为“高级感”引入 writer/queue；
-3. 若 G3 成立，先补实现级 ADR，明确队列/字节/batch 上限、completion 和失败
-   矩阵，再实现组提交并验证 G4-G7；
+1. 先另写实现级 ADR，明确 writer 线程、队列/字节/batch 上限、completion、
+   stop/drain、失败矩阵和新增崩溃点；此步骤不修改生产写路径；
+2. 实现级 ADR 通过后再实现组提交，并依次验证 G4 收益、G5 正确性、G6 资源
+   上限和 G7 实现记录；
+3. 若 G4-G7 任一不成立，保留 negative evidence，拒绝或回退实现，不为“高级感”
+   保留 writer/queue；
 4. 后台/增量 checkpoint 与 MVCC/事务保持独立阶段，不与 R4-A 混合。
 
 任何 R4 工作都必须重新通过 TSan、崩溃矩阵和资源上限验证，不能牺牲当前

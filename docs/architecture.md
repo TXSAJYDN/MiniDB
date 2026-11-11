@@ -55,13 +55,15 @@ flushes, checkpoints, and diagnostic snapshots. A slow filesystem operation
 such as a checkpoint blocks the owner loop; there is no worker pool and no
 background checkpoint. This is a deliberate R0-R3 boundary.
 
-R4-A adds diagnostic instrumentation only. It records successful WAL
-`write_all()`, WAL data-fsync, and `SYNC` persistence-path timings with
-fixed-memory counters and fixed latency buckets. It does not add a writer
-thread, queue, completion path, or batched durability mode; the owner-loop and
-single-writer model above is unchanged. The evidence gates and candidate
-boundaries are recorded in
-[ADR-005](decisions/005-group-commit.md).
+R4-A currently adds diagnostic instrumentation and an external, non-production
+G3 batch-formation experiment. It records successful WAL `write_all()`, WAL
+data-fsync, and `SYNC` persistence-path timings with fixed-memory counters and
+fixed latency buckets, then observes client/fsync overlap without changing the
+server write path. It does not add a writer thread, queue, completion path, or
+batched durability mode; the owner-loop and single-writer model above is
+unchanged. G1-G3 have passed; an implementation-level ADR is still required
+before any write-path change. The evidence gates and candidate boundaries are
+recorded in [ADR-005](decisions/005-group-commit.md).
 
 ## Component map
 
@@ -351,7 +353,9 @@ The local evidence suite covers:
 - sanitizer, clang-format, clang-tidy, four fixed-seed fuzz targets, and the
   reliability benchmark;
 - R4-A timing counters, fixed fsync buckets, and protocol contract checks in
-  both HTTP and KV paths.
+  both HTTP and KV paths;
+- the external, non-production G3 batch-formation experiment and its frozen
+  gate checks.
 
 The acceptance matrix runs Debug, Release, ASan, UBSan, ASan+UBSan, and TSan
 from separate build directories. Passing it is local reproducibility evidence,
@@ -364,8 +368,10 @@ not a substitute for a public CI run or a production qualification.
 - HTTP/2, WebSocket, chunked requests, or Expect/100-continue.
 - Multi-process sharing of one data directory.
 - Group-commit implementation, batched durability, or background/incremental
-  checkpoint. R4-A currently consists only of
-  [ADR-005](decisions/005-group-commit.md) and diagnostic instrumentation.
+  checkpoint. R4-A currently consists of
+  [ADR-005](decisions/005-group-commit.md), diagnostic instrumentation, and an
+  external non-production G3 experiment; the implementation-level ADR is still
+  pending and no writer/queue/batch code exists.
 - Power-loss, kernel-crash, firmware-cache, or media-failure proofs.
 - Production SLAs, capacity claims, or arbitrary client scaling.
 

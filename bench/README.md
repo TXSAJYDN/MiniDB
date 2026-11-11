@@ -1,18 +1,23 @@
 # Benchmark methodology
 
-MiniDB keeps three complementary benchmark harnesses:
+MiniDB keeps four complementary benchmark harnesses:
 
 - `bench/benchmark.py` is the short, deterministic sample-count regression used
   to validate the measurement plumbing;
-- `bench/run_reliability_benchmark.py` is the current R0-R3 durability,
-  concurrency, SIGKILL recovery, and checkpoint-pause harness;
+- `bench/run_reliability_benchmark.py` is the R0-R3 durability, concurrency,
+  SIGKILL recovery, and checkpoint-pause harness and the R4-A v2 baseline
+  collector;
+- `bench/run_r4a_batch_formation.py` is the external, non-production R4-A G3
+  batch-formation experiment;
 - `bench/run_acceptance_benchmark.py` is the historical Stage H timed harness,
   retained only for reproducibility of the pre-WAL baseline.
 
 None of these harnesses is a saturation, capacity, open-loop, or
 production-SLA test. The R3 reliability benchmark supports current durability
 claims; the R4-A v2 baseline supports the diagnostic timing evidence used by
-ADR-005. Stage H numbers are historical background.
+ADR-005; the G3 harness observes external pending-request overlap around real
+WAL data fsyncs without changing the production write path. Stage H numbers are
+historical background.
 
 ## Reliability benchmark suite
 
@@ -84,8 +89,10 @@ The retained R4-A baseline was collected at clean commit `964ba84`:
 - G1 **PASS**: all configurations and provenance are present;
 - G2 **PASS**: 32-client `SYNC` write fsync share of the `SYNC` persistence path
   has median **0.990576**, above the `0.50` threshold;
-- G3 **NOT TESTED**: no batch-formation experiment has been run, and no
-  group-commit implementation exists.
+- G3 **PASS**: the separate [`run_r4a_batch_formation.py`](#r4-a-g3-batch-formation-experiment)
+  experiment observed 2,985 WAL data-fsync windows over 5 rounds, 0 errors, and
+  a pooled fraction of **0.987605** with at least eight pending requests; this
+  is opportunity evidence, not group-commit implementation or performance.
 
 Run the v2 baseline from a clean source commit:
 
@@ -103,6 +110,88 @@ python3 bench/run_reliability_benchmark.py \
 The benchmark reaches the repository's 32-connection cap on its largest
 configurations. That is a boundary observation, not evidence of scaling beyond
 32 clients or of open-loop capacity.
+
+### R4-A G3 batch-formation experiment
+
+`bench/run_r4a_batch_formation.py` is an external experiment. It starts the
+unmodified Release `minidb_kv_server -d sync` under
+`strace -f -ttt -T -yy -qq -e trace=fsync`, drives 32 closed-loop persistent KV
+clients with one in-flight `SET` each, and correlates client
+`CLOCK_REALTIME` timestamps only with successful fsyncs to
+`wal-NNNNNNNNNNNNNNNNNNNN.log` files. Directory fsyncs, RDB fsyncs, preload,
+and shutdown checkpoint fsyncs are excluded.
+
+The frozen G3 policy is:
+
+| Parameter | Value |
+|---|---:|
+| Rounds | 5 |
+| Clients | 32 |
+| Duration per round | 2.0 s |
+| Dataset | 128 keys |
+| Value size | 64 B |
+| Seed | 20261111 |
+| Durability mode | `SYNC` |
+| Minimum successful `SET` per round | 400 |
+| Minimum WAL data-fsync windows per round | 200 |
+| Maximum errors | 0 |
+| Minimum round pending P50/P90 | 8 / 8 |
+| Minimum round `>=8` fraction | 0.80 |
+| Minimum pooled `>=8` fraction | 0.90 |
+
+The primary metric is:
+
+~~~text
+pending_count =
+  count(SET where send_completed_ns <= fsync_start_ns
+             and acknowledged_ns >= fsync_end_ns)
+~~~
+
+Each round must reconcile successful requests, measured `STATS`
+`wal.appends`, `wal.data_fsyncs`, `persistence.sync_mutations`, and parsed WAL
+data-fsync windows. A formal run requires a clean, committed source HEAD and
+must not overwrite an existing artifact.
+
+Retained result:
+
+- `bench/results/r4a-batch-formation-20261111.json`
+- 1,435,200 bytes
+- SHA-256:
+  `f68b485204600ba83d88dd04834ee2df08595776af150cdfb164846ae6b4439d`
+- `git_head=5d26f0be1dba0ff7e383d9660999c50204aa831f`
+- clean worktree at collection
+- harness SHA-256:
+  `8eafe2b777de7da6413086a18e84d920375c9ea227132c9df96a98d15b77f629`
+- binary SHA-256:
+  `5eb7f8055489bc9bfb792a219bdc7c685760fa4020fe16ff7c15de53c2f60d38`
+- verdict: **PASS**
+
+| Round | Successful SET | Windows | Pending P50 | Pending P90 | `>=8` fraction |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 597 | 597 | 32 | 32 | 0.988275 |
+| 2 | 618 | 618 | 32 | 32 | 0.988673 |
+| 3 | 607 | 607 | 32 | 32 | 0.988468 |
+| 4 | 576 | 576 | 32 | 32 | 0.986111 |
+| 5 | 587 | 587 | 32 | 32 | 0.986371 |
+
+Pooled: 2,985 successful `SET`s and 2,985 windows, 0 errors; pending P50/P90/P99
+all 32; 2,948/2,985 = **0.987605** windows had at least eight pending requests.
+WAL data-fsync duration was P50 1,898.000 us, P90 2,270.000 us, and P99
+2,716.800 us. The traced median throughput of 283.293 ops/s is not a G4 result.
+
+Reproduce from a clean Release build with a new output path:
+
+~~~bash
+python3 bench/run_r4a_batch_formation.py --self-test
+python3 bench/run_r4a_batch_formation.py \
+  --kv build/release/app/minidb_kv_server \
+  --out /tmp/r4a-batch-formation-reproduction.json
+~~~
+
+The experiment does not add or test a writer thread, queue, batch, completion,
+`BATCHED` mode, G4 benefit, G5 crash correctness, or G6 bounded-resource
+behavior. Passing G3 only permits the next step: a separate
+implementation-level ADR.
 
 ## Historical Stage H harness
 

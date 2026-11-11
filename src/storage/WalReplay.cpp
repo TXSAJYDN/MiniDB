@@ -20,6 +20,89 @@ void set_error(std::string* error, const std::string& message) {
     }
 }
 
+KvStore::AppliedMutation to_applied_mutation(const WalRecord& record) {
+    KvStore::AppliedMutation mutation;
+    mutation.key = record.key;
+    switch (record.op) {
+    case WalOp::kSet:
+        mutation.kind = KvStore::AppliedMutation::Kind::kSet;
+        mutation.value = record.value;
+        mutation.absolute_expiry_ms = record.expiry_ms;
+        break;
+    case WalOp::kDel:
+        mutation.kind = KvStore::AppliedMutation::Kind::kDelete;
+        break;
+    case WalOp::kExpire:
+        mutation.kind = KvStore::AppliedMutation::Kind::kExpire;
+        mutation.absolute_expiry_ms = record.expiry_ms;
+        break;
+    case WalOp::kTxn:
+        break;
+    }
+    return mutation;
+}
+
+WalReplayStatus apply_record(KvStore& store, const WalRecord& record,
+                             std::string* error) {
+    if (record.op != WalOp::kTxn) {
+        const KvStore::AppliedMutation mutation = to_applied_mutation(record);
+        const KvStore::ApplyStatus apply_status =
+            store.apply_committed_status(record.lsn, {mutation}, error);
+        if (apply_status == KvStore::ApplyStatus::kResourceLimit) {
+            return WalReplayStatus::kResourceLimit;
+        }
+        if (apply_status != KvStore::ApplyStatus::kOk) {
+            return WalReplayStatus::kCorrupt;
+        }
+        return WalReplayStatus::kOk;
+    }
+
+    std::vector<WalTxnOp> operations;
+    std::string payload_error;
+    const WalFormat::DecodeStatus status = WalFormat::decode_transaction(
+        reinterpret_cast<const std::uint8_t*>(record.value.data()),
+        record.value.size(), &operations, &payload_error);
+    if (status != WalFormat::DecodeStatus::kOk) {
+        set_error(error, payload_error.empty()
+                             ? "WAL transaction payload is invalid"
+                             : payload_error);
+        return WalReplayStatus::kCorrupt;
+    }
+
+    std::vector<KvStore::AppliedMutation> mutations;
+    mutations.reserve(operations.size());
+    for (const WalTxnOp& operation : operations) {
+        KvStore::AppliedMutation mutation;
+        mutation.key = operation.key;
+        mutation.value = operation.value;
+        mutation.absolute_expiry_ms = operation.expiry_ms;
+        switch (operation.op) {
+        case WalOp::kSet:
+            mutation.kind = KvStore::AppliedMutation::Kind::kSet;
+            break;
+        case WalOp::kDel:
+            mutation.kind = KvStore::AppliedMutation::Kind::kDelete;
+            break;
+        case WalOp::kExpire:
+            mutation.kind = KvStore::AppliedMutation::Kind::kExpire;
+            break;
+        case WalOp::kTxn:
+            set_error(error, "WAL transaction contains a nested transaction");
+            return WalReplayStatus::kCorrupt;
+        }
+        mutations.push_back(std::move(mutation));
+    }
+    const KvStore::ApplyStatus apply_status =
+        store.apply_committed_status(record.lsn, mutations, error);
+    if (apply_status == KvStore::ApplyStatus::kResourceLimit) {
+        return WalReplayStatus::kResourceLimit;
+    }
+    if (apply_status != KvStore::ApplyStatus::kOk) {
+        return WalReplayStatus::kCorrupt;
+    }
+    return WalReplayStatus::kOk;
+}
+
 bool read_all(WalFileOperations* operations, int fd, std::uint8_t* data,
               std::size_t len, std::string* error) {
     std::size_t consumed = 0;
@@ -310,26 +393,13 @@ WalReplayStatus replay_wal_segments(const std::vector<WalSegmentInfo>& segments,
                 return WalReplayStatus::kResourceLimit;
             }
 
-            switch (record.op) {
-            case WalOp::kSet:
-                if (record.lsn > checkpoint_lsn) {
-                    (void)store.set_with_expiry(record.key, record.value,
-                                                record.expiry_ms);
-                    ++replayed_records;
+            if (record.lsn > checkpoint_lsn) {
+                const WalReplayStatus apply_status =
+                    apply_record(store, record, error);
+                if (apply_status != WalReplayStatus::kOk) {
+                    return apply_status;
                 }
-                break;
-            case WalOp::kDel:
-                if (record.lsn > checkpoint_lsn) {
-                    (void)store.del(record.key);
-                    ++replayed_records;
-                }
-                break;
-            case WalOp::kExpire:
-                if (record.lsn > checkpoint_lsn) {
-                    (void)store.expire_absolute(record.key, record.expiry_ms);
-                    ++replayed_records;
-                }
-                break;
+                ++replayed_records;
             }
 
             last_lsn = record.lsn;

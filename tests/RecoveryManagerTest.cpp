@@ -3,9 +3,11 @@
 #include "../src/storage/RecoveryManager.h"
 #include "../src/storage/RdbManager.h"
 #include "../src/storage/PersistenceManager.h"
+#include "../src/storage/WalFormat.h"
 #include "FaultWalFileOperations.h"
 #include "RdbTestUtil.h"
 
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -70,21 +72,89 @@ std::vector<WalSegmentInfo> segments(const std::string& wal_dir) {
     return result;
 }
 
-void append_prefix(const std::string& path, std::size_t prefix_bytes) {
+void store_u16(std::uint8_t* data, std::uint16_t value) {
+    data[0] = static_cast<std::uint8_t>(value >> 8);
+    data[1] = static_cast<std::uint8_t>(value);
+}
+
+void store_u32(std::uint8_t* data, std::uint32_t value) {
+    data[0] = static_cast<std::uint8_t>(value >> 24);
+    data[1] = static_cast<std::uint8_t>(value >> 16);
+    data[2] = static_cast<std::uint8_t>(value >> 8);
+    data[3] = static_cast<std::uint8_t>(value);
+}
+
+std::uint32_t load_u32(const std::uint8_t* data) {
+    return (static_cast<std::uint32_t>(data[0]) << 24) |
+           (static_cast<std::uint32_t>(data[1]) << 16) |
+           (static_cast<std::uint32_t>(data[2]) << 8) |
+           static_cast<std::uint32_t>(data[3]);
+}
+
+void refresh_record_crc(std::vector<std::uint8_t>* bytes) {
+    require(bytes->size() >= WalFormat::HEADER_SIZE + WalFormat::CHECKSUM_SIZE,
+            "record is too short for its checksum");
+    const std::uint32_t key_len = load_u32(bytes->data() + 18);
+    const std::uint32_t value_len = load_u32(bytes->data() + 22);
+    const std::size_t record_size =
+        WalFormat::HEADER_SIZE + key_len + value_len + WalFormat::CHECKSUM_SIZE;
+    require(record_size == bytes->size(),
+            "record bytes must contain exactly one record");
+    const std::size_t crc_offset = record_size - WalFormat::CHECKSUM_SIZE;
+    store_u32(bytes->data() + crc_offset,
+              WalFormat::crc32c(bytes->data(), crc_offset));
+}
+
+std::vector<std::uint8_t> encode_record(const WalRecord& record) {
+    std::string error;
+    std::vector<std::uint8_t> bytes = WalFormat::encode(record, &error);
+    require(!bytes.empty(), "encode test WAL record: " + error);
+    return bytes;
+}
+
+WalRecord transaction_record(std::uint64_t lsn,
+                             std::vector<WalTxnOp> operations) {
+    std::string error;
+    const std::vector<std::uint8_t> payload =
+        WalFormat::encode_transaction(operations, &error);
+    require(!payload.empty(), "encode test transaction: " + error);
     WalRecord record;
-    record.lsn = 999;
-    record.op = WalOp::kSet;
-    record.key = "torn";
-    record.value = "record";
-    const std::vector<std::uint8_t> bytes = WalFormat::encode(record);
-    require(!bytes.empty(), "encode torn test record");
-    require(prefix_bytes <= bytes.size(), "torn prefix too long");
+    record.lsn = lsn;
+    record.op = WalOp::kTxn;
+    record.key = "txn";
+    record.value.assign(reinterpret_cast<const char*>(payload.data()),
+                        payload.size());
+    return record;
+}
+
+void append_bytes(const std::string& path,
+                  const std::vector<std::uint8_t>& bytes) {
     std::ofstream output(path, std::ios::binary | std::ios::app);
-    require(output.is_open(), "open segment for torn append");
+    require(output.is_open(), "open WAL segment for append");
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    require(output.good(), "append WAL bytes");
+}
+
+void append_prefix(const std::string& path,
+                   const std::vector<std::uint8_t>& bytes,
+                   std::size_t prefix_bytes) {
+    require(prefix_bytes <= bytes.size(), "record prefix too long");
+    std::ofstream output(path, std::ios::binary | std::ios::app);
+    require(output.is_open(), "open WAL segment for partial append");
     output.write(reinterpret_cast<const char*>(bytes.data()),
                  static_cast<std::streamsize>(prefix_bytes));
     output.close();
-    require(output.good(), "append torn prefix");
+    require(output.good(), "append partial WAL record");
+}
+
+void append_complete_record(const std::string& path, const WalRecord& record) {
+    append_bytes(path, encode_record(record));
+}
+
+std::size_t transaction_payload_offset(const WalRecord& record) {
+    return WalFormat::HEADER_SIZE + record.key.size();
 }
 
 void flip_payload_byte(const std::string& path) {
@@ -223,7 +293,12 @@ TEST(RecoveryManagerTest, TornTailIsTruncatedAndFsynced) {
     const std::vector<WalSegmentInfo> live = segments(paths.wal_dir);
     ASSERT_EQ(live.size(), 1u);
     const std::uint64_t valid_size = live.front().size;
-    append_prefix(live.front().path, 13);
+    WalRecord torn;
+    torn.lsn = 999;
+    torn.op = WalOp::kSet;
+    torn.key = "torn";
+    torn.value = "record";
+    append_prefix(live.front().path, encode_record(torn), 13);
     ASSERT_GT(fs::file_size(live.front().path), valid_size);
 
     KvStore target(clock);
@@ -294,6 +369,9 @@ TEST(RecoveryManagerTest, LsnStatsAndAbsoluteTtlSurviveReplay) {
     EXPECT_EQ(recovery.stats().last_lsn, 3u);
     EXPECT_EQ(recovery.stats().wal_records_replayed, 3u);
     EXPECT_EQ(recovery.stats().checkpoint_lsn, 0u);
+    EXPECT_EQ(target.current_lsn(), 3u);
+    EXPECT_EQ(target.latest_committed_lsn("plain"), 1u);
+    EXPECT_EQ(target.latest_committed_lsn("ttl"), 3u);
     EXPECT_EQ(target.get("plain"), std::optional<std::string>("value"));
     const auto ttl = target.ttl_info("ttl");
     ASSERT_EQ(ttl.state, KvStore::TtlState::kExpiring);
@@ -374,6 +452,237 @@ TEST(RecoveryManagerTest,
     clock->advance(25001);
     EXPECT_FALSE(recovered.get("ttl").has_value());
     EXPECT_EQ(recovered.get("set-after"), std::optional<std::string>("value"));
+}
+
+TEST(RecoveryManagerTest, TransactionRecoveryPublishesEveryKeyAtOneLsn) {
+    DatabasePaths paths("minidb_recovery_txn_atomic_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    seed_with_wal(paths.rdb, clock, false);
+    const std::vector<WalSegmentInfo> live = segments(paths.wal_dir);
+    ASSERT_EQ(live.size(), 1u);
+
+    WalTxnOp set_a;
+    set_a.op = WalOp::kSet;
+    set_a.key = "txn-a";
+    set_a.value = "one";
+    WalTxnOp set_b;
+    set_b.op = WalOp::kSet;
+    set_b.key = "txn-b";
+    set_b.value = "two";
+    append_complete_record(live.front().path,
+                           transaction_record(5, {set_a, set_b}));
+
+    KvStore target(clock);
+    RecoveryManager recovery(paths.rdb);
+    std::string error;
+    ASSERT_EQ(recovery.recover(target, &error), RecoveryStatus::kOk) << error;
+    EXPECT_EQ(recovery.stats().last_lsn, 5u);
+    EXPECT_EQ(recovery.stats().next_lsn, 6u);
+    EXPECT_EQ(recovery.stats().wal_records_scanned, 5u);
+    EXPECT_EQ(recovery.stats().wal_records_replayed, 5u);
+    EXPECT_EQ(target.current_lsn(), 5u);
+    EXPECT_EQ(target.latest_committed_lsn("txn-a"), 5u);
+    EXPECT_EQ(target.latest_committed_lsn("txn-b"), 5u);
+    EXPECT_EQ(target.get("txn-a"), std::optional<std::string>("one"));
+    EXPECT_EQ(target.get("txn-b"), std::optional<std::string>("two"));
+    EXPECT_EQ(target.get("base"), std::optional<std::string>("value"));
+    EXPECT_EQ(target.get("delete-me"), std::nullopt);
+}
+
+TEST(RecoveryManagerTest, RecoveryReadsMixedLegacyAndV2Records) {
+    DatabasePaths paths("minidb_recovery_mixed_wal_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    seed_with_wal(paths.rdb, clock, false);
+    const std::vector<WalSegmentInfo> live = segments(paths.wal_dir);
+    ASSERT_EQ(live.size(), 1u);
+
+    WalRecord legacy;
+    legacy.lsn = 5;
+    legacy.op = WalOp::kSet;
+    legacy.key = "legacy-tail";
+    legacy.value = "v1";
+    std::vector<std::uint8_t> legacy_bytes = encode_record(legacy);
+    store_u16(legacy_bytes.data() + 4, WalFormat::LEGACY_VERSION);
+    refresh_record_crc(&legacy_bytes);
+    append_bytes(live.front().path, legacy_bytes);
+
+    WalTxnOp transaction_set;
+    transaction_set.op = WalOp::kSet;
+    transaction_set.key = "v2-tail";
+    transaction_set.value = "v2";
+    append_complete_record(live.front().path,
+                           transaction_record(6, {transaction_set}));
+
+    KvStore target(clock);
+    RecoveryManager recovery(paths.rdb);
+    std::string error;
+    ASSERT_EQ(recovery.recover(target, &error), RecoveryStatus::kOk) << error;
+    EXPECT_EQ(recovery.stats().last_lsn, 6u);
+    EXPECT_EQ(recovery.stats().wal_records_replayed, 6u);
+    EXPECT_EQ(target.get("legacy-tail"), std::optional<std::string>("v1"));
+    EXPECT_EQ(target.get("v2-tail"), std::optional<std::string>("v2"));
+    EXPECT_EQ(target.latest_committed_lsn("legacy-tail"), 5u);
+    EXPECT_EQ(target.latest_committed_lsn("v2-tail"), 6u);
+}
+
+TEST(RecoveryManagerTest, LegacyVersionCannotContainATransactionRecord) {
+    DatabasePaths paths("minidb_recovery_v1_txn_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    seed_with_wal(paths.rdb, clock, false);
+    const std::vector<WalSegmentInfo> live = segments(paths.wal_dir);
+    ASSERT_EQ(live.size(), 1u);
+
+    WalTxnOp operation;
+    operation.op = WalOp::kSet;
+    operation.key = "must-not-publish";
+    operation.value = "x";
+    WalRecord transaction = transaction_record(5, {operation});
+    std::vector<std::uint8_t> bytes = encode_record(transaction);
+    store_u16(bytes.data() + 4, WalFormat::LEGACY_VERSION);
+    refresh_record_crc(&bytes);
+    append_bytes(live.front().path, bytes);
+
+    KvStore target(clock);
+    target.set("sentinel", "kept");
+    RecoveryManager recovery(paths.rdb);
+    std::string error;
+    EXPECT_EQ(recovery.recover(target, &error), RecoveryStatus::kCorrupt);
+    EXPECT_FALSE(error.empty());
+    EXPECT_EQ(target.get("sentinel"), std::optional<std::string>("kept"));
+    EXPECT_EQ(target.get("must-not-publish"), std::nullopt);
+}
+
+TEST(RecoveryManagerTest, CorruptTransactionCrcFailsClosed) {
+    DatabasePaths paths("minidb_recovery_txn_crc_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    seed_with_wal(paths.rdb, clock, false);
+    const std::vector<WalSegmentInfo> live = segments(paths.wal_dir);
+    ASSERT_EQ(live.size(), 1u);
+
+    WalTxnOp operation;
+    operation.op = WalOp::kSet;
+    operation.key = "crc-victim";
+    operation.value = "original";
+    WalRecord transaction = transaction_record(5, {operation});
+    std::vector<std::uint8_t> bytes = encode_record(transaction);
+    const std::size_t payload_offset = transaction_payload_offset(transaction);
+    bytes[payload_offset + WalFormat::TXN_HEADER_SIZE +
+          WalFormat::TXN_OP_HEADER_SIZE] ^= 0x5a;
+    append_bytes(live.front().path, bytes);
+
+    KvStore target(clock);
+    target.set("sentinel", "kept");
+    RecoveryManager recovery(paths.rdb);
+    std::string error;
+    EXPECT_EQ(recovery.recover(target, &error), RecoveryStatus::kCorrupt);
+    EXPECT_EQ(target.get("sentinel"), std::optional<std::string>("kept"));
+}
+
+TEST(RecoveryManagerTest, InvalidTransactionPayloadNeverPublishesPrefixKeys) {
+    DatabasePaths paths("minidb_recovery_txn_payload_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    seed_with_wal(paths.rdb, clock, false);
+    const std::vector<WalSegmentInfo> live = segments(paths.wal_dir);
+    ASSERT_EQ(live.size(), 1u);
+
+    WalTxnOp first;
+    first.op = WalOp::kSet;
+    first.key = "prefix";
+    first.value = "must-not-survive";
+    WalTxnOp second;
+    second.op = WalOp::kSet;
+    second.key = "unknown";
+    second.value = "x";
+    WalRecord transaction = transaction_record(5, {first, second});
+    std::vector<std::uint8_t> bytes = encode_record(transaction);
+    const std::size_t payload_offset = transaction_payload_offset(transaction);
+    bytes[payload_offset + WalFormat::TXN_HEADER_SIZE] = 9;
+    refresh_record_crc(&bytes);
+    append_bytes(live.front().path, bytes);
+
+    KvStore target(clock);
+    target.set("sentinel", "kept");
+    RecoveryManager recovery(paths.rdb);
+    std::string error;
+    EXPECT_EQ(recovery.recover(target, &error), RecoveryStatus::kCorrupt);
+    EXPECT_EQ(target.get("sentinel"), std::optional<std::string>("kept"));
+    EXPECT_EQ(target.get("prefix"), std::nullopt);
+    EXPECT_EQ(target.latest_committed_lsn("prefix"), 0u);
+}
+
+TEST(RecoveryManagerTest, DuplicateTransactionKeyIsRejectedAtomically) {
+    DatabasePaths paths("minidb_recovery_txn_duplicate_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    seed_with_wal(paths.rdb, clock, false);
+    const std::vector<WalSegmentInfo> live = segments(paths.wal_dir);
+    ASSERT_EQ(live.size(), 1u);
+
+    WalTxnOp first;
+    first.op = WalOp::kSet;
+    first.key = "key-one";
+    first.value = "one";
+    WalTxnOp second;
+    second.op = WalOp::kSet;
+    second.key = "key-two";
+    second.value = "two";
+    WalRecord transaction = transaction_record(5, {first, second});
+    std::vector<std::uint8_t> bytes = encode_record(transaction);
+    const std::size_t payload_offset = transaction_payload_offset(transaction);
+    const std::size_t first_key_offset = payload_offset +
+                                         WalFormat::TXN_HEADER_SIZE +
+                                         WalFormat::TXN_OP_HEADER_SIZE;
+    const std::size_t second_key_offset = first_key_offset + first.key.size() +
+                                          first.value.size() +
+                                          WalFormat::TXN_OP_HEADER_SIZE;
+    std::memcpy(bytes.data() + second_key_offset, first.key.data(),
+                first.key.size());
+    refresh_record_crc(&bytes);
+    append_bytes(live.front().path, bytes);
+
+    KvStore target(clock);
+    target.set("sentinel", "kept");
+    RecoveryManager recovery(paths.rdb);
+    std::string error;
+    EXPECT_EQ(recovery.recover(target, &error), RecoveryStatus::kCorrupt);
+    EXPECT_EQ(target.get("sentinel"), std::optional<std::string>("kept"));
+    EXPECT_EQ(target.get("key-one"), std::nullopt);
+    EXPECT_EQ(target.latest_committed_lsn("key-one"), 0u);
+}
+
+TEST(RecoveryManagerTest, TornTransactionTailIsTruncatedWithoutPartialPublish) {
+    DatabasePaths paths("minidb_recovery_txn_torn_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    seed_with_wal(paths.rdb, clock, false);
+    const std::vector<WalSegmentInfo> live = segments(paths.wal_dir);
+    ASSERT_EQ(live.size(), 1u);
+    const std::uint64_t valid_size = live.front().size;
+
+    WalTxnOp operation;
+    operation.op = WalOp::kSet;
+    operation.key = "torn-txn";
+    operation.value = "must-not-publish";
+    WalRecord transaction = transaction_record(5, {operation});
+    const std::vector<std::uint8_t> bytes = encode_record(transaction);
+    const std::size_t torn_size = bytes.size() - 1;
+    append_prefix(live.front().path, bytes, torn_size);
+    ASSERT_EQ(fs::file_size(live.front().path), valid_size + torn_size);
+
+    KvStore target(clock);
+    RecoveryManager recovery(paths.rdb);
+    std::string error;
+    ASSERT_EQ(recovery.recover(target, &error), RecoveryStatus::kOk) << error;
+    EXPECT_EQ(fs::file_size(live.front().path), valid_size);
+    EXPECT_EQ(recovery.stats().truncated_bytes, torn_size);
+    EXPECT_EQ(recovery.stats().last_lsn, 4u);
+    EXPECT_EQ(target.get("torn-txn"), std::nullopt);
+    EXPECT_EQ(target.latest_committed_lsn("torn-txn"), 0u);
 }
 
 } // namespace

@@ -153,6 +153,73 @@ MutationStatus mutation_status_from_wal(WalResult result) {
     return MutationStatus::kIoError;
 }
 
+bool decode_record_mutations(const WalRecord& record,
+                             std::vector<KvStore::AppliedMutation>* mutations,
+                             std::string* error) {
+    mutations->clear();
+    const auto append_operation = [&](WalOp op, const std::string& key,
+                                      const std::string& value,
+                                      std::int64_t expiry_ms) {
+        KvStore::AppliedMutation mutation;
+        mutation.key = key;
+        mutation.value = value;
+        mutation.absolute_expiry_ms = expiry_ms;
+        switch (op) {
+        case WalOp::kSet:
+            mutation.kind = KvStore::AppliedMutation::Kind::kSet;
+            break;
+        case WalOp::kDel:
+            mutation.kind = KvStore::AppliedMutation::Kind::kDelete;
+            break;
+        case WalOp::kExpire:
+            mutation.kind = KvStore::AppliedMutation::Kind::kExpire;
+            break;
+        case WalOp::kTxn:
+            if (error != nullptr) {
+                *error = "nested WAL transaction is not allowed";
+            }
+            return false;
+        }
+        mutations->push_back(std::move(mutation));
+        return true;
+    };
+
+    if (record.op != WalOp::kTxn) {
+        return append_operation(record.op, record.key, record.value,
+                                record.expiry_ms);
+    }
+
+    std::vector<WalTxnOp> operations;
+    std::string payload_error;
+    if (WalFormat::decode_transaction(
+            reinterpret_cast<const std::uint8_t*>(record.value.data()),
+            record.value.size(), &operations,
+            &payload_error) != WalFormat::DecodeStatus::kOk) {
+        if (error != nullptr) {
+            *error = payload_error.empty()
+                         ? "WAL transaction payload is invalid"
+                         : payload_error;
+        }
+        return false;
+    }
+    mutations->reserve(operations.size());
+    for (const WalTxnOp& operation : operations) {
+        if (!append_operation(operation.op, operation.key, operation.value,
+                              operation.expiry_ms)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool mutation_changed(KvStore& store,
+                      const KvStore::AppliedMutation& mutation) {
+    if (mutation.kind == KvStore::AppliedMutation::Kind::kSet) {
+        return true;
+    }
+    return store.get(mutation.key).has_value();
+}
+
 } // namespace
 
 PersistenceManager::PersistenceManager(
@@ -334,7 +401,7 @@ MutationOutcome PersistenceManager::set_impl(const std::string& key,
     record.op = WalOp::kSet;
     record.key = key;
     record.value = value;
-    return append_and_apply(record, true, value, false, 0);
+    return append_and_apply(record);
 }
 
 MutationOutcome PersistenceManager::del_impl(const std::string& key) {
@@ -346,7 +413,7 @@ MutationOutcome PersistenceManager::del_impl(const std::string& key) {
     record.lsn = wal_->next_lsn();
     record.op = WalOp::kDel;
     record.key = key;
-    return append_and_apply(record, false, std::string(), true, 0);
+    return append_and_apply(record);
 }
 
 MutationOutcome PersistenceManager::expire_impl(const std::string& key,
@@ -365,15 +432,24 @@ MutationOutcome PersistenceManager::expire_impl(const std::string& key,
     record.op = WalOp::kExpire;
     record.key = key;
     record.expiry_ms = deadline;
-    return append_and_apply(record, false, std::string(), false, deadline);
+    return append_and_apply(record);
 }
 
-MutationOutcome PersistenceManager::append_and_apply(
-    const WalRecord& record, bool apply_set, const std::string& apply_value,
-    bool apply_del, std::int64_t apply_expiry_ms) {
+MutationOutcome PersistenceManager::append_and_apply(const WalRecord& record) {
     std::string bootstrap_error;
     if (!ensure_bootstrapped_locked(&bootstrap_error)) {
         return fail(MutationStatus::kIoError, bootstrap_error);
+    }
+
+    std::vector<KvStore::AppliedMutation> mutations;
+    std::string decode_error;
+    if (!decode_record_mutations(record, &mutations, &decode_error)) {
+        return fail(MutationStatus::kInvalidArgument, decode_error);
+    }
+
+    bool changed = false;
+    for (const KvStore::AppliedMutation& mutation : mutations) {
+        changed = changed || mutation_changed(*store_, mutation);
     }
 
     std::string append_error;
@@ -387,14 +463,24 @@ MutationOutcome PersistenceManager::append_and_apply(
         return fail(MutationStatus::kIoError, append_error);
     }
 
+    std::string apply_error;
+    const KvStore::ApplyStatus apply_status =
+        store_->apply_committed_status(record.lsn, mutations, &apply_error);
+    if (apply_status != KvStore::ApplyStatus::kOk) {
+        // The record is already durable.  A rejected in-memory publication is
+        // therefore fail-stop; recovery will retry the complete record.
+        mark_failed();
+        return fail(apply_status == KvStore::ApplyStatus::kResourceLimit
+                        ? MutationStatus::kResourceLimit
+                        : MutationStatus::kIoError,
+                    apply_error);
+    }
     last_lsn_ = record.lsn;
-    bool changed = true;
-    if (apply_set) {
-        store_->set(record.key, apply_value);
-    } else if (apply_del) {
-        changed = store_->del(record.key);
-    } else if (apply_expiry_ms > 0) {
-        changed = store_->expire_absolute(record.key, apply_expiry_ms);
+
+    KvStore::GcResult gc_result;
+    if (!store_->garbage_collect({}, &gc_result, &apply_error)) {
+        mark_failed();
+        return fail(MutationStatus::kIoError, apply_error);
     }
 
     if (after_apply_callback_) {
@@ -1656,24 +1742,46 @@ void PersistenceManager::on_group_commit_completion(
                     outcome.status = MutationStatus::kIoError;
                     outcome.error = "group commit apply LSN is not contiguous";
                 } else {
-                    bool changed = true;
+                    bool changed = false;
                     try {
-                        switch (result.record.op) {
-                        case WalOp::kSet:
-                            store_->set(result.record.key, result.record.value);
-                            break;
-                        case WalOp::kDel:
-                            changed = store_->del(result.record.key);
-                            break;
-                        case WalOp::kExpire:
-                            changed = store_->expire_absolute(
-                                result.record.key, result.record.expiry_ms);
-                            break;
-                        default:
+                        std::vector<KvStore::AppliedMutation> mutations;
+                        std::string decode_error;
+                        if (!decode_record_mutations(result.record, &mutations,
+                                                     &decode_error)) {
+                            // GroupCommitWriter validated the record before
+                            // enqueueing it.  A decode failure here means the
+                            // durable WAL is inconsistent with the in-memory
+                            // admission path, so fail closed.
                             mark_failed();
                             outcome.status = MutationStatus::kInvalidArgument;
-                            outcome.error = "unknown WAL operation";
-                            break;
+                            outcome.error = decode_error;
+                        } else {
+                            for (const KvStore::AppliedMutation& mutation :
+                                 mutations) {
+                                changed = changed ||
+                                          mutation_changed(*store_, mutation);
+                            }
+                            std::string apply_error;
+                            const KvStore::ApplyStatus apply_status =
+                                store_->apply_committed_status(
+                                    result.record.lsn, mutations, &apply_error);
+                            if (apply_status != KvStore::ApplyStatus::kOk) {
+                                mark_failed();
+                                outcome.status =
+                                    apply_status ==
+                                            KvStore::ApplyStatus::kResourceLimit
+                                        ? MutationStatus::kResourceLimit
+                                        : MutationStatus::kIoError;
+                                outcome.error = apply_error;
+                            } else {
+                                KvStore::GcResult gc_result;
+                                if (!store_->garbage_collect({}, &gc_result,
+                                                             &apply_error)) {
+                                    mark_failed();
+                                    outcome.status = MutationStatus::kIoError;
+                                    outcome.error = apply_error;
+                                }
+                            }
                         }
                     } catch (const std::exception& ex) {
                         mark_failed();

@@ -636,43 +636,44 @@ bool KvStore::garbage_collect(const std::vector<std::uint64_t>& snapshot_lsns,
     return true;
 }
 
-bool KvStore::apply_committed(std::uint64_t commit_lsn,
-                              const std::vector<AppliedMutation>& mutations,
-                              std::string* error) {
+KvStore::ApplyStatus
+KvStore::apply_committed_status(std::uint64_t commit_lsn,
+                                const std::vector<AppliedMutation>& mutations,
+                                std::string* error) {
     if (commit_lsn == 0) {
         set_error(error, "transaction commit LSN is zero");
-        return false;
+        return ApplyStatus::kInvalidArgument;
     }
     if (mutations.empty()) {
         set_error(error, "transaction mutation set is empty");
-        return false;
+        return ApplyStatus::kInvalidArgument;
     }
     for (const AppliedMutation& mutation : mutations) {
         if (mutation.key.empty() || mutation.key.size() > MAX_KEY_SIZE) {
             set_error(error, "transaction key length is out of range");
-            return false;
+            return ApplyStatus::kInvalidArgument;
         }
         if (mutation.value.size() > MAX_VALUE_SIZE) {
             set_error(error, "transaction value length is out of range");
-            return false;
+            return ApplyStatus::kInvalidArgument;
         }
         switch (mutation.kind) {
         case AppliedMutation::Kind::kSet:
             if (mutation.absolute_expiry_ms < 0) {
                 set_error(error, "transaction SET has a negative expiry");
-                return false;
+                return ApplyStatus::kInvalidArgument;
             }
             break;
         case AppliedMutation::Kind::kDelete:
             if (!mutation.value.empty() || mutation.absolute_expiry_ms != 0) {
                 set_error(error, "transaction DEL has a payload");
-                return false;
+                return ApplyStatus::kInvalidArgument;
             }
             break;
         case AppliedMutation::Kind::kExpire:
             if (!mutation.value.empty() || mutation.absolute_expiry_ms <= 0) {
                 set_error(error, "transaction EXPIRE has invalid fields");
-                return false;
+                return ApplyStatus::kInvalidArgument;
             }
             break;
         }
@@ -681,7 +682,7 @@ bool KvStore::apply_committed(std::uint64_t commit_lsn,
     std::lock_guard<std::mutex> lock(mutex_);
     if (commit_lsn <= max_applied_lsn_) {
         set_error(error, "transaction commit LSN is not increasing");
-        return false;
+        return ApplyStatus::kInvalidArgument;
     }
 
     const auto current = now();
@@ -775,7 +776,7 @@ bool KvStore::apply_committed(std::uint64_t commit_lsn,
     if (version_count_ > max_versions_ ||
         prepared.size() > max_versions_ - version_count_) {
         set_error(error, "KvStore version limit exceeded");
-        return false;
+        return ApplyStatus::kResourceLimit;
     }
 
     struct Touch {
@@ -809,7 +810,7 @@ bool KvStore::apply_committed(std::uint64_t commit_lsn,
                 }
                 version_count_ -= appended;
                 set_error(error, append_error.c_str());
-                return false;
+                return ApplyStatus::kInvalidArgument;
             }
             ++appended;
         }
@@ -822,11 +823,11 @@ bool KvStore::apply_committed(std::uint64_t commit_lsn,
         }
         version_count_ -= appended;
         set_error(error, exception.what());
-        return false;
+        return ApplyStatus::kInvalidArgument;
     }
 
     max_applied_lsn_ = commit_lsn;
-    return true;
+    return ApplyStatus::kOk;
 }
 
 size_t KvStore::sweep_expired() {

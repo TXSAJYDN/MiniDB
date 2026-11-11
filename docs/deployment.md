@@ -312,8 +312,9 @@ all data.
 
 ## Upgrade and rollback
 
-WAL v1, manifest v1, and RDB v2 are the only accepted formats. Before replacing
-a binary:
+The current binary accepts WAL v1 and v2, manifest v1, and RDB v2, and always
+writes WAL v2. A binary that only understands WAL v1 cannot read a WAL containing
+v2 transaction records. Before replacing a binary:
 
 1. run the target build's full local tests;
 2. back up the complete RDB + manifest + WAL set;
@@ -323,7 +324,9 @@ a binary:
 6. verify recovery and read/write behavior;
 7. retain the previous binary and persistence set for rollback.
 
-There is no online migration or rolling upgrade path.
+There is no online migration, automatic downgrade, or rolling upgrade path.
+Rollback requires stopping writes and restoring a persistence set compatible
+with the older binary.
 
 ## Shutdown behavior
 

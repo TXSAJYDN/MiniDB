@@ -265,10 +265,7 @@ class PersistenceManager {
     MutationOutcome set_impl(const std::string& key, const std::string& value);
     MutationOutcome del_impl(const std::string& key);
     MutationOutcome expire_impl(const std::string& key, std::int64_t ttl_ms);
-    MutationOutcome append_and_apply(const WalRecord& record, bool apply_set,
-                                     const std::string& apply_value,
-                                     bool apply_del,
-                                     std::int64_t apply_expiry_ms);
+    MutationOutcome append_and_apply(const WalRecord& record);
     MutationAdmission admit_async(WalRecord record,
                                   MutationCompletion completion);
     MutationAdmission admission_fail(MutationAdmissionStatus status,

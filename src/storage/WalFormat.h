@@ -14,13 +14,15 @@ namespace minidb {
 //          | key_len:u32 | value_len:u32 | expiry_ms:i64 | key | value
 //          | crc32c:u32
 //
-// The CRC covers every byte before the trailing checksum.  The format is
-// intentionally fixed-width so a torn record can be detected before the key
-// or value is materialised.
+// The CRC covers every byte before the trailing checksum.  Version 2 keeps the
+// exact same outer layout as version 1 and adds op 4 (kTxn).  The value of a
+// kTxn record is an MTXN transaction payload.  Decoders accept both versions;
+// encoders always emit version 2.
 enum class WalOp : std::uint8_t {
     kSet = 1,
     kDel = 2,
     kExpire = 3,
+    kTxn = 4,
 };
 
 struct WalRecord {
@@ -29,7 +31,17 @@ struct WalRecord {
     std::string key;
     std::string value;
     // Absolute Unix epoch milliseconds.  0 means no expiry.  DEL carries 0;
-    // EXPIRE carries a positive absolute deadline.
+    // EXPIRE carries a positive absolute deadline.  kTxn carries 0 and uses
+    // the fixed outer key "txn".
+    std::int64_t expiry_ms = 0;
+};
+
+// One operation inside a kTxn payload.  The operation codes are the same as
+// standalone SET/DEL/EXPIRE.  kTxn is deliberately not accepted here.
+struct WalTxnOp {
+    WalOp op = WalOp::kSet;
+    std::string key;
+    std::string value;
     std::int64_t expiry_ms = 0;
 };
 
@@ -50,12 +62,17 @@ const WalLimits& default_wal_limits() noexcept;
 class WalFormat {
   public:
     static constexpr char MAGIC[5] = "MWAL";
-    static constexpr std::uint16_t VERSION = 1;
+    static constexpr std::uint16_t VERSION = 2;
+    static constexpr std::uint16_t LEGACY_VERSION = 1;
     static constexpr std::uint16_t FLAGS = 0;
     static constexpr std::size_t HEADER_SIZE = 34;
     static constexpr std::size_t CHECKSUM_SIZE = 4;
     static constexpr std::size_t MAX_KEY_SIZE = 1024;
     static constexpr std::size_t MAX_VALUE_SIZE = std::size_t{1024} * 1024;
+    static constexpr std::size_t MAX_TXN_OPS = 256;
+    static constexpr std::size_t MAX_TXN_PAYLOAD_SIZE = MAX_VALUE_SIZE;
+    static constexpr std::size_t TXN_HEADER_SIZE = 8;
+    static constexpr std::size_t TXN_OP_HEADER_SIZE = 16;
     static constexpr std::size_t MAX_RECORD_SIZE =
         HEADER_SIZE + MAX_KEY_SIZE + MAX_VALUE_SIZE + CHECKSUM_SIZE;
     // Production defaults.  Persistence code carries an injected WalLimits
@@ -87,10 +104,24 @@ class WalFormat {
     // Decodes one record from data.  NeedMore means the supplied bytes are a
     // truncated prefix and can be treated as a tail only by the recovery
     // layer.  Corrupt means the header or a complete record is invalid.
+    // kTxn payloads are fully validated before this method returns kOk.
     static DecodeStatus decode(const std::uint8_t* data, std::size_t len,
                                WalRecord* record,
                                std::size_t* consumed = nullptr,
                                std::string* error = nullptr);
+
+    // MTXN payload codec.  validate_transaction enforces every field rule and
+    // the 1 MiB payload cap.  encode_transaction returns empty on invalid
+    // input.  decode_transaction requires exactly one complete payload.
+    static bool validate_transaction(const std::vector<WalTxnOp>& operations,
+                                     std::string* error = nullptr);
+    static std::vector<std::uint8_t>
+    encode_transaction(const std::vector<WalTxnOp>& operations,
+                       std::string* error = nullptr);
+    static DecodeStatus decode_transaction(const std::uint8_t* data,
+                                           std::size_t len,
+                                           std::vector<WalTxnOp>* operations,
+                                           std::string* error = nullptr);
 
     static std::uint32_t crc32c(const std::uint8_t* data, std::size_t len);
 };

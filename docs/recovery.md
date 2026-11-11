@@ -14,6 +14,10 @@ The `<rdb_path>.lock` file is not data; it is the advisory single-writer lock.
 Recovery runs before the listening socket accepts clients and publishes the
 store only after the complete image validates.
 
+The WAL decoder accepts both v1 and v2 records. A v1 standalone record is
+replayed as one logical mutation; a v2 `TXN` record carries a fully decoded
+MTXN mutation set. Legacy history is never rewritten during startup.
+
 ## Preconditions
 
 1. The process has parsed a valid command line.
@@ -100,10 +104,14 @@ prefix cleanup.
    - every segment listed by the manifest must exist;
    - segments after the first retained start also participate, including ones
      rotated after the manifest was published.
-5. Read each selected segment and decode records in order.
+5. Read each selected segment and decode records in order. Decode standalone
+   operations and complete MTXN transaction payloads with the per-record WAL
+   version.
 6. Require the first record of each segment to match the segment's start LSN.
 7. Require the global LSN sequence to be contiguous.
-8. Replay only records with `LSN > checkpoint_lsn`.
+8. Replay only records with `LSN > checkpoint_lsn`. A standalone record and a
+   `TXN` record each consume exactly one LSN and are passed to
+   `KvStore::apply_committed_status` exactly once.
 9. Validate recovery record and byte limits.
 10. Publish the temporary store with `KvStore::swap` only after all steps pass.
 
@@ -120,13 +128,40 @@ The following are not tail truncation and are fatal:
 - a complete record with a bad CRC;
 - a record with an invalid header, operation, key, value, expiry, or reserved
   field;
+- a complete v1 record whose operation is `TXN`;
+- a complete `TXN` record whose MTXN payload is truncated, malformed, has
+  duplicate keys, contains an unknown/nested operation, or has trailing bytes;
 - trailing bytes after the last complete record;
 - an LSN gap, duplicate, or segment-start mismatch;
 - a manifest-referenced segment that is missing;
 - a resource-limit breach.
 
+A torn record is truncated only when its final outer record is incomplete. Once
+the outer record is complete, MTXN payload errors are corruption, not a
+truncatable tail; recovery never drops a malformed committed transaction.
+
 The recovery path never scans forward for a plausible record boundary after a
 corruption. It fails closed.
+
+## kTxn atomic recovery
+
+MTXN decoding validates every operation before the store is touched. Recovery
+then converts the decoded operations into one `AppliedMutation` vector and calls
+`apply_committed_status(record.lsn, mutations)` once. The store either publishes
+every key at that single LSN or publishes none of them.
+
+This rule applies to both in-process replay and startup recovery:
+
+- a malformed v2 transaction never publishes a prefix of its operations;
+- a version-budget rejection returns a resource-limit failure and leaves the
+  temporary recovery store unchanged;
+- the WAL record remains the source of truth if a durable append succeeded but
+  the in-memory apply failed during normal operation. The process fail-stops,
+  and the next recovery retries the complete record atomically.
+
+A read-only explicit transaction does not write a WAL record. Once the R4-C
+session layer is enabled, a synthetic empty transaction must never be encoded
+as MTXN because the format requires at least one operation.
 
 ## Why old manifests can be valid
 
@@ -141,9 +176,10 @@ A new manifest with a missing or non-durable snapshot is not allowed by the
 publication order. When an old manifest is observed with a new snapshot, the
 checkpoint LSN in the old manifest is lower than the snapshot's actual content.
 The old manifest still names the complete old live segment set; recovery replays
-every WAL record after the old checkpoint LSN. SET, DEL, and EXPIRE are
-idempotent at the logical level, so replay over the newer snapshot produces the
-same final state without double-applying a semantic effect.
+every WAL record after the old checkpoint LSN. Standalone SET, DEL, and EXPIRE
+and the operations inside MTXN are idempotent at the logical level, so replay
+over the newer snapshot produces the same final state without double-applying a
+semantic effect.
 
 ## Resource bounds
 
@@ -151,7 +187,9 @@ same final state without double-applying a semantic effect.
 |---|---:|
 | Concurrent connections | 32 |
 | Key size | 1 KiB |
-| Value / WAL payload | 1 MiB |
+| Value / standalone WAL payload | 1 MiB |
+| MTXN operations per transaction | 256 |
+| MTXN payload per transaction | 1 MiB |
 | WAL segment | 16 MiB |
 | Total WAL bytes | 256 MiB |
 | Segments | 128 |
@@ -173,7 +211,9 @@ nonzero, does not listen, and does not publish a partial store.
 | Manifest without RDB | corrupt, nonzero exit |
 | RDB corrupt | nonzero exit |
 | WAL middle corruption | nonzero exit |
-| WAL tail partial record | truncate + fsync, then start |
+| v1 transaction record | nonzero exit |
+| MTXN payload invalid or duplicate key | nonzero exit; no partial transaction |
+| WAL tail partial outer record | truncate + fsync, then start |
 | Missing referenced segment | nonzero exit |
 | LSN gap or duplicate | nonzero exit |
 | Recovery limit exceeded | nonzero exit |

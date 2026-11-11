@@ -224,16 +224,19 @@ TEST(KvStoreMvccTest, ApplyRejectsInvalidLsnAndMutationFields) {
 TEST(KvStoreMvccTest, VersionLimitRejectsBeforePublication) {
     KvStore store(nullptr, KvStore::Limits{2});
     std::string error;
-    EXPECT_FALSE(store.apply_committed(
-        1, {make_set("a", "1"), make_set("b", "2"), make_set("c", "3")},
-        &error));
+    EXPECT_EQ(store.apply_committed_status(
+                  1,
+                  {make_set("a", "1"), make_set("b", "2"), make_set("c", "3")},
+                  &error),
+              KvStore::ApplyStatus::kResourceLimit);
     EXPECT_FALSE(error.empty());
     EXPECT_EQ(store.current_lsn(), 0u);
     EXPECT_EQ(store.version_count(), 0u);
 
     ASSERT_TRUE(store.apply_committed(1, {make_set("a", "1")}));
     ASSERT_TRUE(store.apply_committed(2, {make_set("b", "2")}));
-    EXPECT_FALSE(store.apply_committed(3, {make_set("c", "3")}, &error));
+    EXPECT_EQ(store.apply_committed_status(3, {make_set("c", "3")}, &error),
+              KvStore::ApplyStatus::kResourceLimit);
     EXPECT_EQ(store.current_lsn(), 2u);
     EXPECT_EQ(store.version_count(), 2u);
     EXPECT_EQ(store.get("c"), std::nullopt);

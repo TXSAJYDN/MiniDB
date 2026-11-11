@@ -81,13 +81,35 @@ class KvStore {
         std::int64_t absolute_expiry_ms = 0;
     };
 
+    // Explicit outcome for callers that must distinguish malformed WAL
+    // input from a bounded-resource rejection.  kInvalidArgument covers all
+    // caller/data validation failures; kResourceLimit is returned only when
+    // publishing would exceed the configured version budget.  Neither result
+    // publishes a version or advances the store LSN.
+    enum class ApplyStatus : std::uint8_t {
+        kOk,
+        kInvalidArgument,
+        kResourceLimit,
+    };
+
     // Validates and atomically publishes one committed WAL record.  Every key
     // appears at most once in the resulting version metadata: duplicate
     // operations in the input are folded to their final state first.  On
     // validation/allocation failure no version or LSN is published.
+    ApplyStatus
+    apply_committed_status(std::uint64_t commit_lsn,
+                           const std::vector<AppliedMutation>& mutations,
+                           std::string* error = nullptr);
+
+    // Compatibility wrapper.  New persistence/recovery callers should use
+    // apply_committed_status() so they never infer failure kinds from error
+    // text.
     bool apply_committed(std::uint64_t commit_lsn,
                          const std::vector<AppliedMutation>& mutations,
-                         std::string* error = nullptr);
+                         std::string* error = nullptr) {
+        return apply_committed_status(commit_lsn, mutations, error) ==
+               ApplyStatus::kOk;
+    }
 
     // Snapshot read.  snapshot_lsn == 0 addresses versions restored from an
     // RDB image, which predate the replayed WAL.

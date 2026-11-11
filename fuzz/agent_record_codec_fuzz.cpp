@@ -10,23 +10,28 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data,
     const std::string_view input(reinterpret_cast<const char*>(data), size);
     std::string error;
 
+    minidb::AgentRecordCodec::KeyInfo key_info;
+    minidb::AgentRecordCodec::Record record;
+    minidb::AgentRecordCodec::Response response;
+    minidb::AgentRecordCodec::SessionPayload session;
+    minidb::AgentRecordCodec::ToolPayload tool;
+    minidb::AgentRecordCodec::IdempotencyPayload idempotency;
+
     minidb::AgentRecordCodec::decode_marker(input, &error);
-    minidb::AgentRecordCodec::decode_key(input, nullptr, &error);
-    minidb::AgentRecordCodec::decode_record(input, nullptr, &error);
-    minidb::AgentRecordCodec::decode_response(input, nullptr, &error);
-    minidb::AgentRecordCodec::decode_session_payload(input, nullptr, &error);
-    minidb::AgentRecordCodec::decode_tool_payload(input, nullptr, &error);
-    minidb::AgentRecordCodec::decode_idempotency_payload(input, nullptr,
+    const bool valid_key =
+        minidb::AgentRecordCodec::decode_key(input, &key_info, &error);
+    const bool valid_record =
+        minidb::AgentRecordCodec::decode_record(input, &record, &error);
+    minidb::AgentRecordCodec::decode_response(input, &response, &error);
+    minidb::AgentRecordCodec::decode_session_payload(input, &session, &error);
+    minidb::AgentRecordCodec::decode_tool_payload(input, &tool, &error);
+    minidb::AgentRecordCodec::decode_idempotency_payload(input, &idempotency,
                                                          &error);
 
-    minidb::AgentRecordCodec::KeyInfo key_info;
-    if (minidb::AgentRecordCodec::decode_key(input, &key_info, &error)) {
+    if (valid_key && valid_record) {
         std::string key(input);
-        minidb::AgentRecordCodec::Record record;
-        if (minidb::AgentRecordCodec::decode_record(input, &record, &error)) {
-            minidb::AgentRecordCodec::decode_typed_record(
-                key, input, nullptr, nullptr, nullptr, nullptr, &error);
-        }
+        minidb::AgentRecordCodec::decode_typed_record(
+            key, input, nullptr, nullptr, nullptr, nullptr, &error);
     }
     return 0;
 }

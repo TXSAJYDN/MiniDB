@@ -87,3 +87,21 @@ target_compile_options(minidb_agent_record_codec_fuzz PRIVATE
 target_link_options(minidb_agent_record_codec_fuzz PRIVATE
     -fsanitize=fuzzer,address,undefined
 )
+
+add_executable(minidb_agent_protocol_fuzz
+    agent_protocol_fuzz.cpp
+)
+
+target_link_libraries(minidb_agent_protocol_fuzz PRIVATE
+    minidb_storage
+    minidb_base
+)
+
+target_compile_options(minidb_agent_protocol_fuzz PRIVATE
+    -fsanitize=fuzzer-no-link,address,undefined
+    -fno-omit-frame-pointer
+)
+
+target_link_options(minidb_agent_protocol_fuzz PRIVATE
+    -fsanitize=fuzzer,address,undefined
+)

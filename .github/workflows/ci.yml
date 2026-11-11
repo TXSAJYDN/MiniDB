@@ -120,7 +120,9 @@ jobs:
             minidb_http_parser_fuzz \
             minidb_kv_protocol_fuzz \
             minidb_wal_record_fuzz \
-            minidb_checkpoint_manifest_fuzz
+            minidb_checkpoint_manifest_fuzz \
+            minidb_agent_record_codec_fuzz \
+            minidb_agent_protocol_fuzz
       - name: Run fixed-seed corpus smoke
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:halt_on_error=1
@@ -128,11 +130,14 @@ jobs:
         run: |
           mkdir -p /tmp/minidb-fuzz-http /tmp/minidb-fuzz-kv \
             /tmp/minidb-fuzz-wal /tmp/minidb-fuzz-manifest \
+            /tmp/minidb-fuzz-agent-record /tmp/minidb-fuzz-agent-protocol \
             /tmp/minidb-fuzz-artifacts
           cp fuzz/corpus/http/* /tmp/minidb-fuzz-http/
           cp fuzz/corpus/kv/* /tmp/minidb-fuzz-kv/
           cp fuzz/corpus/wal/* /tmp/minidb-fuzz-wal/
           cp fuzz/corpus/manifest/* /tmp/minidb-fuzz-manifest/
+          cp fuzz/corpus/agent_record/* /tmp/minidb-fuzz-agent-record/
+          cp fuzz/corpus/agent_protocol/* /tmp/minidb-fuzz-agent-protocol/
           build/fuzz-ci/fuzz/minidb_http_parser_fuzz \
             -seed=20261111 -runs=20000 -max_len=2097152 \
             -artifact_prefix=/tmp/minidb-fuzz-artifacts/ /tmp/minidb-fuzz-http
@@ -145,4 +150,10 @@ jobs:
           build/fuzz-ci/fuzz/minidb_checkpoint_manifest_fuzz \
             -seed=20261111 -runs=20000 -max_len=2048 \
             -artifact_prefix=/tmp/minidb-fuzz-artifacts/ /tmp/minidb-fuzz-manifest
+          build/fuzz-ci/fuzz/minidb_agent_record_codec_fuzz \
+            -seed=20261111 -runs=20000 -max_len=70000 \
+            -artifact_prefix=/tmp/minidb-fuzz-artifacts/ /tmp/minidb-fuzz-agent-record
+          build/fuzz-ci/fuzz/minidb_agent_protocol_fuzz \
+            -seed=20261111 -runs=20000 -max_len=262144 \
+            -artifact_prefix=/tmp/minidb-fuzz-artifacts/ /tmp/minidb-fuzz-agent-protocol
           test -z "$(find /tmp/minidb-fuzz-artifacts -type f -print -quit)"

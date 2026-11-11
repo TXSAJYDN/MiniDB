@@ -38,7 +38,17 @@ KV_STATS = 8
 KV_BEGIN = 9
 KV_COMMIT = 10
 KV_ROLLBACK = 11
+KV_AGENT = 12
+KV_ERROR = 100
+KV_OK = 101
+KV_VALUE = 102
 KV_CONFLICT = 105
+
+AGENT_OK = 0
+AGENT_CREATED = 1
+AGENT_FENCED = 7
+AGENT_TOOL_RUNNING = 2
+AGENT_RESERVED_PREFIX = b"\x00minidb-agent-v1\x00"
 
 
 class TestError(Exception):
@@ -250,6 +260,62 @@ def kv_request(port, command_type, args=(), timeout=5.0):
         sock.settimeout(timeout)
         sock.sendall(kv_encode(command_type, args))
         return kv_read_frame(sock)
+
+
+def agent_request(port, subcommand, args=(), timeout=5.0):
+    return kv_request(port, KV_AGENT, [subcommand, *args], timeout=timeout)
+
+
+def decode_agent_response(encoded):
+    check(isinstance(encoded, bytes) and len(encoded) >= 36,
+          f"agent response is truncated: {encoded!r}")
+    (magic, version, status, flags, reserved, revision, fence, lsn,
+     payload_length) = struct.unpack(">4sBBBBQQQI", encoded[:36])
+    check(magic == b"MDOR", f"agent response magic is {magic!r}")
+    check(version == 1, f"agent response version is {version}")
+    check(flags == 0 and reserved == 0,
+          f"agent response flags are invalid: {flags}, {reserved}")
+    check(len(encoded) == 36 + payload_length,
+          f"agent response length {len(encoded)} != {36 + payload_length}")
+    return {
+        "status": status,
+        "revision": revision,
+        "fence": fence,
+        "lsn": lsn,
+        "payload": encoded[36:],
+    }
+
+
+def decode_agent_record(encoded):
+    check(isinstance(encoded, bytes) and len(encoded) >= 52,
+          f"agent record is truncated: {encoded!r}")
+    (magic, version, record_type, status, reserved, revision, fence,
+     created_at_ms, updated_at_ms, lease_expires_at_ms,
+     payload_length) = struct.unpack(">4sBBBBQQqqqI", encoded[:52])
+    check(magic == b"MDAR", f"agent record magic is {magic!r}")
+    check(version == 1, f"agent record version is {version}")
+    check(reserved == 0, f"agent record reserved byte is {reserved}")
+    check(len(encoded) == 52 + payload_length,
+          f"agent record length {len(encoded)} != {52 + payload_length}")
+    return {
+        "type": record_type,
+        "status": status,
+        "revision": revision,
+        "fence": fence,
+        "created_at_ms": created_at_ms,
+        "updated_at_ms": updated_at_ms,
+        "lease_expires_at_ms": lease_expires_at_ms,
+        "payload": encoded[52:],
+    }
+
+
+def agent_value_request(port, subcommand, args=(), timeout=5.0):
+    command_type, response_args = agent_request(
+        port, subcommand, args, timeout=timeout)
+    check(command_type == KV_VALUE and len(response_args) == 1,
+          f"AGENT {subcommand} returned type={command_type}, "
+          f"args={response_args!r}")
+    return decode_agent_response(response_args[0])
 
 
 class ServerProcess:
@@ -488,8 +554,44 @@ def check_transaction_contract(stats, label):
           f"{label} GC timing is inconsistent: {stats!r}")
 
 
+def check_agent_contract(stats, label):
+    agent = stats.get("agent")
+    check(isinstance(agent, dict), f"{label} stats omitted agent: {stats!r}")
+    required = (
+        "sessions_stored", "sessions_live", "sessions_created",
+        "sessions_completed", "sessions_failed", "sessions_cancelled",
+        "sessions_purged", "tools_stored", "tools_pending", "tools_running",
+        "tools_succeeded", "tools_failed", "tools_cancelled",
+        "records_stored", "idempotency_stored", "logical_bytes",
+        "logical_bytes_max", "idempotency_replays", "idempotency_conflicts",
+        "revision_mismatches", "lease_acquires", "lease_renews",
+        "lease_expiries", "fenced_rejections", "gc_runs", "gc_candidates",
+        "gc_deleted", "gc_failures", "gc_total_us", "gc_max_us",
+    )
+    for name in required:
+        value = agent.get(name)
+        check(isinstance(value, int) and not isinstance(value, bool) and
+              value >= 0,
+              f"{label} agent field {name} is invalid: {stats!r}")
+    check(agent["sessions_live"] <= agent["sessions_stored"],
+          f"{label} live sessions exceed stored sessions: {stats!r}")
+    check(agent["logical_bytes"] <= agent["logical_bytes_max"],
+          f"{label} agent logical bytes exceed the limit: {stats!r}")
+    check(agent["gc_total_us"] >= agent["gc_max_us"],
+          f"{label} agent GC timing is inconsistent: {stats!r}")
+    tool_status_total = sum(
+        agent[name] for name in (
+            "tools_pending", "tools_running", "tools_succeeded",
+            "tools_failed", "tools_cancelled",
+        )
+    )
+    check(tool_status_total == agent["tools_stored"],
+          f"{label} agent tool status counters are inconsistent: {stats!r}")
+
+
 def check_timing_contract(stats, label):
     check_transaction_contract(stats, label)
+    check_agent_contract(stats, label)
     timing = stats.get("timing")
     check(isinstance(timing, dict), f"{label} stats omitted timing: {stats!r}")
     required = (
@@ -1912,6 +2014,296 @@ def test_transaction_contract():
             server.cleanup()
 
 
+def test_agent_idempotency_crash_recovery():
+    with tempfile.TemporaryDirectory(
+            prefix="minidb-process-agent-idempotency-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "agent-idempotency.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            command_type, response_args = agent_request(
+                port, "SESSION_CREATE",
+                ["idem-session", "60000", "working", "create-idem-session"])
+            check(command_type == KV_VALUE and len(response_args) == 1,
+                  f"AGENT SESSION_CREATE returned type={command_type}, "
+                  f"args={response_args!r}")
+            original_bytes = response_args[0]
+            original = decode_agent_response(original_bytes)
+            check(original["status"] == AGENT_CREATED,
+                  f"agent session was not created: {original!r}")
+            check(original["revision"] == 1 and original["lsn"] >= 1,
+                  f"agent create response is inconsistent: {original!r}")
+            before = read_kv_stats(port)
+            check(before["last_lsn"] == original["lsn"],
+                  f"agent create LSN is inconsistent: {before!r}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            recovered = read_kv_stats(port)
+            check(recovered["last_lsn"] == before["last_lsn"],
+                  f"agent restart changed the durable LSN: {recovered!r}")
+            command_type, response_args = agent_request(
+                port, "SESSION_CREATE",
+                ["idem-session", "60000", "working", "create-idem-session"])
+            check(command_type == KV_VALUE and len(response_args) == 1,
+                  f"replayed AGENT SESSION_CREATE returned "
+                  f"type={command_type}, args={response_args!r}")
+            check(response_args[0] == original_bytes,
+                  "replayed agent response changed across the crash")
+            replay = decode_agent_response(response_args[0])
+            check(replay["lsn"] == original["lsn"],
+                  f"replayed agent mutation advanced the LSN: {replay!r}")
+            after = read_kv_stats(port)
+            check(after["last_lsn"] == before["last_lsn"],
+                  f"agent replay advanced the durable LSN: {after!r}")
+            check(after["agent"]["idempotency_replays"] ==
+                  before["agent"]["idempotency_replays"] + 1,
+                  f"agent replay counter is incorrect: {after!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"agent idempotency shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_agent_lease_takeover():
+    with tempfile.TemporaryDirectory(
+            prefix="minidb-process-agent-lease-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "agent-lease.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            created = agent_value_request(
+                port, "SESSION_CREATE",
+                ["lease-session", "60000", "working", "lease-create"])
+            check(created["status"] == AGENT_CREATED,
+                  f"lease session was not created: {created!r}")
+
+            first = agent_value_request(
+                port, "LEASE_ACQUIRE",
+                ["lease-session", "1000", "lease-first"])
+            check(first["status"] == AGENT_OK and first["fence"] == 1,
+                  f"first lease acquisition is inconsistent: {first!r}")
+
+            tool = agent_value_request(
+                port, "TOOL_CREATE",
+                ["lease-session", "tool-1", "shell", "echo hi",
+                 "lease-tool-create"])
+            check(tool["status"] == AGENT_CREATED and tool["revision"] == 1,
+                  f"lease tool creation is inconsistent: {tool!r}")
+
+            claim = agent_value_request(
+                port, "TOOL_CLAIM",
+                ["lease-session", "tool-1", "1", "1", "1000",
+                 "lease-claim"])
+            check(claim["status"] == AGENT_OK and claim["revision"] == 2 and
+                  claim["fence"] == 1,
+                  f"initial tool claim is inconsistent: {claim!r}")
+
+            time.sleep(1.5)
+            takeover = agent_value_request(
+                port, "LEASE_ACQUIRE",
+                ["lease-session", "10000", "lease-second"])
+            check(takeover["status"] == AGENT_OK and takeover["fence"] == 2,
+                  f"lease takeover did not advance the fence: {takeover!r}")
+
+            stale = agent_value_request(
+                port, "TOOL_COMPLETE",
+                ["lease-session", "tool-1", "2", "1", "SUCCEEDED", "done",
+                 "lease-stale-complete"])
+            check(stale["status"] == AGENT_FENCED and stale["fence"] == 2,
+                  f"stale fence was not rejected: {stale!r}")
+
+            stats = read_kv_stats(port)
+            check(stats["agent"]["lease_acquires"] >= 2,
+                  f"lease acquisition counter is incorrect: {stats!r}")
+            check(stats["agent"]["fenced_rejections"] >= 1,
+                  f"fence rejection counter is incorrect: {stats!r}")
+            check(server.terminate_group(signal.SIGTERM) == 0,
+                  f"agent lease shutdown failed:\n{server.log}")
+        finally:
+            server.cleanup()
+
+
+def test_agent_crash_recovery():
+    with tempfile.TemporaryDirectory(
+            prefix="minidb-process-agent-crash-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "agent-crash.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            created = agent_value_request(
+                port, "SESSION_CREATE",
+                ["crash-session", "300000", "working", "crash-create"])
+            check(created["status"] == AGENT_CREATED,
+                  f"crash session was not created: {created!r}")
+            lease = agent_value_request(
+                port, "LEASE_ACQUIRE",
+                ["crash-session", "2000", "crash-lease-one"])
+            check(lease["status"] == AGENT_OK and lease["fence"] == 1,
+                  f"crash lease acquisition is inconsistent: {lease!r}")
+            tool = agent_value_request(
+                port, "TOOL_CREATE",
+                ["crash-session", "crash-tool", "shell", "echo crash",
+                 "crash-tool-create"])
+            check(tool["status"] == AGENT_CREATED and tool["revision"] == 1,
+                  f"crash tool creation is inconsistent: {tool!r}")
+            claim = agent_value_request(
+                port, "TOOL_CLAIM",
+                ["crash-session", "crash-tool", "1", "1", "2000",
+                 "crash-claim-one"])
+            check(claim["status"] == AGENT_OK and claim["revision"] == 2,
+                  f"crash tool claim is inconsistent: {claim!r}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            recovered = agent_value_request(
+                port, "TOOL_GET", ["crash-session", "crash-tool"])
+            check(recovered["status"] == AGENT_OK and
+                  recovered["revision"] == 2 and recovered["fence"] == 1,
+                  f"recovered tool metadata is inconsistent: {recovered!r}")
+            recovered_record = decode_agent_record(recovered["payload"])
+            check(recovered_record["status"] == AGENT_TOOL_RUNNING,
+                  f"recovered tool did not remain RUNNING: "
+                  f"{recovered_record!r}")
+
+            time.sleep(2.2)
+            takeover = agent_value_request(
+                port, "LEASE_ACQUIRE",
+                ["crash-session", "10000", "crash-lease-two"])
+            check(takeover["status"] == AGENT_OK and takeover["fence"] == 2,
+                  f"crash lease takeover is inconsistent: {takeover!r}")
+
+            stale = agent_value_request(
+                port, "TOOL_COMPLETE",
+                ["crash-session", "crash-tool", "2", "1", "SUCCEEDED",
+                 "stale", "crash-stale-complete"])
+            check(stale["status"] == AGENT_FENCED and stale["fence"] == 2,
+                  f"recovered stale fence was not rejected: {stale!r}")
+
+            requeue = agent_value_request(
+                port, "TOOL_REQUEUE",
+                ["crash-session", "crash-tool", "2", "2",
+                 "crash-requeue"])
+            check(requeue["status"] == AGENT_OK and requeue["revision"] == 3,
+                  f"tool requeue after recovery failed: {requeue!r}")
+
+            reclaim = agent_value_request(
+                port, "TOOL_CLAIM",
+                ["crash-session", "crash-tool", "3", "2", "10000",
+                 "crash-claim-two"])
+            check(reclaim["status"] == AGENT_OK and reclaim["revision"] == 4 and
+                  reclaim["fence"] == 2,
+                  f"tool reclaim after recovery failed: {reclaim!r}")
+
+            final_tool = agent_value_request(
+                port, "TOOL_GET", ["crash-session", "crash-tool"])
+            final_record = decode_agent_record(final_tool["payload"])
+            check(final_tool["status"] == AGENT_OK and
+                  final_tool["revision"] == 4 and final_tool["fence"] == 2 and
+                  final_record["status"] == AGENT_TOOL_RUNNING,
+                  f"reclaimed tool state is inconsistent: {final_tool!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"agent crash recovery shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_agent_namespace_collision():
+    with tempfile.TemporaryDirectory(
+            prefix="minidb-process-agent-namespace-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "agent-namespace.rdb")
+        port = free_loopback_port()
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            reserved_key = AGENT_RESERVED_PREFIX + b"session/id"
+            with connect_kv(port) as sock:
+                operations = (
+                    (HTTP_SET, [reserved_key, b"value"], "SET"),
+                    (HTTP_GET, [reserved_key], "GET"),
+                    (KV_DEL, [reserved_key], "DEL"),
+                )
+                for command_type, args, name in operations:
+                    response_type, response_args = kv_command(
+                        sock, command_type, args)
+                    check(response_type == KV_ERROR and response_args,
+                          f"ordinary {name} entered the agent namespace: "
+                          f"type={response_type}, args={response_args!r}")
+                ping_type, ping_args = kv_command(sock, HTTP_PING)
+                check(ping_type == KV_OK and ping_args == [b"PONG"],
+                      f"agent namespace rejection closed the connection: "
+                      f"type={ping_type}, args={ping_args!r}")
+            check(server.terminate_group(signal.SIGTERM) == 0,
+                  f"agent namespace shutdown failed:\n{server.log}")
+        finally:
+            server.cleanup()
+
+
+def test_agent_stats_contract():
+    with tempfile.TemporaryDirectory(
+            prefix="minidb-process-agent-stats-") as temp_dir:
+        http_rdb = os.path.join(temp_dir, "agent-stats-http.rdb")
+        http_port = free_loopback_port()
+        http_server = start_http(http_port, http_rdb, temp_dir, "sync")
+        try:
+            stats = read_http_stats(http_port)
+            check_agent_contract(stats, "HTTP agent")
+            check(http_server.terminate_group(signal.SIGTERM) == 0,
+                  f"HTTP agent stats shutdown failed:\n{http_server.log}")
+        finally:
+            http_server.cleanup()
+
+        kv_rdb = os.path.join(temp_dir, "agent-stats-kv.rdb")
+        kv_port = free_loopback_port()
+        kv_server = start_kv(kv_port, kv_rdb, temp_dir, "sync")
+        try:
+            created = agent_value_request(
+                kv_port, "SESSION_CREATE",
+                ["stats-session", "300000", "working", "stats-create"])
+            check(created["status"] == AGENT_CREATED,
+                  f"stats session was not created: {created!r}")
+            lease = agent_value_request(
+                kv_port, "LEASE_ACQUIRE",
+                ["stats-session", "10000", "stats-lease"])
+            check(lease["status"] == AGENT_OK and lease["fence"] == 1,
+                  f"stats lease acquisition failed: {lease!r}")
+            tool = agent_value_request(
+                kv_port, "TOOL_CREATE",
+                ["stats-session", "stats-tool", "shell", "echo stats",
+                 "stats-tool-create"])
+            check(tool["status"] == AGENT_CREATED,
+                  f"stats tool creation failed: {tool!r}")
+            claim = agent_value_request(
+                kv_port, "TOOL_CLAIM",
+                ["stats-session", "stats-tool", "1", "1", "10000",
+                 "stats-claim"])
+            check(claim["status"] == AGENT_OK,
+                  f"stats tool claim failed: {claim!r}")
+
+            stats = read_kv_stats(kv_port)
+            check_agent_contract(stats, "KV agent")
+            agent = stats["agent"]
+            check(agent["sessions_stored"] == 1 and
+                  agent["sessions_live"] == 1,
+                  f"agent session counters are inconsistent: {stats!r}")
+            check(agent["tools_stored"] == 1 and
+                  agent["tools_running"] == 1,
+                  f"agent tool counters are inconsistent: {stats!r}")
+            check(agent["logical_bytes"] > 0,
+                  f"agent logical byte counter did not advance: {stats!r}")
+            check(agent["lease_acquires"] >= 1,
+                  f"agent lease counter did not advance: {stats!r}")
+            check(kv_server.terminate_group(signal.SIGTERM) == 0,
+                  f"KV agent stats shutdown failed:\n{kv_server.log}")
+        finally:
+            kv_server.cleanup()
+
+
 def test_stats_contract():
     with tempfile.TemporaryDirectory(prefix="minidb-process-stats-") as temp_dir:
         http_rdb = os.path.join(temp_dir, "stats-http.rdb")
@@ -2005,6 +2397,11 @@ CASES = {
     "TtlCrashRecovery": test_ttl_crash_recovery,
     "StatsContract": test_stats_contract,
     "TransactionContract": test_transaction_contract,
+    "AgentIdempotencyCrashRecovery": test_agent_idempotency_crash_recovery,
+    "AgentLeaseTakeover": test_agent_lease_takeover,
+    "AgentCrashRecovery": test_agent_crash_recovery,
+    "AgentNamespaceCollision": test_agent_namespace_collision,
+    "AgentStatsContract": test_agent_stats_contract,
     "KvAsyncProtocol": test_kv_async_protocol,
     "KvDisconnectSafety": test_kv_disconnect_safety,
     "HttpAsyncProtocol": test_http_async_protocol,

@@ -202,6 +202,11 @@ set(MINIDB_PROCESS_CASES
     TtlCrashRecovery
     StatsContract
     TransactionContract
+    AgentIdempotencyCrashRecovery
+    AgentLeaseTakeover
+    AgentCrashRecovery
+    AgentNamespaceCollision
+    AgentStatsContract
     KvAsyncProtocol
     KvDisconnectSafety
     HttpAsyncProtocol

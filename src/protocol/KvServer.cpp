@@ -62,8 +62,8 @@ void KvServer::start() {
                 kIntervalFlushMs, [this]() { flush_interval(); });
         }
         if (persistence_manager_ && persistence_manager_->opened()) {
-            agent_gc_timer_id_ = loop_->run_every(
-                kAgentGcIntervalMs, [this]() { run_agent_gc(); });
+            agent_gc_timer_id_ = loop_->run_every(kAgentGcIntervalMs,
+                                                  [this]() { run_agent_gc(); });
         }
     } catch (...) {
         if (interval_timer_id_ != 0) {
@@ -307,8 +307,9 @@ void KvServer::run_agent_gc() {
     if (persistence_manager_->agent_gc_async(&error)) {
         return;
     }
-    const bool retryable = error.find("control operation") != std::string::npos ||
-                           error.find("in progress") != std::string::npos;
+    const bool retryable =
+        error.find("control operation") != std::string::npos ||
+        error.find("in progress") != std::string::npos;
     if (!retryable) {
         Log::Error("Agent GC failed; stopping fail-closed: " +
                    (error.empty() ? std::string("unknown error") : error));

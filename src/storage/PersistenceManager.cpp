@@ -1770,9 +1770,8 @@ bool PersistenceManager::agent_gc_async(std::string* error) {
                 break;
             }
         }
-        if (pending ||
-            selected_keys.size() + candidate.keys.size() >
-                AgentRecordCodec::Limits::kMaxGcTxnOps) {
+        if (pending || selected_keys.size() + candidate.keys.size() >
+                           AgentRecordCodec::Limits::kMaxGcTxnOps) {
             continue;
         }
         if (selected_candidates >= AgentRecordCodec::Limits::kMaxGcCandidates) {

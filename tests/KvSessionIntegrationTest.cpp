@@ -343,39 +343,38 @@ class KvPersistenceIntegrationTest : public ::testing::Test {
         rdb_path_ = temp_dir_ + "/db.rdb";
         std::promise<uint16_t> ready;
         auto port = ready.get_future();
-        server_thread_ =
-            std::thread([this, ready = std::move(ready),
-                         clock = std::move(clock)]() mutable {
-                bool published = false;
-                try {
-                    EventLoop loop;
-                    loop_pointer_.store(&loop);
-                    KvServer server(&loop, InetAddress(0, true), rdb_path_,
-                                    DurabilityMode::kSync);
-                    if (clock) {
-                        server.set_kv_store(std::make_shared<KvStore>(clock));
-                    }
-                    if (!server.load_rdb()) {
-                        throw std::runtime_error("failed to open persistence");
-                    }
-                    server.start();
-                    server_pointer_.store(&server);
-                    persistence_manager_.store(server.persistence_manager());
-                    ready.set_value(server.listen_address().port());
-                    published = true;
-                    loop.loop();
-                    persistence_manager_.store(nullptr);
-                    server_pointer_.store(nullptr);
-                    loop_pointer_.store(nullptr);
-                } catch (...) {
-                    persistence_manager_.store(nullptr);
-                    server_pointer_.store(nullptr);
-                    loop_pointer_.store(nullptr);
-                    if (!published) {
-                        ready.set_exception(std::current_exception());
-                    }
+        server_thread_ = std::thread([this, ready = std::move(ready),
+                                      clock = std::move(clock)]() mutable {
+            bool published = false;
+            try {
+                EventLoop loop;
+                loop_pointer_.store(&loop);
+                KvServer server(&loop, InetAddress(0, true), rdb_path_,
+                                DurabilityMode::kSync);
+                if (clock) {
+                    server.set_kv_store(std::make_shared<KvStore>(clock));
                 }
-            });
+                if (!server.load_rdb()) {
+                    throw std::runtime_error("failed to open persistence");
+                }
+                server.start();
+                server_pointer_.store(&server);
+                persistence_manager_.store(server.persistence_manager());
+                ready.set_value(server.listen_address().port());
+                published = true;
+                loop.loop();
+                persistence_manager_.store(nullptr);
+                server_pointer_.store(nullptr);
+                loop_pointer_.store(nullptr);
+            } catch (...) {
+                persistence_manager_.store(nullptr);
+                server_pointer_.store(nullptr);
+                loop_pointer_.store(nullptr);
+                if (!published) {
+                    ready.set_exception(std::current_exception());
+                }
+            }
+        });
 
         ASSERT_EQ(port.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
@@ -776,8 +775,8 @@ TEST_F(KvPersistenceIntegrationTest,
 }
 
 TEST_F(KvPersistenceIntegrationTest, AgentGcTimerDeletesTerminalGroups) {
-    auto clock = std::make_shared<minidb_test::FrozenClock>(
-        1000, 1700000000000);
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
     StartServer(clock);
     KvClient client;
     client.ConnectTo(port_);

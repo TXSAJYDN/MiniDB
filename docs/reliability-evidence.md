@@ -15,8 +15,8 @@ The evidence covers:
 - durability-mode performance, checkpoint pause, recovery time, and RSS;
 - R4-A diagnostic timing fields, fixed WAL data-fsync buckets, and the
   top-level group-commit metrics contract;
-- an external batch-formation opportunity experiment and the implemented,
-  bounded group-commit writer;
+- an external batch-formation opportunity experiment, the implemented bounded
+  group-commit writer, and its clean-HEAD G4 benefit run;
 - explicit limits and non-claims.
 
 ## Source and environment
@@ -97,8 +97,10 @@ The unit and integration inventory also includes:
 - C01-C14 deterministic crash points.
 
 This is local reproducibility evidence. It is not a substitute for a public CI
-run. The R0-R3 baseline commit `cfbda60` passed 9/9 GitHub Actions jobs; R4-A
-final-HEAD status must be read from the GitHub checks for that commit.
+run. The R0-R3 baseline commit `cfbda60` and the R4-A implementation commit
+`a06d7c2` both passed 9/9 GitHub Actions jobs. The final G4 evidence commit must
+pass its own full CI run; status must be read from the GitHub checks for that
+commit, not inherited from an earlier one.
 
 ## Fuzz evidence
 
@@ -136,9 +138,9 @@ The v2 benchmark records successful-operation timings from
 
 `total` fields support measured-window means. `max` fields are process-lifetime
 maxima that include preload/warm-up. The fixed buckets do not provide arbitrary
-quantiles or per-request traces. ADR-005 defines G1-G7; no group-commit work
-starts unless the baseline and a separate batch-formation experiment satisfy
-the gates.
+quantiles or per-request traces. ADR-005 defines G1-G7: the baseline and
+separate batch-formation experiment had to satisfy G1-G3 before implementation,
+and G4 later validated the implemented path on a clean HEAD.
 
 ### v2 baseline artifact
 
@@ -200,14 +202,19 @@ latency sample retained by the compact artifact.
   requests was **0.987605**, above the frozen thresholds. This is evidence of
   an external batch-formation opportunity, not of a server queue or group
   commit.
-- **G4: PENDING CLEAN HEAD.** The writer, queue, batch, completion, barrier,
-  and asynchronous protocol paths are implemented in
-  [ADR-006](decisions/006-group-commit-implementation.md). Formal benefit
-  evidence must be collected in 5 rounds on a committed clean HEAD after CI.
-- **G5/G6: LOCAL PASS.** The six-configuration 338-test matrix, 24 process
-  cases, group-commit fault tests, and bounded-resource assertions pass locally.
-- **G7: IN PROGRESS.** ADR-006 records the implementation contract and failure
-  matrix; final status and G4 artifact are added after the clean-HEAD run.
+- **G4 PASS.** The formal 5-round run was collected on clean implementation
+  HEAD `a06d7c2` after GitHub Actions run `43006353520` passed 9/9. Median QPS is
+  **2,858.989**, or **6.84x** the frozen `418.018` gate baseline and 4.63x the
+  clean v2 instrumentation baseline `617.673`. Pooled P50/P99 are
+  **10,476.388/21,839.172 us**, with 29,100/29,100 successful requests, zero
+  errors, 6.696833 records per batch on average, and zero queue rejections or
+  writer failures. Full resource and per-round data are below.
+- **G5/G6 PASS.** The six-configuration 338-test matrix, 24 process cases,
+  group-commit fault tests, and bounded-resource assertions pass locally; the
+  implementation commit also passed all CI jobs.
+- **G7 COMPLETE.** ADR-005 records the gates, ADR-006 records the implementation
+  contract and failure matrix, and the G4 artifact plus final status are
+  committed with this evidence.
 
 See [ADR-005](decisions/005-group-commit.md) for candidate boundaries and
 [ADR-006](decisions/006-group-commit-implementation.md) for the implementation.
@@ -273,6 +280,80 @@ present and the clients are closed-loop, this value is not a G4 performance
 result. The experiment does not prove that the production admission queue contains
 those exact requests, that writer/completion overhead is negligible, or that
 the G4 throughput gate passes.
+
+## R4-A G4 group-commit benefit run
+
+### Configuration and provenance
+
+- Artifact: `bench/results/r4a-group-commit-20261111.json`
+- Size: **28,319 bytes**
+- SHA-256:
+  `0ecf064ed9d7b70971188199abbc1194d974659e5ffa3ac24908b7ca9e8f8f7e`
+- Clean source HEAD:
+  `a06d7c2f3e0be7fc7da1217c3c6f4c6f04fc3128`
+- `working_tree_dirty_at_collection=false`
+- Implementation CI:
+  [run 43006353520](https://github.com/TXSAJYDN/MiniDB/actions/runs/43006353520),
+  9/9 jobs passed before collection
+- Rounds: 5, each with 2 measured seconds after warm-up
+- Dataset: 128 keys, 64-byte values; seed `20261111`
+- Workload: `SYNC` write (KV `SET`), 32 closed-loop persistent clients, one
+  in-flight command per client
+- Recovery: `SIGKILL` after each measured round, then fresh-process startup to
+  `PING`; checkpoint: KV `SAVE` after recovery
+- Frozen gate: median QPS `>= 836`, exactly 2x the R3 `SYNC` write baseline
+  `418.018`; no threshold or durability semantic was changed
+
+### Comparison with the clean instrumentation baseline
+
+The v2 baseline was collected before the writer existed. It is the fairest
+same-machine implementation comparison; the `418.018` R3 number remains the
+frozen gate baseline.
+
+| Metric | v2 baseline | G4 | Change |
+|---|---:|---:|---:|
+| Median QPS | 617.673 | **2,858.989** | 4.63x |
+| Pooled P50 / P99 us | 46,229.579 / 90,371.772 | **10,476.388 / 21,839.172** | lower |
+| Client / server CPU median, one core | 6.119% / 6.256% | 176.739% / 24.383% | higher |
+| Client / server RSS peak KiB | 20,908 / 4,612 | 19,716 / 4,836 | server +224 KiB |
+| WAL write amplification | 1.527778 | 1.527778 | unchanged |
+| Recovery median s | 0.022041 | 0.044825 | about 2x |
+| Data fsyncs per `SYNC` mutation | 1.0 | 0.149324 | about 6.7x fewer |
+| Records per batch mean | — | 6.696833 | — |
+| Queue rejections / writer failures | — | 0 / 0 | — |
+
+The frozen gate is satisfied: 2,858.989 is **3.42x** the `836` threshold and
+**6.84x** the `418.018` gate baseline. Relative to the clean v2 baseline, the
+gain is **4.63x**. The throughput and latency improvement is accompanied by
+higher client/server CPU use, a 224 KiB increase in peak server RSS, and roughly
+twice the measured recovery time. Those costs are part of the result, not
+footnotes to omit.
+
+### Per-round observations
+
+| Round | QPS | P50 us | P99 us | Batches | Batch records | Max batch records | Queue rejects | Writer failures |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2,731.783 | 10,858.455 | 22,696.026 | 851 | 5,615 | 26 | 0 | 0 |
+| 2 | 2,786.958 | 10,680.789 | 22,151.359 | 853 | 5,715 | 20 | 0 | 0 |
+| 3 | 2,858.989 | 10,482.744 | 21,613.536 | 863 | 5,857 | 28 | 0 | 0 |
+| 4 | 2,887.715 | 10,291.577 | 21,297.945 | 884 | 5,920 | 24 | 0 | 0 |
+| 5 | 2,925.525 | 10,147.647 | 21,367.014 | 923 | 5,993 | 23 | 0 | 0 |
+
+All 29,100 measured requests succeeded; `attempts=29,100` and `errors=0`.
+Median batches and batch records are 863 and 5,857 respectively, so records
+outnumber physical batches in every round and the data fsync count equals the
+batch count. Actual batches stayed far below the 256-record/16-MiB limits, so
+this run exercised normal group formation rather than the maximum-size path.
+Median checkpoint pause and save time were 14,587 us and 16,180.828 us.
+
+Interpretation limits:
+
+- the result is from WSL2 loopback, one host, one closed-loop 32-client
+  configuration, and the fixed dataset above;
+- it is not open-loop saturation capacity or evidence for more than 32 clients;
+- every `SYNC` acknowledgement still waited for the data fsync covering its
+  LSN; no loss window was added;
+- the measured CPU/RSS/recovery costs must accompany the throughput claim.
 
 ## R3 reliability benchmark
 
@@ -362,7 +443,10 @@ Total successful requests: 340,240. Total errors: 0. Wall-clock collection time:
 - multi-node, replicated, transactional, or multi-writer operation;
 - any Redis or SQL compatibility;
 - a production SLA;
-- a completed G4 benefit claim until the clean-HEAD artifact and final CI exist;
+- that the G4 result generalizes to other hardware, power modes, datasets, or
+  more than 32 clients;
+- that the measured CPU and recovery-time costs are acceptable outside the tested
+  configuration;
 - that external pending overlap alone proves group-commit correctness or speed;
 - that every later commit inherited an earlier CI result without its own checks.
 
@@ -382,6 +466,20 @@ For the reliability benchmark, rebuild Release and run
 `bench/run_reliability_benchmark.py` with the same seed, round count, client
 set, workloads, and a fresh work directory. Compare only runs from the same
 machine, power mode, kernel, compiler, build configuration, and background load.
+
+The frozen G4 command was:
+
+~~~bash
+python3 bench/run_reliability_benchmark.py \
+  --kv build/ci-release/app/minidb_kv_server \
+  --rounds 5 --duration-seconds 2 \
+  --dataset-keys 128 --value-size 64 \
+  --seed 20261111 \
+  --modes sync --clients 32 --workloads write \
+  --out bench/results/r4a-group-commit-20261111.json
+~~~
+
+Use a new output path for reproduction; do not overwrite the retained artifact.
 
 For the frozen G3 batch-formation experiment, first run its self-test, then use
 a new output path so the retained artifact is never overwritten:

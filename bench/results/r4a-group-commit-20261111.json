@@ -1,0 +1,897 @@
+{
+  "schema": "minidb-reliability-benchmark-v2",
+  "generated_at": "2026-11-11T10:50:46.586346+00:00",
+  "environment": {
+    "platform": "Linux-6.18.58.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "kernel": "6.18.58.1-microsoft-standard-WSL2",
+    "wsl2": true,
+    "machine": "x86_64",
+    "cpu_model": "Intel(R) Core(TM) i9-14900HX",
+    "cpu_count": 32,
+    "python": "3.12.3",
+    "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "cmake": "cmake version 3.28.3",
+    "filesystem": "ext2/ext3",
+    "git_head": "a06d7c2f3e0be7fc7da1217c3c6f4c6f04fc3128",
+    "working_tree_dirty_at_collection": false,
+    "load_average_at_start": [
+      0.781,
+      0.564,
+      0.788
+    ]
+  },
+  "configuration": {
+    "rounds": 5,
+    "duration_seconds_per_round": 2.0,
+    "dataset_keys": 128,
+    "value_size_bytes": 64,
+    "seed": 20261111,
+    "modes": [
+      "sync"
+    ],
+    "clients": [
+      32
+    ],
+    "workloads": [
+      "write"
+    ],
+    "connection_model": "closed-loop persistent KV connections, one in-flight command per client",
+    "workload_definitions": {
+      "write": "SET with a 64-byte value",
+      "mixed": "80% GET, 20% SET",
+      "ttl": "50% EXPIRE with 5-60 second TTL, 50% TTL"
+    },
+    "recovery_method": "SIGKILL after the measured round, then fresh-process startup to PING",
+    "checkpoint_method": "KV SAVE after recovery, measured client-side and via STATS checkpoint_pause_us",
+    "timing_method": "STATS deltas measured with std::chrono::steady_clock; successes only"
+  },
+  "r4a_evidence": {
+    "status": "R4-A group commit implemented; v2 diagnostic timing retained",
+    "adrs": [
+      "docs/decisions/005-group-commit.md",
+      "docs/decisions/006-group-commit-implementation.md"
+    ],
+    "timing_semantics": {
+      "wal_append": "write_all only; excludes encoding, rotation, and fsync",
+      "wal_data_fsync": "all successful WAL data fsyncs, including empty-segment creation",
+      "sync_mutation": "successful SYNC persistence path through in-memory apply; excludes network parsing/serialization",
+      "max_fields": "process-lifetime maxima at the end of a round; include preload/warm-up",
+      "mean_fields": "computed from measured-window counter and total-time deltas",
+      "fsync_buckets": "fixed 50 us through 100 ms upper bounds plus a greater-than-100 ms overflow bucket"
+    }
+  },
+  "limits": {
+    "concurrent_connections_per_server": 32,
+    "wal_segment_bytes": 16777216,
+    "wal_total_bytes": 268435456,
+    "wal_segments": 128,
+    "recovery_records": 1000000,
+    "recovery_bytes": 536870912
+  },
+  "limitations": [
+    "WSL2 loopback, single node, same-host client and server; no bare-metal or production SLA claim.",
+    "Closed-loop clients with one outstanding command each; this is not open-loop saturation capacity.",
+    "The Python standard-library client competes for CPU and contributes to measured latency.",
+    "The 32-client configuration reaches the server's hard connection cap; it is not evidence for more than 32 clients.",
+    "SYNC batches may amortize one WAL data fsync across multiple mutations; every ack still waits for the data fsync covering its LSN.",
+    "INTERVAL acknowledges after append and relies on a 100 ms timer or checkpoint/shutdown flush.",
+    "Recovery is measured at one quiescent crash point after each round, not across every possible crash point.",
+    "The compact artifact intentionally omits raw latency samples; per-round percentiles and variation are retained.",
+    "Timing counters are successful-operation cumulative values from steady_clock; they are diagnostic, not a production latency SLO.",
+    "Observed max timing fields are process-lifetime maxima including preload/warm-up; mean timing fields use measured-window deltas.",
+    "Fixed fsync buckets bound memory and cardinality but do not provide per-request traces or arbitrary quantiles.",
+    "This v2 artifact records the current implementation and its diagnostic counters; performance benefit is established only by a matching-environment G4 run, not by instrumentation alone."
+  ],
+  "configurations": [
+    {
+      "durability_mode": "sync",
+      "clients": 32,
+      "workload": "write",
+      "round_count": 5,
+      "attempts": 29100,
+      "successes": 29100,
+      "errors": 0,
+      "error_rate": 0.0,
+      "throughput_ops_per_second_median": 2858.989,
+      "throughput_ops_per_second_min": 2731.783,
+      "throughput_ops_per_second_max": 2925.525,
+      "pooled_latency": {
+        "min_us": 2812.733,
+        "mean_us": 11007.948,
+        "p50_us": 10476.388,
+        "p95_us": 17816.675,
+        "p99_us": 21839.172,
+        "p999_us": 26785.633,
+        "max_us": 40048.787
+      },
+      "client_cpu_percent_one_core_median": 176.739,
+      "server_cpu_percent_one_core_median": 24.383,
+      "client_rss_peak_kib_max": 19716,
+      "server_rss_peak_kib_max": 4836,
+      "wal_bytes_median": 644270,
+      "wal_data_fsyncs_median": 863,
+      "wal_append_us_mean_median": 5.264,
+      "wal_append_us_max_observed": 383,
+      "wal_data_fsync_us_mean_median": 2231.813,
+      "wal_data_fsync_us_max_observed": 12131,
+      "sync_mutation_us_mean_median": 3576.561,
+      "sync_mutation_us_max_observed": 12332,
+      "data_fsyncs_per_sync_mutation_median": 0.149324,
+      "data_fsync_share_of_sync_mutation_median": 0.093708,
+      "fsync_latency_buckets_pooled": [
+        {
+          "upper_bound_us": 50,
+          "count": 0
+        },
+        {
+          "upper_bound_us": 100,
+          "count": 0
+        },
+        {
+          "upper_bound_us": 250,
+          "count": 0
+        },
+        {
+          "upper_bound_us": 500,
+          "count": 0
+        },
+        {
+          "upper_bound_us": 1000,
+          "count": 0
+        },
+        {
+          "upper_bound_us": 2500,
+          "count": 3780
+        },
+        {
+          "upper_bound_us": 5000,
+          "count": 585
+        },
+        {
+          "upper_bound_us": 10000,
+          "count": 9
+        },
+        {
+          "upper_bound_us": 25000,
+          "count": 0
+        },
+        {
+          "upper_bound_us": 50000,
+          "count": 0
+        },
+        {
+          "upper_bound_us": 100000,
+          "count": 0
+        },
+        {
+          "upper_bound_us": null,
+          "count": 0
+        }
+      ],
+      "group_commit_batches_median": 863,
+      "group_commit_batch_records_median": 5857,
+      "group_commit_records_per_batch_mean_median": 6.696833,
+      "group_commit_data_fsyncs_per_batch_mean_median": 1.0,
+      "group_commit_max_batch_records_max": 28,
+      "group_commit_queue_rejections_total": 0,
+      "group_commit_writer_failures_total": 0,
+      "write_amplification_median": 1.527778,
+      "checkpoint_save_us_median": 16180.828,
+      "checkpoint_pause_us_median": 14587,
+      "recovery_seconds_median": 0.044825,
+      "rounds": [
+        {
+          "round": 1,
+          "throughput_ops_per_second": 2731.783,
+          "latency": {
+            "min_us": 3699.429,
+            "mean_us": 11414.156,
+            "p50_us": 10858.455,
+            "p95_us": 18660.075,
+            "p99_us": 22696.026,
+            "p999_us": 27262.097,
+            "max_us": 38180.123
+          },
+          "error_rate": 0.0,
+          "client_cpu_percent_one_core": 177.719,
+          "server_cpu_percent_one_core": 24.812,
+          "server_rss_peak_kib": 4788,
+          "wal_bytes": 617650,
+          "wal_data_fsyncs": 851,
+          "timing": {
+            "wal_append_us_mean": 6.135,
+            "wal_append_us_max_observed": 308,
+            "wal_data_fsync_us_mean": 2262.467,
+            "wal_data_fsync_us_max_observed": 12131,
+            "sync_mutation_us_mean": 3622.519,
+            "sync_mutation_us_max_observed": 12332,
+            "data_fsyncs_per_sync_mutation": 0.151558,
+            "data_fsync_share_of_sync_mutation": 0.094657,
+            "fsync_latency_buckets": [
+              {
+                "upper_bound_us": 50,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 250,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 500,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 1000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 2500,
+                "count": 709
+              },
+              {
+                "upper_bound_us": 5000,
+                "count": 141
+              },
+              {
+                "upper_bound_us": 10000,
+                "count": 1
+              },
+              {
+                "upper_bound_us": 25000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 50000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": null,
+                "count": 0
+              }
+            ]
+          },
+          "group_commit": {
+            "queue_rejections": 0,
+            "batches": 851,
+            "batch_records": 5615,
+            "batch_bytes": 617650,
+            "data_fsyncs": 851,
+            "writer_loop_total_us": 1977443,
+            "submit_to_fsync_total_us": 19939125,
+            "fsync_to_apply_total_us": 400654,
+            "writer_failures": 0,
+            "append_failures": 0,
+            "fsync_failures": 0,
+            "records_per_batch_mean": 6.59812,
+            "bytes_per_batch_mean": 725.793184,
+            "data_fsyncs_per_batch_mean": 1.0,
+            "max_batch_records_observed": 26,
+            "max_batch_bytes_observed": 2860,
+            "queue_max_entries_observed": 26,
+            "queue_max_bytes_observed": 6188,
+            "completion_backlog_max_observed": 26,
+            "completion_backlog_max_bytes_observed": 6252,
+            "batch_size_bucket_bounds": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32,
+              64,
+              128
+            ],
+            "batch_size_bucket_counts": [
+              4,
+              12,
+              139,
+              552,
+              142,
+              2,
+              0,
+              0,
+              0
+            ],
+            "writer_state": "running"
+          },
+          "write_amplification": 1.527778,
+          "checkpoint_save_us": 17896.928,
+          "checkpoint_pause_us": 15946,
+          "recovery_seconds": 0.044881,
+          "recovery": {
+            "rdb_records": 0,
+            "checkpoint_lsn": 0,
+            "last_lsn": 6063,
+            "next_lsn": 6064,
+            "wal_records_scanned": 6063,
+            "wal_records_replayed": 6063,
+            "wal_bytes": 666930,
+            "truncated_bytes": 0,
+            "wal_segments": 1,
+            "ignored_residue_segments": 0,
+            "legacy_import": false,
+            "needs_bootstrap": false,
+            "manifest_present": true
+          }
+        },
+        {
+          "round": 2,
+          "throughput_ops_per_second": 2786.958,
+          "latency": {
+            "min_us": 2812.733,
+            "mean_us": 11211.418,
+            "p50_us": 10680.789,
+            "p95_us": 18035.522,
+            "p99_us": 22151.359,
+            "p999_us": 26539.575,
+            "max_us": 30305.601
+          },
+          "error_rate": 0.0,
+          "client_cpu_percent_one_core": 177.487,
+          "server_cpu_percent_one_core": 24.383,
+          "server_rss_peak_kib": 4836,
+          "wal_bytes": 628650,
+          "wal_data_fsyncs": 853,
+          "timing": {
+            "wal_append_us_mean": 5.264,
+            "wal_append_us_max_observed": 371,
+            "wal_data_fsync_us_mean": 2264.784,
+            "wal_data_fsync_us_max_observed": 7120,
+            "sync_mutation_us_mean": 3614.28,
+            "sync_mutation_us_max_observed": 9666,
+            "data_fsyncs_per_sync_mutation": 0.149256,
+            "data_fsync_share_of_sync_mutation": 0.093527,
+            "fsync_latency_buckets": [
+              {
+                "upper_bound_us": 50,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 250,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 500,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 1000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 2500,
+                "count": 714
+              },
+              {
+                "upper_bound_us": 5000,
+                "count": 138
+              },
+              {
+                "upper_bound_us": 10000,
+                "count": 1
+              },
+              {
+                "upper_bound_us": 25000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 50000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": null,
+                "count": 0
+              }
+            ]
+          },
+          "group_commit": {
+            "queue_rejections": 0,
+            "batches": 853,
+            "batch_records": 5715,
+            "batch_bytes": 628650,
+            "data_fsyncs": 853,
+            "writer_loop_total_us": 1980167,
+            "submit_to_fsync_total_us": 20249540,
+            "fsync_to_apply_total_us": 405459,
+            "writer_failures": 0,
+            "append_failures": 0,
+            "fsync_failures": 0,
+            "records_per_batch_mean": 6.699883,
+            "bytes_per_batch_mean": 736.987104,
+            "data_fsyncs_per_batch_mean": 1.0,
+            "max_batch_records_observed": 20,
+            "max_batch_bytes_observed": 2200,
+            "queue_max_entries_observed": 20,
+            "queue_max_bytes_observed": 4760,
+            "completion_backlog_max_observed": 20,
+            "completion_backlog_max_bytes_observed": 4824,
+            "batch_size_bucket_bounds": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32,
+              64,
+              128
+            ],
+            "batch_size_bucket_counts": [
+              6,
+              12,
+              109,
+              555,
+              167,
+              4,
+              0,
+              0,
+              0
+            ],
+            "writer_state": "running"
+          },
+          "write_amplification": 1.527778,
+          "checkpoint_save_us": 17243.538,
+          "checkpoint_pause_us": 15754,
+          "recovery_seconds": 0.045339,
+          "recovery": {
+            "rdb_records": 0,
+            "checkpoint_lsn": 0,
+            "last_lsn": 6163,
+            "next_lsn": 6164,
+            "wal_records_scanned": 6163,
+            "wal_records_replayed": 6163,
+            "wal_bytes": 677930,
+            "truncated_bytes": 0,
+            "wal_segments": 1,
+            "ignored_residue_segments": 0,
+            "legacy_import": false,
+            "needs_bootstrap": false,
+            "manifest_present": true
+          }
+        },
+        {
+          "round": 3,
+          "throughput_ops_per_second": 2858.989,
+          "latency": {
+            "min_us": 2942.882,
+            "mean_us": 10938.313,
+            "p50_us": 10482.744,
+            "p95_us": 17578.091,
+            "p99_us": 21613.536,
+            "p999_us": 26179.847,
+            "max_us": 29396.083
+          },
+          "error_rate": 0.0,
+          "client_cpu_percent_one_core": 176.739,
+          "server_cpu_percent_one_core": 24.407,
+          "server_rss_peak_kib": 4780,
+          "wal_bytes": 644270,
+          "wal_data_fsyncs": 863,
+          "timing": {
+            "wal_append_us_mean": 5.733,
+            "wal_append_us_max_observed": 323,
+            "wal_data_fsync_us_mean": 2231.813,
+            "wal_data_fsync_us_max_observed": 6621,
+            "sync_mutation_us_mean": 3576.561,
+            "sync_mutation_us_max_observed": 9090,
+            "data_fsyncs_per_sync_mutation": 0.147345,
+            "data_fsync_share_of_sync_mutation": 0.091945,
+            "fsync_latency_buckets": [
+              {
+                "upper_bound_us": 50,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 250,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 500,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 1000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 2500,
+                "count": 741
+              },
+              {
+                "upper_bound_us": 5000,
+                "count": 119
+              },
+              {
+                "upper_bound_us": 10000,
+                "count": 3
+              },
+              {
+                "upper_bound_us": 25000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 50000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": null,
+                "count": 0
+              }
+            ]
+          },
+          "group_commit": {
+            "queue_rejections": 0,
+            "batches": 863,
+            "batch_records": 5857,
+            "batch_bytes": 644270,
+            "data_fsyncs": 863,
+            "writer_loop_total_us": 1977422,
+            "submit_to_fsync_total_us": 20549341,
+            "fsync_to_apply_total_us": 397926,
+            "writer_failures": 0,
+            "append_failures": 0,
+            "fsync_failures": 0,
+            "records_per_batch_mean": 6.78679,
+            "bytes_per_batch_mean": 746.546929,
+            "data_fsyncs_per_batch_mean": 1.0,
+            "max_batch_records_observed": 28,
+            "max_batch_bytes_observed": 3080,
+            "queue_max_entries_observed": 28,
+            "queue_max_bytes_observed": 6664,
+            "completion_backlog_max_observed": 28,
+            "completion_backlog_max_bytes_observed": 6728,
+            "batch_size_bucket_bounds": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32,
+              64,
+              128
+            ],
+            "batch_size_bucket_counts": [
+              3,
+              10,
+              121,
+              555,
+              171,
+              3,
+              0,
+              0,
+              0
+            ],
+            "writer_state": "running"
+          },
+          "write_amplification": 1.527778,
+          "checkpoint_save_us": 14811.883,
+          "checkpoint_pause_us": 13143,
+          "recovery_seconds": 0.044825,
+          "recovery": {
+            "rdb_records": 0,
+            "checkpoint_lsn": 0,
+            "last_lsn": 6305,
+            "next_lsn": 6306,
+            "wal_records_scanned": 6305,
+            "wal_records_replayed": 6305,
+            "wal_bytes": 693550,
+            "truncated_bytes": 0,
+            "wal_segments": 1,
+            "ignored_residue_segments": 0,
+            "legacy_import": false,
+            "needs_bootstrap": false,
+            "manifest_present": true
+          }
+        },
+        {
+          "round": 4,
+          "throughput_ops_per_second": 2887.715,
+          "latency": {
+            "min_us": 3298.935,
+            "mean_us": 10820.294,
+            "p50_us": 10291.577,
+            "p95_us": 17205.152,
+            "p99_us": 21297.945,
+            "p999_us": 25645.758,
+            "max_us": 28676.791
+          },
+          "error_rate": 0.0,
+          "client_cpu_percent_one_core": 175.283,
+          "server_cpu_percent_one_core": 23.414,
+          "server_rss_peak_kib": 4812,
+          "wal_bytes": 651200,
+          "wal_data_fsyncs": 884,
+          "timing": {
+            "wal_append_us_mean": 4.933,
+            "wal_append_us_max_observed": 276,
+            "wal_data_fsync_us_mean": 2182.15,
+            "wal_data_fsync_us_max_observed": 6508,
+            "sync_mutation_us_mean": 3477.283,
+            "sync_mutation_us_max_observed": 8853,
+            "data_fsyncs_per_sync_mutation": 0.149324,
+            "data_fsync_share_of_sync_mutation": 0.093708,
+            "fsync_latency_buckets": [
+              {
+                "upper_bound_us": 50,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 250,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 500,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 1000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 2500,
+                "count": 793
+              },
+              {
+                "upper_bound_us": 5000,
+                "count": 90
+              },
+              {
+                "upper_bound_us": 10000,
+                "count": 1
+              },
+              {
+                "upper_bound_us": 25000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 50000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": null,
+                "count": 0
+              }
+            ]
+          },
+          "group_commit": {
+            "queue_rejections": 0,
+            "batches": 884,
+            "batch_records": 5920,
+            "batch_bytes": 651200,
+            "data_fsyncs": 884,
+            "writer_loop_total_us": 1977220,
+            "submit_to_fsync_total_us": 20188344,
+            "fsync_to_apply_total_us": 396569,
+            "writer_failures": 0,
+            "append_failures": 0,
+            "fsync_failures": 0,
+            "records_per_batch_mean": 6.696833,
+            "bytes_per_batch_mean": 736.651584,
+            "data_fsyncs_per_batch_mean": 1.0,
+            "max_batch_records_observed": 24,
+            "max_batch_bytes_observed": 2640,
+            "queue_max_entries_observed": 24,
+            "queue_max_bytes_observed": 5712,
+            "completion_backlog_max_observed": 24,
+            "completion_backlog_max_bytes_observed": 5776,
+            "batch_size_bucket_bounds": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32,
+              64,
+              128
+            ],
+            "batch_size_bucket_counts": [
+              3,
+              14,
+              96,
+              615,
+              155,
+              1,
+              0,
+              0,
+              0
+            ],
+            "writer_state": "running"
+          },
+          "write_amplification": 1.527778,
+          "checkpoint_save_us": 16180.828,
+          "checkpoint_pause_us": 14587,
+          "recovery_seconds": 0.044772,
+          "recovery": {
+            "rdb_records": 0,
+            "checkpoint_lsn": 0,
+            "last_lsn": 6368,
+            "next_lsn": 6369,
+            "wal_records_scanned": 6368,
+            "wal_records_replayed": 6368,
+            "wal_bytes": 700480,
+            "truncated_bytes": 0,
+            "wal_segments": 1,
+            "ignored_residue_segments": 0,
+            "legacy_import": false,
+            "needs_bootstrap": false,
+            "manifest_present": true
+          }
+        },
+        {
+          "round": 5,
+          "throughput_ops_per_second": 2925.525,
+          "latency": {
+            "min_us": 2986.106,
+            "mean_us": 10686.753,
+            "p50_us": 10147.647,
+            "p95_us": 17325.665,
+            "p99_us": 21367.014,
+            "p999_us": 27950.182,
+            "max_us": 40048.787
+          },
+          "error_rate": 0.0,
+          "client_cpu_percent_one_core": 173.12,
+          "server_cpu_percent_one_core": 23.92,
+          "server_rss_peak_kib": 4768,
+          "wal_bytes": 659230,
+          "wal_data_fsyncs": 923,
+          "timing": {
+            "wal_append_us_mean": 4.835,
+            "wal_append_us_max_observed": 383,
+            "wal_data_fsync_us_mean": 2089.156,
+            "wal_data_fsync_us_max_observed": 6146,
+            "sync_mutation_us_mean": 3340.33,
+            "sync_mutation_us_max_observed": 8715,
+            "data_fsyncs_per_sync_mutation": 0.154013,
+            "data_fsync_share_of_sync_mutation": 0.096325,
+            "fsync_latency_buckets": [
+              {
+                "upper_bound_us": 50,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 250,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 500,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 1000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 2500,
+                "count": 823
+              },
+              {
+                "upper_bound_us": 5000,
+                "count": 97
+              },
+              {
+                "upper_bound_us": 10000,
+                "count": 3
+              },
+              {
+                "upper_bound_us": 25000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 50000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": 100000,
+                "count": 0
+              },
+              {
+                "upper_bound_us": null,
+                "count": 0
+              }
+            ]
+          },
+          "group_commit": {
+            "queue_rejections": 0,
+            "batches": 923,
+            "batch_records": 5993,
+            "batch_bytes": 659230,
+            "data_fsyncs": 923,
+            "writer_loop_total_us": 1975478,
+            "submit_to_fsync_total_us": 19627001,
+            "fsync_to_apply_total_us": 391026,
+            "writer_failures": 0,
+            "append_failures": 0,
+            "fsync_failures": 0,
+            "records_per_batch_mean": 6.492958,
+            "bytes_per_batch_mean": 714.225352,
+            "data_fsyncs_per_batch_mean": 1.0,
+            "max_batch_records_observed": 23,
+            "max_batch_bytes_observed": 2530,
+            "queue_max_entries_observed": 23,
+            "queue_max_bytes_observed": 5474,
+            "completion_backlog_max_observed": 23,
+            "completion_backlog_max_bytes_observed": 5538,
+            "batch_size_bucket_bounds": [
+              1,
+              2,
+              4,
+              8,
+              16,
+              32,
+              64,
+              128
+            ],
+            "batch_size_bucket_counts": [
+              4,
+              14,
+              138,
+              626,
+              139,
+              2,
+              0,
+              0,
+              0
+            ],
+            "writer_state": "running"
+          },
+          "write_amplification": 1.527778,
+          "checkpoint_save_us": 13709.058,
+          "checkpoint_pause_us": 12240,
+          "recovery_seconds": 0.044555,
+          "recovery": {
+            "rdb_records": 0,
+            "checkpoint_lsn": 0,
+            "last_lsn": 6441,
+            "next_lsn": 6442,
+            "wal_records_scanned": 6441,
+            "wal_records_replayed": 6441,
+            "wal_bytes": 708510,
+            "truncated_bytes": 0,
+            "wal_segments": 1,
+            "ignored_residue_segments": 0,
+            "legacy_import": false,
+            "needs_bootstrap": false,
+            "manifest_present": true
+          }
+        }
+      ]
+    }
+  ],
+  "elapsed_wall_seconds": 18.152
+}

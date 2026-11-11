@@ -5,8 +5,8 @@ MiniDB keeps four complementary benchmark harnesses:
 - `bench/benchmark.py` is the short, deterministic sample-count regression used
   to validate the measurement plumbing;
 - `bench/run_reliability_benchmark.py` is the R0-R3 durability, concurrency,
-  SIGKILL recovery, and checkpoint-pause harness and the R4-A v2 baseline
-  collector;
+  SIGKILL recovery, and checkpoint-pause harness, the R4-A v2 baseline
+  collector, and the formal clean-HEAD G4 benefit harness;
 - `bench/run_r4a_batch_formation.py` is the external, non-production R4-A G3
   batch-formation experiment;
 - `bench/run_acceptance_benchmark.py` is the historical Stage H timed harness,
@@ -15,9 +15,10 @@ MiniDB keeps four complementary benchmark harnesses:
 None of these harnesses is a saturation, capacity, open-loop, or
 production-SLA test. The R3 reliability benchmark supports current durability
 claims; the R4-A v2 baseline supports the diagnostic timing evidence used by
-ADR-005; the G3 harness observes external pending-request overlap around real
-WAL data fsyncs without changing the production write path. Stage H numbers are
-historical background.
+ADR-005; the G3 harness observed external pending-request overlap around real
+WAL data fsyncs without changing the production write path; and the clean-HEAD
+G4 run measures the implemented bounded group-commit path in one frozen
+configuration. Stage H numbers are historical background.
 
 ## Reliability benchmark suite
 
@@ -193,10 +194,78 @@ python3 bench/run_r4a_batch_formation.py \
   --out /tmp/r4a-batch-formation-reproduction.json
 ~~~
 
-The experiment does not add or test a writer thread, queue, batch, completion,
-`BATCHED` mode, G4 benefit, G5 crash correctness, or G6 bounded-resource
-behavior. Passing G3 only permits the next step: a separate
-implementation-level ADR.
+The experiment itself does not add or test a writer thread, queue, batch,
+completion, `BATCHED` mode, G4 benefit, G5 crash correctness, or G6
+bounded-resource behavior. Passing G3 was only the prerequisite for the
+implementation-level [ADR-006](../docs/decisions/006-group-commit-implementation.md);
+the implemented path and its G4 result are recorded below.
+
+### R4-A G4 group-commit benefit run
+
+The formal G4 run measured the implemented bounded writer through the production
+`SYNC` path. It did not enable a public `BATCHED` mode or change the durability
+contract. Retained evidence:
+
+- `bench/results/r4a-group-commit-20261111.json`
+- 28,319 bytes
+- SHA-256:
+  `0ecf064ed9d7b70971188199abbc1194d974659e5ffa3ac24908b7ca9e8f8f7e`
+- `git_head=a06d7c2f3e0be7fc7da1217c3c6f4c6f04fc3128`
+- clean worktree at collection
+- implementation CI: GitHub Actions run
+  [43006353520](https://github.com/TXSAJYDN/MiniDB/actions/runs/43006353520),
+  9/9 jobs passed before collection
+- verdict: **PASS**
+
+The frozen G4 policy was:
+
+| Parameter | Value |
+|---|---:|
+| Rounds | 5 |
+| Clients | 32 |
+| Duration per round | 2.0 s |
+| Dataset | 128 keys |
+| Value size | 64 B |
+| Seed | 20261111 |
+| Durability mode | `SYNC` |
+| Workload | 100% write (`SET`) |
+| Frozen R3 baseline | 418.018 ops/s |
+| Required median QPS | >= 836 |
+| Achieved median QPS | **2,858.989** |
+| Relative to baseline | **6.84x** |
+| Errors | 0 / 29,100 requests |
+
+| Round | QPS | P50 us | P99 us | Batches | Batch records | Max batch records |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2,731.783 | 10,858.455 | 22,696.026 | 851 | 5,615 | 26 |
+| 2 | 2,786.958 | 10,680.789 | 22,151.359 | 853 | 5,715 | 20 |
+| 3 | 2,858.989 | 10,482.744 | 21,613.536 | 863 | 5,857 | 28 |
+| 4 | 2,887.715 | 10,291.577 | 21,297.945 | 884 | 5,920 | 24 |
+| 5 | 2,925.525 | 10,147.647 | 21,367.014 | 923 | 5,993 | 23 |
+
+Pooled P50/P99 were **10,476.388/21,839.172 us**. Median throughput used
+**6.696833 records per batch**; queue rejections and writer failures were both
+zero. Relative to the clean v2 instrumentation baseline of 617.673 QPS, the gain
+was **4.63x**, but the same run also used more CPU, added 224 KiB to peak server
+RSS, and measured about twice the recovery time. Those costs are part of the
+result.
+
+Reproduce with a new output path after building Release:
+
+~~~bash
+python3 bench/run_reliability_benchmark.py \
+  --kv build/ci-release/app/minidb_kv_server \
+  --rounds 5 --duration-seconds 2 \
+  --dataset-keys 128 --value-size 64 \
+  --seed 20261111 \
+  --modes sync --clients 32 --workloads write \
+  --out /tmp/r4a-group-commit-reproduction.json
+~~~
+
+The run is WSL2 loopback, single-node, and closed-loop with one in-flight command
+per client. It is not open-loop saturation capacity evidence and does not
+generalize beyond the measured 32-client configuration. Every `SYNC`
+acknowledgement still waited for the data fsync covering its LSN.
 
 ## Historical Stage H harness
 

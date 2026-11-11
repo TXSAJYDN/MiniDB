@@ -27,7 +27,7 @@ rejected by an advisory `flock` on `<rdb_path>.lock`.
 1. One owner EventLoop is the only mutation admission, in-memory apply,
    completion, and protocol-response point.
 2. A dedicated writer thread exclusively owns WAL append, fsync, rotation, and
-   cleanup once group commit starts.
+   cleanup for bounded group commit.
 3. A mutation is appended to the WAL before it is applied to the in-memory
    store and before success is reported.
 4. `SYNC` reports success only after the physical WAL batch covering its LSN

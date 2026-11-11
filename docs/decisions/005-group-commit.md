@@ -1,6 +1,6 @@
 # ADR-005：R4-A 组提交候选设计与证据门槛
 
-- 状态：Accepted — 由 ADR-006 落实实现；G1-G3 PASS，G4 clean-HEAD 证据待采集，G5/G6 本地通过
+- 状态：Accepted — 由 ADR-006 落实实现；G1-G7 PASS（正式 G4 采集自 clean HEAD `a06d7c2`，实现提交 CI 9/9）
 - 日期：2026-11-11
 - 关联：`docs/MiniDB-可靠性与持久化升级计划书.md`、`docs/architecture.md`、`docs/reliability-evidence.md`
 - 决策范围：R4-A 的设计、观测口径和准入条件；不包含组提交实现
@@ -284,13 +284,18 @@ P99 2,716.800 us；客户端延迟 P50 111,990.761 us、P99 133,233.279 us。
   SHA-256
   `f68b485204600ba83d88dd04834ee2df08595776af150cdfb164846ae6b4439d`。
   该实验只证明外部请求层面存在 batch 形成机会。
-- **G4：PENDING CLEAN HEAD。** 组提交 writer/queue/batch/completion 已由
-  [ADR-006](006-group-commit-implementation.md) 实现；正式收益必须在提交并
-  通过 CI 的 clean HEAD 上，用 5 轮 32 客户端 write 实验采集。
-- **G5/G6：LOCAL PASS。** 338 项 CTest、24 个进程用例、故障注入、writer
-  资源上限和 fail-stop 测试通过；最终证据以 clean HEAD 的完整门禁记录为准。
-- **G7：IN PROGRESS。** ADR-006 已记录实现选择、失败矩阵、资源上限和代码
-  落点；完成后补齐 G4 artifact 与最终状态。
+- **G4：PASS。** 正式 5 轮实验采集自 clean HEAD `a06d7c2`（GitHub
+  Actions run `43006353520` 9/9 通过）。artifact
+  `bench/results/r4a-group-commit-20261111.json` 为 **28,319 bytes**，SHA-256
+  `0ecf064ed9d7b70971188199abbc1194d974659e5ffa3ac24908b7ca9e8f8f7e`。
+  32 客户端 `SYNC` write 的 median QPS 为 **2,858.989**，是冻结门槛 836
+  的 3.42 倍、基线 418.018 的 **6.84x**；29,100/29,100 次成功、0 错误，
+  pooled P50/P99 为 **10,476.388/21,839.172 us**，平均 6.696833
+  records/batch，queue rejection 和 writer failure 均为 0。
+- **G5/G6：PASS。** 338 项 CTest、24 个进程用例、故障注入、writer 资源上限
+  和 fail-stop 测试在六种本地配置通过；实现提交也通过完整 GitHub Actions。
+- **G7：COMPLETE。** ADR-006 已记录实现选择、失败矩阵、资源上限和代码落点；
+  G4 artifact、资源代价和最终状态已写回证据文档。
 
 ## 明确非目标
 
@@ -313,9 +318,9 @@ P99 2,716.800 us；客户端延迟 P50 111,990.761 us、P99 133,233.279 us。
 
 ## 后果
 
-- R4-A 的实现选择、失败矩阵和资源上限由 ADR-006 冻结；G1-G3 已 PASS，
-  G5/G6 本地通过。
-- 正式 G4 收益仍必须用同一环境、相同数据集和至少 5 轮的可复现实验证明；
-  未达到门槛时不得把实现写成性能收益成立。
+- R4-A 的实现选择、失败矩阵和资源上限由 ADR-006 冻结；G1-G7 已 PASS。
+- 正式 G4 证明当前实现达到门槛：median QPS 2,858.989，为基线 418.018 的
+  6.84x。该结果同时伴随更高的 CPU、略高的 server RSS 和约 2 倍的恢复时间，
+  不能脱离限制单独宣传。
 - 任何后续扩展都必须保持现有 ack 持久性语义、LSN 连续性和有界资源，不得为了
   吞吐放宽正确性。

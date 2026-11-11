@@ -157,7 +157,7 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 
 ## 验证状态
 
-R4-A 组提交实现已完成并通过本地质量门禁；正式 G4 收益证据在推送后的 clean HEAD 上采集：
+R4-A 组提交实现、本地质量门禁和正式 G4 收益证据均已完成：
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种构建配置；
 - 每个配置 **338 项 CTest**，包含 24 个 `ProcessIntegrationTest.*` 进程级用例；
@@ -170,12 +170,19 @@ R4-A 组提交实现已完成并通过本地质量门禁；正式 G4 收益证�
   `SYNC` write 的 fsync 占持久化耗时中位数 99.06%，G1/G2 PASS；
 - R4-A G3：独立 batch-formation 实验 5 轮、2,985 个 WAL data fsync 窗口、
   0 错误，汇总 `pending_count >= 8` 比例 **0.987605**，PASS；
-- 正式 G4 的 clean-HEAD 结果、原始 artifact 摘要和限制见
-  [可靠性证据](docs/reliability-evidence.md)。
+- 正式 G4 在 clean HEAD `a06d7c2` 上采集（该提交 GitHub Actions 9/9 通过）：
+  32 客户端 `SYNC` write 5 轮 median QPS **2,858.989**，相对冻结门槛基线
+  `418.018` 为 **6.84x**；P50/P99 为 **10,476.388 / 21,839.172 us**，
+  29,100/29,100 次请求成功、0 错误，平均 **6.70 records/batch**，
+  queue rejection 与 writer failure 均为 0；
+- 同一 G4 运行中 server CPU 中位数 24.383%（单核）、server RSS 峰值
+  4,836 KiB、WAL 写放大 1.527778、恢复时间中位数 0.044825 s；完整原始
+  artifact、逐轮数据和限制见 [可靠性证据](docs/reliability-evidence.md)。
 
-具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。远程 CI 必须在
-最终 `main` HEAD 上通过；本地门禁不替代 GitHub Actions。G3 的 pending 计数
-是批处理机会上界，不是服务器队列已有记录的证据。
+具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。实现提交
+`a06d7c2` 已通过 9/9 GitHub Actions；G4 证据提交必须在最终 `main` HEAD 上再次
+通过完整 CI，最终结果以该 commit 的 checks 为准。本地门禁不替代 GitHub Actions。
+G3 的 pending 计数是批处理机会上界，不是服务器队列已有记录的证据。
 
 ## 明确的非目标
 

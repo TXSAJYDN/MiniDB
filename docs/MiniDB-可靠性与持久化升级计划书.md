@@ -1,6 +1,6 @@
 # MiniDB 可靠性与持久化升级计划书
 
-> 文档状态：`R0-R3 Completed / R4-A Implemented / G1-G3 PASS / G5-G6 Local PASS / G7 Recorded / G4 Pending Clean HEAD`
+> 文档状态：`R0-R3 Completed / R4-A Completed / G1-G7 PASS`
 >
 > 编写日期：2026-11-10（Asia/Shanghai）
 >
@@ -11,10 +11,9 @@
 > 最近历史功能验收基线：`9da4b48`（阶段 A-H 技术验收 PASS）
 >
 > 计划性质：R0-R3 已按本文完成实现并通过本地验证；R4-A 已完成 ADR-005、
-> 诊断指标、clean v2 baseline、独立 G3 batch formation 实验和 ADR-006 实现冻结，
-> G1-G3 PASS，G5/G6 本地通过。组提交已作为 `SYNC` 的内部优化落地；正式 G4
-> 收益证据必须在提交并通过 CI 的 clean HEAD 上采集。其他 R4 路线仍是证据驱动的
-> 可选项。
+> 诊断指标、clean v2 baseline、独立 G3 batch formation 实验、ADR-006 实现和
+> clean-HEAD G4 收益验证，G1-G7 PASS。组提交作为 `SYNC` 的内部优化落地，
+> 不暴露新的 durability mode。其他 R4 路线仍是证据驱动的可选项。
 >
 > 推进方式：按技术依赖和验收门槛推进，不设置固定总工期或强制周计划。阶段状态、证据链接、已知限制和下一步准入条件随实现同步更新。
 >
@@ -289,7 +288,7 @@ KvStore snapshot + checkpoint_lsn
 | `WalReplay` | 扫描、校验、尾部截断、按 LSN 重放 |
 | `CheckpointManifest` | manifest 编码/解码、checkpoint_lsn、segment 列表 |
 | `RecoveryManager` | 组合 RDB、manifest 和 WAL，完成启动恢复 |
-| `DurabilityPolicy` | `SYNC`、`BATCHED`、`INTERVAL` 等语义和返回时机 |
+| `DurabilityPolicy` | 公开 `SYNC`、`INTERVAL` 语义和返回时机，以及 `SYNC` 内部组提交策略 |
 
 网络层不应直接依赖 WAL 细节；存储模块也不应依赖网络模块。HTTP 和 KV 两个服务应复用同一套存储恢复逻辑。
 
@@ -302,13 +301,13 @@ KvStore snapshot + checkpoint_lsn
 - 这会阻塞事件循环，但实现简单、顺序清晰，适合先建立正确性基线；
 - 该阶段的吞吐不是最终目标，必须如实记录 fsync 带来的停顿。
 
-**R4 可选优化：**
+**R4-A 已实现优化：**
 
-- 只有在实测证明 fsync 是主要瓶颈后，才引入专用 WAL writer thread 和组提交；
-- 写请求按顺序入队，WAL writer 批量 append + 一次 fsync；
-- fsync 完成后通过 completion queue 回到 owner loop，再按原顺序应用内存并响应；
-- 组提交只能优化“多个写共享一次 fsync”，不能改变全局应用顺序和 ack 语义；
-- 需要 eventfd、 有界队列、completion 预留、stop/drain 和 TSan 测试。
+- R1 benchmark 与 G1-G3 证明 fsync 是 `SYNC` 写路径的主要瓶颈后，才引入专用 WAL writer thread 和组提交；
+- 写请求按顺序进入有界队列，WAL writer 批量 append + 一次 data fsync；
+- fsync 完成后通过有界 completion backlog 回到 owner loop，再按原顺序应用内存并响应；
+- 组提交只优化“多个写共享一次 fsync”，没有改变全局应用顺序和 ack 语义；
+- eventfd、有界队列/backlog、stop/drain、失败 fail-stop 和 TSan 测试均已落地。
 
 **checkpoint 策略：**
 
@@ -380,7 +379,7 @@ RDB v2 文件格式可以保持不变，`last_lsn` 放在 manifest 中，避免�
 | 模式 | 成功返回条件 | 已确认写保证 | 可能丢失 | 用途 |
 |---|---|---|---|---|
 | `SYNC` | WAL append + fsync 成功，内存应用后 | 在 fsync 假设下，已确认写不丢 | 无（对已确认写） | R1 正确性基线 |
-| `BATCHED` | 同一批次 WAL fsync 成功，按顺序应用后 | 同 `SYNC` | 无（对已确认写） | R4 性能优化 |
+| `BATCHED`（未公开） | 同一批次 WAL fsync 成功，按顺序应用后 | 同 `SYNC` | 无（对已确认写） | 仅作为 R4-A 内部组提交；不提供 CLI 模式 |
 | `INTERVAL` | 内存应用后，周期 fsync | 不保证崩溃后不丢 | 最近一个 fsync 窗口 | 明确的弱持久化对照 |
 | `NONE` | 内存应用后 | 无 | 进程崩溃也可能丢 | 仅基准对照，不作为对外能力 |
 
@@ -388,12 +387,12 @@ RDB v2 文件格式可以保持不变，`last_lsn` 放在 manifest 中，避免�
 
 - R1 默认 `SYNC`；
 - `INTERVAL` 必须显式配置，不能默认开启；
-- `BATCHED` 只有在组提交实现并通过崩溃矩阵后才能成为候选默认值；
+- 不新增公开 `BATCHED` 模式；R4-A 组提交只作为 `SYNC` 的内部优化存在；
 - README 必须明确每个模式的保证和代价，不能只列模式名。
 
 ### 4.3 核心不变量
 
-1. **I1：ack 后持久性。** `SYNC`/`BATCHED` 下，客户端收到成功响应后，已确认写必须在恢复后可读；前提是存储设备遵守 fsync 语义。
+1. **I1：ack 后持久性。** `SYNC`（含内部组提交）下，客户端收到成功响应后，已确认写必须在恢复后可读；前提是存储设备遵守 fsync 语义。
 2. **I2：合法前缀。** 恢复只接受连续、校验通过的 WAL 前缀；尾部半写可截断，中间损坏必须拒绝启动。
 3. **I3：重放幂等。** 快照与 WAL 的重放不能重复应用或漏应用；同一 LSN 不能出现两次不同语义。
 4. **I4：TTL 语义稳定。** WAL 保存绝对 deadline，重放不受重启时间和相对时钟影响。
@@ -574,7 +573,7 @@ R1 的 checkpoint 仍可以是 stop-the-world；先保证正确性，再根据�
 - 所有 WAL segment 总字节数软/硬上限；
 - 单条记录最大字节数；
 - 恢复时可分配的最大内存；
-- 未完成写入队列长度（若后续做组提交）；
+- group-commit admission queue 与 completion backlog 的条目/字节上限（已实现）；
 - checkpoint 临时文件大小；
 - 启动恢复允许的最大 segment 数量。
 
@@ -649,7 +648,7 @@ R1 的 checkpoint 仍可以是 stop-the-world；先保证正确性，再根据�
 - manifest parser fuzz：随机字节、非法 segment 引用、CRC 错误、重复 LSN；
 - 继续运行现有 HTTP/KV fuzz；
 - ASan/UBSan 覆盖 WAL 编解码和恢复路径；
-- TSan 覆盖组提交和后台 checkpoint（若实现）；
+- TSan 覆盖已实现的组提交；后台 checkpoint 若后续实现也必须纳入；
 - clang-format、clang-tidy 和现有 CI 矩阵不能回退。
 
 ### 6.4 CI 分层
@@ -668,7 +667,7 @@ R1 的 checkpoint 仍可以是 stop-the-world；先保证正确性，再根据�
 
 性能工作不是追求一个孤立 QPS 数字，而是回答：
 
-1. `SYNC`、`BATCHED`、`INTERVAL` 的吞吐和尾延迟差异是多少？
+1. `SYNC`（含内部组提交）与 `INTERVAL` 的吞吐和尾延迟差异是多少？
 2. 达到同样 ack 语义时，组提交能提升多少？
 3. WAL 大小增长如何影响恢复时间？
 4. checkpoint 的停顿、RSS 和写放大是多少？
@@ -679,7 +678,7 @@ R1 的 checkpoint 仍可以是 stop-the-world；先保证正确性，再根据�
 
 | 维度 | 取值 |
 |---|---|
-| 持久化级别 | `SYNC`、`INTERVAL`、后续 `BATCHED` |
+| 持久化级别 | `SYNC`（含内部组提交）、`INTERVAL`，以及未实现组提交的 v2 baseline |
 | 客户端数 | 1、8、32；不夸大超过连接上限的扩展性 |
 | 工作负载 | 小 key/value 写、混合读写、TTL 负载、重启恢复 |
 | 指标 | throughput、P50/P95/P99/P999、错误率、CPU、RSS、WAL bytes、fsync 次数 |
@@ -828,7 +827,7 @@ durability/客户端数/负载矩阵，seed 为 `20261111`。原始数据保存�
 
 **R4-A：组提交**
 
-**实施状态（2026-11-11）：** [ADR-005](decisions/005-group-commit.md) 已固化候选边界、不可妥协不变量和 G1-G7 证据门槛；[ADR-006](decisions/006-group-commit-implementation.md) 已冻结 writer/completion 线程模型、资源上限、失败语义、checkpoint barrier 和新增观测契约。实现已落地：专用 WAL writer thread 从连续 LSN 前缀形成有界 batch，一次 data fsync 覆盖整批；owner EventLoop 仍是唯一 admission、Store apply、completion 和协议响应点。HTTP/KV mutation、SAVE、checkpoint 和 shutdown 已异步化，队列/backlog 满时明确拒绝或 fail-stop。G1-G3 PASS；G5/G6 已在本地六配置 338 项测试中通过；G7 由 ADR-006 记录。正式 G4 仍需在提交并跑通 CI 的 clean HEAD 上采集，当前不得宣称性能收益已经成立。
+**实施状态（2026-11-11）：** [ADR-005](decisions/005-group-commit.md) 已固化候选边界、不可妥协不变量和 G1-G7 证据门槛；[ADR-006](decisions/006-group-commit-implementation.md) 已冻结 writer/completion 线程模型、资源上限、失败语义、checkpoint barrier 和新增观测契约。实现已落地：专用 WAL writer thread 从连续 LSN 前缀形成有界 batch，一次 data fsync 覆盖整批；owner EventLoop 仍是唯一 admission、Store apply、completion 和协议响应点。HTTP/KV mutation、SAVE、checkpoint 和 shutdown 已异步化，队列/backlog 满时明确拒绝或 fail-stop。实现提交 `a06d7c2` 的 GitHub Actions 9/9 通过；正式 G4 在该 clean HEAD 上完成 5 轮 32 客户端 `SYNC` write，median QPS **2,858.989**，为冻结基线 418.018 的 **6.84x**，29,100/29,100 次成功且 0 错误，判定 PASS。G1-G7 已闭环；收益必须与更高的 CPU、略高的 server RSS 和约 2 倍恢复时间一起引用。
 
 - [x] 写 ADR，定义候选边界、失败矩阵和证据门槛；
 - [x] 增加低开销诊断指标和 `/stats`/`STATS` 契约；
@@ -844,8 +843,8 @@ durability/客户端数/负载矩阵，seed 为 `20261111`。原始数据保存�
 - [x] HTTP/KV 异步 mutation、SAVE、checkpoint barrier 和 graceful shutdown；
 - [x] 顶层 `group_commit` 指标、batch-size 桶、queue/backlog 高水位和失败计数；
 - [x] G5/G6 本地验证：六配置各 338 项测试、24 个进程用例、TSan/sanitizer/fuzz/静态分析门禁；
-- [ ] G4：在 clean HEAD 上用相同环境、数据集和至少 5 轮实验验证 32 客户端 write 的中位 QPS 相对 418.018 至少提升 2 倍，并保留 negative evidence；
-- [ ] 将 G4 artifact、限制、digest 和最终 G7 状态写回证据文档并在最终 `main` HEAD 上重跑 CI。
+- [x] G4：在 clean HEAD `a06d7c2` 上用相同环境、数据集和 5 轮实验验证 32 客户端 write；median QPS 2,858.989，相对 418.018 提升 6.84x，PASS；
+- [x] 将 G4 artifact、限制和 digest 写回 ADR-005、ADR-006、证据文档与项目状态，完成 G7；最终证据提交以自身 `main` HEAD 的完整 CI 为发布门禁。
 
 **R4-B：后台/增量 checkpoint**
 
@@ -958,7 +957,8 @@ R1-R3 完成后可以写：
 | R1 | `SYNC` 语义、WAL 重放、RDB checkpoint 和旧库迁移通过测试 |
 | R2 | 崩溃点矩阵、恢复模型、fuzz 和 sanitizer 全部通过 |
 | R3 | 持久化性能、恢复时间、checkpoint 停顿有可复现报告 |
-| R4 | 只有在测量证明需要时，才引入组提交、后台 checkpoint 或事务能力 |
+| R4-A | 组提交只在 G1-G3 证明机会后实现，并完成 G1-G7、clean-HEAD G4 和完整门禁 |
+| R4-B/C | 后台 checkpoint、事务和 MVCC 只有在测量证明需要时单独启动 |
 
 任何阶段如果出现：
 
@@ -987,22 +987,15 @@ R1 开始前的文档决策均已落地：
 7. 保持 `-r <rdb_path>`，sidecar 为 `.manifest`、`.wal/`、`.lock`；
 8. R1 已引入单写者锁以及 HTTP/KV 共享的持久化统计。
 
-R4-A 已从“可选设计”进入已实现、待正式收益验证的状态。ADR-005 规定的
-G1/G2/G3 已 PASS，ADR-006 已冻结并落地 writer/completion 线程模型、有界资源、
-batch formation、异步协议、checkpoint/shutdown barrier 和失败语义；G5/G6 已有
-本地六配置 338 项测试证据。当前剩余工作是按顺序完成：
+R4-A 已完成 G1-G7，不再处于待验证状态。ADR-005 的证据门槛与 ADR-006 的
+实现约束均已闭环；clean-HEAD G4 artifact 记录了 median QPS 2,858.989、
+相对基线 6.84x、0 错误以及 CPU/RSS/恢复时间代价。最终证据提交仍必须以自身
+`main` HEAD 的完整 GitHub Actions 作为发布门禁，不能继承实现提交的结果。
 
-1. 将实现与文档同步到 Windows 工作树，提交并推送 `main`；
-2. 在 `main` 上跑完整 GitHub Actions，要求全部 job 通过；
-3. 在通过 CI 的 clean HEAD 上运行正式 G4，不修改阈值、不放宽 ack 持久性；
-4. 计算 artifact bytes/SHA-256，更新 ADR-005、ADR-006、证据文档和项目状态；
-5. 提交 G4 证据并推送，确保最终 `main` HEAD 的 CI 再次全绿；
-6. 删除中间临时产物，但保留可靠性 benchmark artifacts、正式 G4 artifact 和仓库根旧 in-source build 历史产物。
-
-G4 失败时必须保留 negative evidence，并重新评估设计；不得把未达标结果写成收益成立。
-后台/增量 checkpoint、MVCC/事务和多写者仍保持独立阶段，不随 R4-A 自动启动。任何
+后台/增量 checkpoint、MVCC/事务和多写者仍是独立阶段，不随 R4-A 自动启动。任何
 后续 R4 变更仍必须保持 manifest 原子发布、ack 后不丢、全局顺序和有界资源，并重新
 通过 sanitizer、崩溃矩阵、fuzz 和资源上限验证。
+
 ---
 
 ## 13. 变更记录
@@ -1014,3 +1007,4 @@ G4 失败时必须保留 negative evidence，并重新评估设计；不得把�
 | 2026-11-11 | 0.3 | R4-A 完成 ADR-005、timing 指标和 clean v2 baseline；G1/G2 PASS，G3 待验证；组提交实现仍未开始 |
 | 2026-11-11 | 0.4 | R4-A 完成独立非生产 G3 batch formation 实验：5 轮、2,985 个窗口、0 错误，汇总 `>=8` 比例 0.987605，G3 PASS；等待实现级 ADR，组提交仍未实现 |
 | 2026-11-11 | 0.5 | R4-A 实现完成：ADR-006、writer/queue/batch/completion、异步 HTTP/KV、SAVE/checkpoint/shutdown barrier、`group_commit` 指标和本地六配置 338 项测试；G1-G3 PASS、G5/G6 本地 PASS、G7 已记录，G4 待 clean HEAD 采集 |
+| 2026-11-11 | 0.6 | R4-A G4 PASS：clean HEAD `a06d7c2`、5 轮 32 客户端 `SYNC` write、median QPS 2,858.989、相对 418.018 为 6.84x、29,100 次成功 0 错误；artifact、digest、CPU/RSS/恢复代价和 G7 状态已写回，R4-A 完成 |

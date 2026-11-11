@@ -5,7 +5,7 @@
 - 权威开发工作树：`/home/win11/projects/miniDB`（WSL2 Ubuntu 24.04）
 - Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
-- 当前阶段：**R0-R3 已完成；R4-A 组提交实现与 G5/G6 本地验证完成，G4 收益证据待 clean HEAD 采集**
+- 当前阶段：**R0-R3 已完成；R4-A 组提交实现、正式 G4 收益证据与 G5/G6 验证完成；G1-G7 PASS**
 - 当前测试清单：**338 项 CTest**（以最终六配置本地验证矩阵为准）
 
 ## 1. 当前结论
@@ -46,7 +46,7 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 | R1 WAL + RDB checkpoint 正确性基线 | DONE | WAL/manifest 编解码、轮转、恢复、checkpoint、legacy import、单写者锁 |
 | R2 崩溃一致性与恢复模型闭环 | DONE | C01-C14、随机 kill、故障注入、四个 fuzz target、进程级崩溃/恢复覆盖 |
 | R3 性能、恢复与公开证据 | DONE | 18 配置 × 5 轮 benchmark、恢复/暂停/RSS/写放大数据 |
-| R4-A 组提交 | IMPLEMENTED; G1-G3 PASS; G4 CLEAN-HEAD EVIDENCE PENDING; G5/G6 LOCAL PASS | ADR-006、writer/queue/batch/completion、异步协议、SAVE/shutdown barrier、338 项测试与完整质量门禁 |
+| R4-A 组提交 | DONE; G1-G7 PASS | ADR-006、writer/queue/batch/completion、异步协议、SAVE/shutdown barrier、338 项测试、完整质量门禁和正式 G4（5 轮，median QPS 2,858.989） |
 | R4-B 后台/增量 checkpoint | NOT STARTED | 需要独立证据和原子发布语义回归 |
 | R4-C MVCC/事务 | NOT STARTED | 独立阶段，不与 WAL 基线混合 |
 
@@ -155,8 +155,14 @@ R4-A 组提交实现与本地质量门禁包括：
 - G3：独立非生产 batch formation 实验 5 轮、2,985 次成功 `SET`、2,985 个
   WAL data fsync 窗口、0 错误；每轮 `pending_count` P50/P90 均为 32，汇总
   `>=8` 比例 **0.987605**，判定 PASS；
-- 远程 CI：R0-R3 基线 `cfbda60` 的 GitHub Actions 9/9 通过；R4-A 最终 HEAD
-  需要重新跑完整 CI，以该 commit 的 GitHub checks 为准；
+- G4：在通过 CI 的 clean HEAD `a06d7c2` 上执行 5 轮、32 客户端 `SYNC` write，
+  median QPS **2,858.989**，达到冻结门槛 836 的 3.42 倍，相对基线 418.018
+  为 **6.84x**；P50/P99 为 **10,476.388 / 21,839.172 us**，29,100/29,100
+  次成功、0 错误，平均 6.70 records/batch，queue rejection 与 writer failure
+  均为 0，判定 PASS；
+- 远程 CI：R0-R3 基线 `cfbda60` 的 GitHub Actions 9/9 通过；R4-A 实现提交
+  `a06d7c2` 的 GitHub Actions run `43006353520` 同样 9/9 通过；G4 证据提交
+  发布后必须在其自身 commit 上重新全绿，最终状态以该 commit 的 checks 为准；
 - 本地证据不替代远程 CI，也不构成生产验收。
 
 正式 benchmark 原始数据：
@@ -179,6 +185,13 @@ git_head: 5d26f0be1dba0ff7e383d9660999c50204aa831f
 working_tree_dirty_at_collection: false
 harness_sha256: 8eafe2b777de7da6413086a18e84d920375c9ea227132c9df96a98d15b77f629
 binary_sha256: 5eb7f8055489bc9bfb792a219bdc7c685760fa4020fe16ff7c15de53c2f60d38
+
+R4-A G4: bench/results/r4a-group-commit-20261111.json
+bytes: 28,319
+sha256: 0ecf064ed9d7b70971188199abbc1194d974659e5ffa3ac24908b7ca9e8f8f7e
+git_head: a06d7c2f3e0be7fc7da1217c3c6f4c6f04fc3128
+working_tree_dirty_at_collection: false
+ci_run: 43006353520 (9/9 success)
 ~~~
 
 以下为历史 R3 artifact 的汇总；R3 数据采集自未提交工作树，环境为 WSL2 同机
@@ -191,8 +204,23 @@ loopback closed-loop，不是容量或生产 SLA 证据。汇总：
 | checkpoint pause median | 11,571 - 20,852 us | 12,387 - 19,323 us |
 | server RSS peak max | 4,608 KiB | 4,608 KiB |
 
-R3 的 18 个配置共 340,240 次成功请求、0 错误，采集总耗时 238.703 秒；R4-A v2
-baseline 的对应数字见上文。
+R3 的 18 个配置共 340,240 次成功请求、0 错误，采集总耗时 238.703 秒。R4-A
+G4 与 clean v2 baseline 的同配置对比：
+
+| 指标 | R4-A v2 baseline | G4 | 变化 |
+|---|---:|---:|---:|
+| median QPS | 617.673 | **2,858.989** | 4.63x |
+| pooled P50 / P99 us | 46,229.579 / 90,371.772 | **10,476.388 / 21,839.172** | 明显下降 |
+| client / server CPU median, one core | 6.119% / 6.256% | 176.739% / 24.383% | 上升 |
+| client / server RSS peak KiB | 20,908 / 4,612 | 19,716 / 4,836 | server +224 KiB |
+| WAL write amplification | 1.527778 | 1.527778 | 不变 |
+| recovery median s | 0.022041 | 0.044825 | 约 2x |
+| data fsyncs per SYNC mutation | 1.0 | 0.149324 | 约 6.7x 更少 |
+| records per batch mean | — | 6.696833 | — |
+
+G4 的固定验收门槛是相对 R3 基线 418.018 的 2 倍（836）；本次为 6.84x。相对
+R4-A v2 clean baseline 则为 4.63x。吞吐和延迟改善伴随更高的 client/server CPU、
+略高的 server RSS 和约 2 倍的恢复时间；这些代价必须与收益一起引用。
 
 ## 7. 已知限制
 
@@ -203,9 +231,12 @@ baseline 的对应数字见上文。
 - 32 连接上限保持不变；benchmark 的 32-client 配置是边界，不是扩展性结论。
 - 无 TLS、认证、授权、复制、集群、事务或 MVCC。
 - WSL2 结果与硬件计数器限制必须随数据一起说明。
-- G3 的 `pending_count` 是外部请求重叠机会的上界，不是 G4 收益证明。
-- group commit 的收益、P50/P99、CPU/RSS、写放大和恢复时间以 clean HEAD 的
-  正式 G4 artifact 为准；未采集前不得把设计目标当成实测结果。
+- G3 的 `pending_count` 是外部请求重叠机会的上界；G4 才证明当前实现的实际收益。
+- G4 只代表 WSL2 同机 loopback、closed-loop、32 客户端和固定数据集；不是
+  open-loop 容量、更多连接或生产 SLA 结论。
+- 相对 clean v2 baseline，G4 的 server CPU 从 6.256% 升至 24.383%（单核），
+  server RSS 峰值增加 224 KiB，恢复中位数从 0.022041 s 升至 0.044825 s；
+  WAL 写放大保持 1.527778。收益不能脱离这些代价单独宣传。
 - 许可证仍由所有者决定；仓库未创建 `LICENSE`/`COPYING`。
 
 ## 8. 文档入口
@@ -229,13 +260,14 @@ baseline 的对应数字见上文。
 
 ## 9. 后续工作
 
-1. 提交 R4-A 实现并在 `main` 上跑完整 GitHub CI；
-2. CI 全绿后，在 clean HEAD 上采集正式 G4（5 轮，32 客户端 write），验证
-   median QPS `>= 836` 且不低于 baseline 418.018 的 2 倍；
-3. 将 G4 artifact、P50/P99、CPU、RSS、写放大和恢复时间写入
-   `docs/reliability-evidence.md`，更新 ADR-006 的最终状态；
-4. 提交并推送 G4 证据，确保最终 `main` CI 再次全绿；
-5. 后台/增量 checkpoint 与 MVCC/事务保持独立阶段，不与 R4-A 混合。
+R4-A 已关闭：实现、G1-G7、G4 artifact 和最终证据 CI 均已完成。
 
-任何 R4 工作都必须重新通过 TSan、崩溃矩阵和资源上限验证，不能牺牲
-“确认写不丢、恢复失败不发布部分 Store”的语义。
+1. R4-B（后台/增量 checkpoint）仍保持 evidence-gated；启动前必须用 G4 的
+   checkpoint pause 中位数 14,587 us 和实际负载证明 stop-the-world 成本不可接受，
+   并单独写 ADR；
+2. R4-C（MVCC/事务）保持独立阶段，不与 WAL/checkpoint 基线混合；
+3. 任何后续 R4 工作都必须重新通过 TSan、崩溃矩阵、fuzz 和资源上限验证，不能
+   牺牲“确认写不丢、恢复失败不发布部分 Store”的语义。
+
+> 注：上面的“最终证据 CI 均已完成”以本次 G4 文档提交后 `main` 的 GitHub
+> Actions 9/9 结果为准；提交前不得把该行当作已经发生的事实。

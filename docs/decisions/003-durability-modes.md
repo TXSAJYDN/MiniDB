@@ -26,9 +26,11 @@ MiniDB 选择少量、可验证的模式，而不是提供一组名称好听但�
 不新增公开 `BATCHED` 模式。R4-A 把组提交实现为 `SYNC` 的内部优化：
 [ADR-005](005-group-commit.md) 定义证据门槛，[ADR-006](006-group-commit-implementation.md)
 冻结并落实 writer thread、有界队列、批量 data fsync、合并 completion 和
-checkpoint/shutdown barrier。G1-G3 PASS，G5/G6 已在本地 338 项测试中通过；
-G4 收益证据仍待 clean HEAD 采集。无论组提交是否形成 batch，`SYNC` 的成功响应
-都不得早于覆盖该 LSN 的 data fsync，因此 ack 持久性语义没有放宽。
+checkpoint/shutdown barrier。G1-G7 PASS：正式 G4 在 clean HEAD `a06d7c2` 上
+测到 median QPS **2,858.989**，相对冻结基线 418.018 为 **6.84x**，29,100 次
+请求成功且 0 错误；代价是更高的 CPU、略高的 server RSS 和约 2 倍恢复时间。
+无论组提交是否形成 batch，`SYNC` 的成功响应都不得早于覆盖该 LSN 的 data
+fsync，因此 ack 持久性语义没有放宽。
 
 ## fsync 失败语义
 

@@ -1,6 +1,6 @@
 # ADR-006：R4-A 组提交实现
 
-- 状态：Accepted — 实现完成；G4 clean-HEAD 证据待采集，G5/G6 本地通过
+- 状态：Accepted — 实现与 G1-G7 验证完成；正式 G4 已在 clean HEAD `a06d7c2` PASS
 - 日期：2026-11-11
 - 关联：ADR-003、ADR-004、ADR-005、`docs/MiniDB-可靠性与持久化升级计划书.md`
 - 决策范围：R4-A 的并发写路径、WAL batch 接口、checkpoint/SAVE/shutdown barrier、资源上限、失败语义和观测指标
@@ -249,8 +249,12 @@ batch-size 桶边界固定为：
 - EventLoop/Acceptor/TcpServer：signalfd、正式停止 accepting、graceful stop；
 - `/stats` 与 `STATS`：顶层 `group_commit` 指标和 batch-size 桶。
 
-仍待完成：正式 G4 收益采集、G4 artifact 提交、最终 GitHub CI。G5/G6 的
-本地测试与资源上限验证已通过，但最终证据仍以 clean HEAD 的完整门禁记录为准。
+验证已完成：实现提交 `a06d7c2` 的 GitHub Actions run `43006353520` 9/9
+通过；G4 在该 clean HEAD 上采集 5 轮，median QPS **2,858.989**，相对冻结
+基线 418.018 为 **6.84x**，29,100/29,100 次请求成功、0 错误。正式 artifact
+为 `bench/results/r4a-group-commit-20261111.json`（28,319 bytes，SHA-256
+`0ecf064ed9d7b70971188199abbc1194d974659e5ffa3ac24908b7ca9e8f8f7e`）。
+G5/G6 的本地测试与资源上限验证通过；G7 由本 ADR、ADR-005 和证据文档闭环。
 
 ## 验证与准入门槛
 
@@ -270,12 +274,17 @@ completion 顺序、checkpoint barrier、shutdown drain 和崩溃点测试。
 - HTTP/KV 异步 mutation、客户端断开 no-op、流水线响应顺序；
 - SAVE/checkpoint barrier、shutdown drain 和失败非零退出码。
 
-G4 在相同机器和数据集上至少 5 轮，32 客户端 write median QPS 必须：
+G4 在相同机器和数据集上执行 5 轮，32 客户端 write 的正式结果：
 
-- `>= 836`；
-- 相对 `SYNC` 基线 `418.018` 至少 2 倍；
-- 同时报告 P50/P99、CPU、RSS、WAL 写放大和恢复时间；
-- 不得放宽 ack 持久性换取 QPS。
+- median QPS **2,858.989**，高于冻结门槛 `836`，是 `SYNC` 基线 `418.018` 的
+  **6.84x**；
+- pooled P50/P99 为 **10,476.388/21,839.172 us**；
+- client/server CPU 中位数分别为 176.739%/24.383%（单核），server RSS 峰值
+  4,836 KiB；
+- WAL 写放大 1.527778，恢复时间中位数 0.044825 s；
+- 平均 6.696833 records/batch，queue rejection 与 writer failure 均为 0；
+- 29,100/29,100 次成功、0 错误，且没有放宽 ack 持久性。
 
-G5-G7 仍按 ADR-005 执行：失败注入、崩溃恢复、网络协议和可观测性门槛均需通过。
-任何验证失败都阻止将本 ADR 标记为完成。
+G5-G7 已按 ADR-005 完成：失败注入、崩溃恢复、网络协议、可观测性和资源上限
+门槛均通过。收益必须与更高的 CPU、略高的 server RSS 和约 2 倍的恢复时间一起
+引用。

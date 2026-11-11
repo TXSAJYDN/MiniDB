@@ -77,11 +77,12 @@ Admission queue, physical batch, and completion backlog are bounded:
 | physical batch | 256 records / 16 MiB |
 | completion backlog | 4,096 entries / 64 MiB |
 
-SAVE, checkpoint, interval flush, and shutdown issue writer barriers. Checkpoint
-pauses admission, drains and applies all accepted records before rotation,
-snapshot, manifest publication, and cleanup. A manifest therefore never includes
-an LSN that has not been applied. Shutdown failure is propagated to a nonzero
-process exit code.
+SAVE, checkpoint, interval flush, and shutdown issue writer barriers. A
+background checkpoint has two short admission cuts. The first drains and applies
+accepted records before WAL rotation and independent snapshot capture; the
+second drains writes admitted while the worker writes the RDB before manifest
+publication and cleanup. A manifest therefore never includes an LSN that has not
+been applied. Shutdown failure is propagated to a nonzero process exit code.
 
 ## Component map
 
@@ -176,7 +177,7 @@ level-triggered epoll because no new kernel edge exists for user-space bytes.
 object reports successful-operation cumulative and process-lifetime maximum
 durations plus fixed WAL data-fsync buckets; it is diagnostic evidence for
 [ADR-005](decisions/005-group-commit.md), not an SLO. `POST /save` performs a
-stop-the-world checkpoint and reports failure or unconfirmed durability
+two-phase background checkpoint and reports failure or unconfirmed durability
 explicitly.
 
 ## Idle timeout
@@ -199,7 +200,7 @@ connection. The KV protocol has no idle timeout.
    or an unknown command returns ERROR where possible and closes the connection.
 
 `STATS` (command code 8) returns the same persistence statistics JSON as the
-HTTP endpoint. `SAVE` (command code 7) performs a checkpoint.
+HTTP endpoint. `SAVE` (command code 7) runs the same two-phase background checkpoint state machine as HTTP POST /save.
 
 One command is in flight per connection. Pipelined frames remain buffered and
 are resumed from write completion, not recursive callbacks.
@@ -239,13 +240,15 @@ wal-00000000000000000001.log
 
 ### Write path
 
-`PersistenceManager::set`, `del`, and `expire` validate the operation, create a
-logical WAL record with the next LSN, and call `WalManager::append`.
+`PersistenceManager::set`, `del`, and `expire` validate the operation and
+submit it to the bounded group-commit writer with the next contiguous LSN.
 
-- `SYNC`: append and `fsync` the WAL file, then apply the mutation to KvStore,
-  then return success.
-- `INTERVAL`: append to the file, apply the mutation, and return success. The
-  owner-loop timer, checkpoint, or shutdown flushes and fsyncs the WAL.
+- `SYNC`: the writer appends a physical batch and fsyncs its tail. The owner
+  loop receives the completion, applies the mutations in LSN order, and only
+  then reports success.
+- `INTERVAL`: the owner loop applies after the append completes and reports
+  success. The owner-loop timer, checkpoint, or shutdown later flushes and
+  fsyncs the WAL.
 - If the WAL append or required fsync fails, the persistence layer enters
   fail-stop: later mutations return an error until restart. LSN, byte counters,
   and statistics are not rolled back.
@@ -255,23 +258,31 @@ logical WAL record with the next LSN, and call `WalManager::append`.
 
 ### Checkpoint ordering
 
-A checkpoint is stop-the-world:
+A checkpoint is a two-phase background state machine:
 
-1. pause the TTL scanner;
-2. flush and fsync the WAL;
-3. rotate the active segment if it contains records, so the next segment starts
-   at `checkpoint_lsn + 1`;
-4. write the RDB snapshot to a temporary file, fsync it, rename it, and fsync
-   the parent directory;
-5. atomically write and fsync the manifest naming `checkpoint_lsn` and the
-   first retained segment;
-6. only then remove obsolete WAL segments and fsync the WAL directory.
+1. pause mutation admission, pause the group-commit writer, and drain every
+   accepted record through owner-loop apply;
+2. flush and fsync the WAL, rotate the active segment if it contains records,
+   and capture an independent snapshot while scanner sweeps are excluded;
+3. resume the group-commit writer and mutation admission;
+4. on the checkpoint worker, serialize the independent snapshot, write the RDB
+   temporary file, fsync it, rename it, and fsync the parent directory;
+5. pause admission and the writer again, then drain records admitted while the
+   RDB was being written;
+6. atomically write and fsync a manifest naming `checkpoint_lsn` and the
+   complete live WAL-segment set beginning at `checkpoint_lsn + 1`;
+7. remove obsolete WAL segments and fsync the WAL directory;
+8. resume admission, or finish shutdown, and complete the SAVE request.
+
+Snapshot capture is O(records) and still occurs while admission is paused. RDB
+serialization and durable file I/O do not hold admission or the live store.
 
 A snapshot-durability or manifest-durability failure marks persistence
 fail-stop. Old WAL is retained in every ambiguous case. Cleanup failure does not
 invalidate a checkpoint: obsolete segments become residue, recovery ignores
-segments before the first retained start, and a later checkpoint retries
-cleanup.
+segments before the first retained start, and the writer remains paused so a
+later SAVE retries cleanup. A crash after RDB rename but before manifest publish
+leaves the old manifest and complete old WAL as the recovery source.
 
 ### Recovery
 

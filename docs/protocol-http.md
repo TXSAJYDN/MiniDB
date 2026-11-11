@@ -135,28 +135,36 @@ method on an unknown path returns 404. A valid extension method returns 501.
 
 ## `/save` semantics
 
-`POST /save` starts the asynchronous checkpoint state machine:
+`POST /save` starts the two-cut background checkpoint state machine:
 
-1. pause new mutation admission and issue a writer pause barrier;
+1. pause mutation admission and issue the writer pause barrier;
 2. drain accepted WAL records, return completions to the owner loop, and apply
    them in LSN order;
-3. pause the TTL scanner, flush and fsync the WAL;
-4. rotate the active segment if it contains records;
-5. write, fsync, rename, and directory-fsync the RDB snapshot;
-6. atomically publish the checkpoint manifest;
-7. remove obsolete WAL segments and fsync the WAL directory;
-8. resume the writer, or enter final shutdown.
+3. pause the TTL scanner, flush and fsync the WAL, and rotate the active segment
+   when it contains records;
+4. capture an independent `RdbSnapshot` at `checkpoint_lsn`; this capture is
+   O(records) and remains inside the admission cut;
+5. resume the writer and mutation admission while a checkpoint worker serializes
+   the snapshot, writes and fsyncs a temporary RDB, atomically renames it, and
+   directory-fsyncs its parent;
+6. pause admission again, drain and apply mutations admitted while the worker was
+   running, collect the complete live WAL segment set beginning at
+   `checkpoint_lsn + 1`, and atomically publish and directory-fsync the manifest;
+7. best-effort remove WAL segments preceding the retained boundary and fsync the
+   WAL directory, then resume the writer, or finish shutdown.
 
-The HTTP response is deferred until the whole state machine completes. A 200
-response means the checkpoint succeeded through manifest publication. A failure
-returns 500 and does not claim durability. A directory-fsync failure after
-rename may leave the new snapshot visible while durability is unconfirmed; the
-server reports that condition and enters fail-stop rather than publishing an
-unsafe manifest.
+The HTTP response is deferred until the state machine completes. A 200 response
+means the RDB and manifest were durably published. A failure returns 500 and
+does not claim durability. A directory-fsync failure after rename may leave the
+new snapshot visible while durability is unconfirmed; the server reports that
+condition and enters fail-stop rather than publishing an unsafe manifest.
 
-`/save` is not a lightweight backup command. Snapshot serialization, file I/O,
-fsyncs, and cleanup still occupy the owner loop in checkpoint stages, while
-concurrent mutations are not admitted.
+`/save` is not a lightweight backup command. Snapshot capture and the two
+admission cuts can still pause new mutations, and capture cost grows with the
+number of records. RDB serialization, temporary-file I/O, data fsync, rename,
+and directory fsync run on the checkpoint worker rather than the owner loop.
+Cleanup failure after a durable manifest does not invalidate the published
+checkpoint: residue is safe and a later SAVE retries cleanup.
 
 ## `/stats` response
 
@@ -177,7 +185,25 @@ concurrent mutations are not admitted.
     "interval_mutations": 0,
     "checkpoints": 0,
     "interval_flushes": 0,
-    "checkpoint_pause_us": 0
+    "checkpoint_pause_us": 0,
+    "checkpoint_admission_blocked_total_us": 0,
+    "checkpoint_admission_blocked_max_us": 0,
+    "checkpoint_snapshot_capture_total_us": 0,
+    "checkpoint_snapshot_capture_max_us": 0,
+    "checkpoint_snapshot_serialize_total_us": 0,
+    "checkpoint_snapshot_serialize_max_us": 0,
+    "checkpoint_snapshot_write_total_us": 0,
+    "checkpoint_snapshot_write_max_us": 0,
+    "checkpoint_snapshot_fsync_total_us": 0,
+    "checkpoint_snapshot_fsync_max_us": 0,
+    "checkpoint_manifest_total_us": 0,
+    "checkpoint_wal_cleanup_total_us": 0,
+    "checkpoint_total_us": 0,
+    "checkpoint_max_us": 0,
+    "checkpoint_failures": 0,
+    "background_checkpoint_state": "idle",
+    "save_client_latency_total_us": 0,
+    "save_client_latency_max_us": 0
   },
   "wal": {
     "appends": 42,
@@ -261,6 +287,19 @@ mutations; it excludes network parsing and response serialization. `total`
 fields support window means, while `max` fields are process-lifetime maxima
 that include preload/warm-up. The fixed buckets partition `wal.data_fsyncs`;
 they provide bounded cardinality, not arbitrary quantiles or per-request traces.
+
+Checkpoint timing fields distinguish the short admission cuts from worker I/O.
+`checkpoint_admission_blocked_*` covers both pause intervals, including capture
+but excluding RDB serialization and durable worker I/O. `checkpoint_snapshot_*`
+reports capture, serialization, temporary-file write, and RDB fsync separately.
+`checkpoint_manifest_total_us` and `checkpoint_wal_cleanup_total_us` are
+cumulative; `checkpoint_total_us` and `checkpoint_max_us` measure successful
+checkpoint duration from the first cut to completion. `checkpoint_failures`
+counts failed attempts. `save_client_latency_*` measures non-shutdown SAVE
+requests. `background_checkpoint_state` is one of `idle`, `capture`, `writing`,
+`finalizing`, `cleanup`, or `failed`. Phase counters use monotonic time and need
+not sum exactly to end-to-end latency because scheduling and completion
+delivery are included in the latter.
 
 The top-level `group_commit` object reports:
 

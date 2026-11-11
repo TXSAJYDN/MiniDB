@@ -1,6 +1,6 @@
 # Troubleshooting
 
-This guide targets the current R0-R4-A reliability implementation: WAL + RDB
+This guide targets the current R0-R4-B reliability implementation: WAL + RDB
 checkpoint + manifest recovery, `SYNC` and `INTERVAL` durability, the
 single-writer lock, and the bounded group-commit writer. It is diagnostic
 guidance for a local engineering prototype, not a production runbook.
@@ -21,7 +21,7 @@ clang++ --version
 ctest --test-dir build/release -N | tail -n 3
 ~~~
 
-The final local acceptance inventory is 338 CTest cases, including 24
+The final local acceptance inventory is 348 CTest cases, including 25
 `ProcessIntegrationTest.*` cases. Always identify the build directory and
 configuration you are actually using; an old or partial build can report a
 different count.
@@ -51,19 +51,19 @@ cmake --build build/debug -j2
 ctest --test-dir build/debug -N | tail -n 3
 ~~~
 
-The current inventory is 338 tests. A lower count usually means an old build
+The current inventory is 348 tests. A lower count usually means an old build
 directory or an incomplete build. The 214 count in
 `docs/A_H_ACCEPTANCE_REPORT.md` is historical pre-WAL evidence and is not the
 current inventory.
 
 ## A process integration test is missing
 
-The current process suite has 24 cases and covers CLI validation, HTTP/KV
+The current process suite has 25 cases and covers CLI validation, HTTP/KV
 persistence, TTL scanner lifecycle, corrupt startup, save failure, crash
 recovery, interval flush, writer-lock conflict, WAL tail truncation, manifest
 corruption, missing WAL segment, middle-of-file WAL corruption, legacy import,
 random kill replay, TTL crash recovery, async mutation ordering, group-commit
-stats, shutdown failure exit codes, and the stats contract.
+stats, shutdown failure exit codes, the stats contract, and the background-checkpoint rename-before-manifest crash.
 
 Run only that suite in Release:
 
@@ -71,7 +71,7 @@ Run only that suite in Release:
 ctest --preset release -R '^ProcessIntegrationTest\.' --output-on-failure
 ~~~
 
-If fewer than 24 are discovered, rebuild the full test target rather than
+If fewer than 25 are discovered, rebuild the full test target rather than
 running `process_integration_test.py` ad hoc outside CTest.
 
 ## TSan fails with unexpected memory mapping
@@ -199,7 +199,7 @@ the final segment.
 
 ## Manifest is missing or corrupt
 
-The manifest records `checkpoint_lsn` and the first retained WAL segment. It is
+The manifest records `checkpoint_lsn` and the complete retained WAL segment set starting at `checkpoint_lsn + 1`. It is
 published with a temporary file, fsync, atomic rename, and parent-directory
 fsync. A corrupt manifest, a missing manifest with existing WAL, or a manifest
 that points at nonexistent segments is a startup failure.
@@ -289,6 +289,30 @@ Inspect the top-level `group_commit` object in `/stats` or KV `STATS`:
 Do not raise limits or retry in a tight loop before identifying whether the
 bottleneck is the writer, fsync, the owner loop, or a stalled client. A full
 completion backlog is a fail-stop condition, not ordinary backpressure.
+
+## Checkpoint stays non-idle or SAVE times out
+
+Inspect the `persistence` object in `/stats` or KV `STATS`:
+
+- `background_checkpoint_state` should return to `idle` after a successful SAVE;
+  `capture`, `writing`, `finalizing`, or `cleanup` means a checkpoint is still
+  in progress, while `failed` means the persistence path entered fail-stop;
+- `checkpoint_admission_blocked_*` isolates the two short admission cuts;
+- `checkpoint_snapshot_capture_*`, `checkpoint_snapshot_serialize_*`,
+  `checkpoint_snapshot_write_*`, and `checkpoint_snapshot_fsync_*` separate
+  capture from worker serialization and durable I/O;
+- `checkpoint_manifest_total_us`, `checkpoint_wal_cleanup_total_us`,
+  `checkpoint_total_us`, and `checkpoint_failures` identify publication and
+  cleanup problems.
+
+A large SAVE latency dominated by `checkpoint_snapshot_serialize_*` does not
+mean admission was blocked for that whole interval. Capture remains O(records)
+and runs while admission is paused; RDB serialization and durable worker I/O do
+not. If cleanup fails after the manifest is durable, the checkpoint itself is
+published: preserve WAL residue, allow the next SAVE to retry cleanup, and do
+not delete the manifest or segments manually. If `background_checkpoint_state`
+stays non-idle or a SAVE never returns, collect process logs and the persistence
+set before restarting.
 
 ## Save or checkpoint fails during shutdown
 

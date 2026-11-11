@@ -38,27 +38,55 @@ The legacy import path does not write during recovery. The existing RDB is loade
 into a temporary store, and the first persistence write establishes the initial
 manifest and WAL segment.
 
-## Group-commit checkpoint boundary
+## Two-cut background-checkpoint boundary
 
 At runtime, a checkpoint cannot snapshot an LSN that has been written or fsynced
-by the writer but not yet applied by the owner loop. SAVE, interval flush, and
-shutdown therefore use a writer barrier:
+by the writer but not yet applied by the owner loop. R4-B uses two short
+admission cuts around background work:
 
-1. pause new mutation admission;
-2. let the writer drain every record accepted before the barrier;
-3. return completions to the owner loop and apply them in LSN order;
-4. flush the WAL and rotate the active segment when required;
-5. publish the RDB snapshot and manifest;
-6. clean up old WAL segments;
-7. resume the writer or enter final shutdown.
+1. pause new mutation admission and issue a writer pause barrier;
+2. let the writer drain every record accepted before the barrier, return
+   completions to the owner loop, and apply them in LSN order;
+3. pause the TTL scanner, flush the WAL, and rotate the active segment when
+   required;
+4. capture an independent `RdbSnapshot` and record the applied LSN as
+   `checkpoint_lsn`; then resume the writer and admission;
+5. on the checkpoint worker, serialize the snapshot, write and fsync a temporary
+   RDB, atomically rename it, and directory-fsync its parent;
+6. pause admission again and issue a second writer barrier; drain and apply all
+   mutations admitted while the worker was running;
+7. collect the complete live WAL segment set beginning at `checkpoint_lsn + 1`,
+   publish and directory-fsync the manifest, remove obsolete WAL prefix files,
+   and resume the writer or finish shutdown.
 
 A barrier failure keeps the writer paused or failed and prevents manifest
 publication. Shutdown failure is reflected in a nonzero process exit code; a
 failed graceful shutdown is not reported as success.
 
-The writer owns WAL append, fsync, rotation, and cleanup after it starts.
-Recovery itself still runs before the writer is created and follows the same
-manifest + LSN validation rules as earlier releases.
+The writer remains the sole owner of WAL append, fsync, rotation, and cleanup.
+The worker never reads the live `KvStore` and does not hold the store scanner
+pause. Capture is still O(records) and runs inside the first admission cut; this
+is not a zero-pause checkpoint.
+
+## Manifest and live-segment boundary
+
+The manifest records `checkpoint_lsn` and every retained segment from
+`checkpoint_lsn + 1` through the current live chain. It is not valid to record
+only the final active segment: writes admitted while the worker serializes or
+writes the RDB may cause rotations, and all of those segments are required for
+recovery.
+
+If the process crashes after the new RDB rename but before manifest publication,
+the old manifest remains authoritative. The new RDB may already contain state
+ahead of the old `checkpoint_lsn`, but the complete old WAL still covers every
+mutation after that checkpoint. Replay is deterministic because SET, DEL, and
+EXPIRE are logical operations with stable LSN order and absolute expiry
+deadlines.
+
+Cleanup failure after a durable manifest is safe residue, not a checkpoint
+failure. The manifest still defines the live chain, the writer remains paused
+when cleanup needs retry, and the next SAVE captures a new boundary and retries
+prefix cleanup.
 
 ## Normal recovery algorithm
 
@@ -112,9 +140,10 @@ A crash can leave:
 A new manifest with a missing or non-durable snapshot is not allowed by the
 publication order. When an old manifest is observed with a new snapshot, the
 checkpoint LSN in the old manifest is lower than the snapshot's actual content.
-Recovery replays every WAL record after the old checkpoint LSN. SET, DEL, and
-EXPIRE are idempotent at the logical level, so replay over the newer snapshot
-produces the same final state without double-applying a semantic effect.
+The old manifest still names the complete old live segment set; recovery replays
+every WAL record after the old checkpoint LSN. SET, DEL, and EXPIRE are
+idempotent at the logical level, so replay over the newer snapshot produces the
+same final state without double-applying a semantic effect.
 
 ## Resource bounds
 

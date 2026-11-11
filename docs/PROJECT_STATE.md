@@ -5,8 +5,8 @@
 - 权威开发工作树：`/home/win11/projects/miniDB`（WSL2 Ubuntu 24.04）
 - Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
-- 当前阶段：**R0-R3 已完成；R4-A 组提交实现、正式 G4 收益证据与 G5/G6 验证完成；G1-G7 PASS**
-- 当前测试清单：**338 项 CTest**（以最终六配置本地验证矩阵为准）
+- 当前阶段：**R0-R3、R4-A 已完成；R4-B 后台全量 checkpoint 已实现并通过本地六配置、故障注入和正式证据采集**
+- 当前测试清单：**348 项 CTest**（以 R4-B 的六配置本地验证矩阵为准）
 
 ## 1. 当前结论
 
@@ -19,16 +19,17 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 - 逻辑 WAL、CRC32C、严格递增 LSN 和 segment 轮转；
 - `SYNC` 与 `INTERVAL` 两种 durability 模式，默认 `SYNC`；
 - RDB v2 作为全量 checkpoint，不再承担每一笔写入的持久化承诺；
-- checkpoint manifest 原子记录 `checkpoint_lsn` 与保留的 WAL segment；
+- checkpoint manifest 原子记录 `checkpoint_lsn` 与从边界开始的完整 live WAL segment 集合；
 - 启动时 RDB + manifest + WAL 全量校验后一次性发布临时 Store；
 - 仅允许最后一个 WAL segment 的尾部半写截断，中间损坏拒绝启动；
 - `<rdb_path>.lock` 上的非阻塞 `flock` 单写者锁；
 - owner EventLoop 唯一 admission/apply/ack 点与专用 WAL writer thread；
 - 连续 LSN 合并为有界 batch，一次 data fsync 覆盖整批，不新增公开 durability mode；
 - 有界 admission queue、物理 batch 和 completion backlog，满时明确拒绝或 fail-stop；
-- SAVE、checkpoint 和 shutdown 通过 writer barrier 排空并只在目标 LSN apply 后发布 manifest；
+- SAVE、checkpoint 和 shutdown 使用两阶段短 barrier：capture 独立快照后恢复 writer，RDB 序列化与持久化在后台 worker 完成，最终 pause 后发布 manifest；
 - HTTP `/stats` 与 KV `STATS` 共享的持久化诊断快照；
 - R4-A 成功 append、data fsync、`SYNC` 持久化路径计时、固定 fsync 延迟桶和顶层 `group_commit` 指标；
+- R4-B checkpoint admission/capture/serialize/write/fsync/manifest/cleanup 分段指标及 `background_checkpoint_state`；
 - C01-C14 崩溃点、固定 seed 随机 `kill -9`、尾部/中间损坏和故障注入测试；
 - HTTP、KV、WAL record、checkpoint manifest 四个 fuzz target；
 - 18 种配置的 durability/客户端/负载可靠性 benchmark。
@@ -47,8 +48,8 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 | R2 崩溃一致性与恢复模型闭环 | DONE | C01-C14、随机 kill、故障注入、四个 fuzz target、进程级崩溃/恢复覆盖 |
 | R3 性能、恢复与公开证据 | DONE | 18 配置 × 5 轮 benchmark、恢复/暂停/RSS/写放大数据 |
 | R4-A 组提交 | DONE; G1-G7 PASS | ADR-006、writer/queue/batch/completion、异步协议、SAVE/shutdown barrier、338 项测试、完整质量门禁和正式 G4（5 轮，median QPS 2,858.989） |
-| R4-B 后台/增量 checkpoint | NOT STARTED | 需要独立证据和原子发布语义回归 |
-| R4-C MVCC/事务 | NOT STARTED | 独立阶段，不与 WAL 基线混合 |
+| R4-B 后台全量 checkpoint | DONE | ADR-007、两阶段 barrier、独立 snapshot capture、后台 RDB I/O、完整 live segment manifest、348 项测试和正式 artifact |
+| R4-C MVCC/事务 | NOT STARTED | 独立阶段，先以 ADR 冻结版本链、WAL 与 checkpoint barrier |
 
 ## 3. 新定位与范围
 
@@ -72,7 +73,8 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 - 多进程共享一个数据目录；
 - 生产 SLA、容量规划或高并发宣传；
 - 公开 `BATCHED` durability mode；组提交仅作为 `SYNC` 的内部优化；
-- 后台/增量 checkpoint、事务、MVCC 或多写者。
+- 自动周期 checkpoint、增量/COW checkpoint、多写者；R4-B 仅提供显式 SAVE/shutdown 的后台全量快照；
+- 事务、MVCC、隔离级别（R4-C 单独准入）。
 
 ## 4. 持久化语义
 
@@ -99,16 +101,19 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 
 ### 4.3 checkpoint 顺序
 
-1. 暂停新 mutation admission，并向 writer 发出 pause barrier；
+1. 暂停新 mutation admission，并向 writer 发出第一次 pause barrier；
 2. writer 排空此前已接受的连续记录，completion 回到 owner 按 LSN apply；
-3. 暂停 TTL scanner，flush 并 fsync WAL；
-4. 必要时轮转 active segment；
-5. 发布 RDB 快照；
-6. 原子发布 manifest；
-7. 清理旧 WAL 并 fsync WAL 目录；
-8. 成功后 resume，或进入 shutdown 的最终停止阶段。
+3. flush 并 fsync WAL，必要时轮转 active segment，得到 `checkpoint_lsn`；
+4. 在短 pause 内 capture 独立 `RdbSnapshot`，随后恢复 mutation admission；
+5. 后台 worker 完成 RDB serialize、临时文件写入、fsync、rename 和目录 fsync；
+6. 第二次暂停 admission，排空后台写期间进入 WAL 的新 mutation，并再次轮转；
+7. 收集从 `checkpoint_lsn + 1` 开始的完整 live segment 集合，原子发布 manifest；
+8. 清理边界前 WAL；cleanup 失败时保持 writer paused，下次 SAVE 重试；
+9. 成功后 resume，或进入 shutdown。
 
-任何快照或 manifest 的持久性不确定都会 fail-stop，并保留旧 WAL。
+capture 只复制 key/value/expiry，worker 不读取 live `KvStore`。任何快照或 manifest
+的持久性不确定都会 fail-stop，并保留旧 WAL；rename 后、manifest 前崩溃时旧
+manifest + 旧 WAL 仍是权威恢复输入。
 
 ### 4.4 恢复
 
@@ -142,11 +147,12 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 
 ## 6. 当前验证状态
 
-R4-A 组提交实现与本地质量门禁包括：
+R4-A 组提交与 R4-B 后台 checkpoint 的本地质量门禁包括：
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种配置；
-- 每个配置 **338 项 CTest**；
-- **24 个 `ProcessIntegrationTest.*` 进程级用例**，含 HTTP/KV 异步协议、客户端断开、shutdown 失败退出码；
+- 每个配置 **348 项 CTest**；
+- **25 个 `ProcessIntegrationTest.*` 进程级用例**，含后台 checkpoint、RDB rename 后/manifest 前崩溃、HTTP/KV 异步协议、客户端断开和 shutdown 失败退出码；
+- 后台 checkpoint 状态机、独立快照 capture、完整 live segment 保留、cleanup 失败重试和析构回调安全测试；
 - HTTP、KV、WAL record、checkpoint manifest 四个 fuzz target，各 20,000 runs，seed `20261111`；
 - clang-format dry-run、clang-tidy、`git diff --check`；
 - 18 配置 × 5 轮 R3 可靠性 benchmark，seed `20261111`；
@@ -161,8 +167,12 @@ R4-A 组提交实现与本地质量门禁包括：
   次成功、0 错误，平均 6.70 records/batch，queue rejection 与 writer failure
   均为 0，判定 PASS；
 - 远程 CI：R0-R3 基线 `cfbda60` 的 GitHub Actions 9/9 通过；R4-A 实现提交
-  `a06d7c2` 的 GitHub Actions run `43006353520` 同样 9/9 通过；G4 证据提交
+  `a06d7c2` 的 GitHub Actions run `43006353520` 同样 9/9 通过；R4-B 证据提交
   发布后必须在其自身 commit 上重新全绿，最终状态以该 commit 的 checks 为准；
+- R4-B 正式 benchmark 在 clean HEAD `fbfd6a6` 上采集：主 benchmark 5 轮、32
+  clients、`SYNC`、100% write，34,916/34,916 成功、0 错误，median QPS
+  3,526.336；checkpoint probe 5 轮 SAVE 全部成功、0 checkpoint failure，总耗时
+  中位数 387,509 us；显式 backpressure 233 次，不是已确认写丢失；
 - 本地证据不替代远程 CI，也不构成生产验收。
 
 正式 benchmark 原始数据：
@@ -192,6 +202,15 @@ sha256: 0ecf064ed9d7b70971188199abbc1194d974659e5ffa3ac24908b7ca9e8f8f7e
 git_head: a06d7c2f3e0be7fc7da1217c3c6f4c6f04fc3128
 working_tree_dirty_at_collection: false
 ci_run: 43006353520 (9/9 success)
+
+R4-B: bench/results/r4b-background-checkpoint-20261111.json
+bytes: 43,519
+sha256: d562809738df883e6bf9b9bf317569ab9aa66b8cfb7c72b2e5a8cbaec2ba6aa4
+git_head: fbfd6a6667285dd24448c6fa6df7dd1a73790119
+working_tree_dirty_at_collection: false
+harness_sha256: e2672c0fcb38adf9d462849b6c2592baeb5ec5f3a4c3f88ba8c5e60a7e70f0b0
+binary_sha256: 295434e3fe00d06f9644a7530edf7b14d0b557a59602a9ff0648949c9e539909
+schema: minidb-reliability-benchmark-v3
 ~~~
 
 以下为历史 R3 artifact 的汇总；R3 数据采集自未提交工作树，环境为 WSL2 同机
@@ -225,7 +244,8 @@ R4-A v2 clean baseline 则为 4.63x。吞吐和延迟改善伴随更高的 clien
 ## 7. 已知限制
 
 - durability 结论只覆盖进程崩溃；未证明掉电、内核崩溃、设备缓存或介质故障。
-- checkpoint 是 stop-the-world，会暂停 owner loop；未实现后台/增量 checkpoint。
+- SAVE/shutdown 的 RDB serialize/write/fsync 在后台执行，但仍需两次短 admission pause 和一次 O(records) snapshot capture；capture 仍会暂停 owner，不是零停顿。
+- 未实现自动周期 checkpoint、增量/COW checkpoint；同一时间只允许一个控制操作。
 - `INTERVAL` 最近一个 flush 窗口内的已确认写可能丢失。
 - 只有单机单写者；`flock` 是 advisory lock，不能阻止第三方直接修改文件。
 - 32 连接上限保持不变；benchmark 的 32-client 配置是边界，不是扩展性结论。
@@ -257,17 +277,19 @@ R4-A v2 clean baseline 则为 4.63x。吞吐和延迟改善伴随更高的 clien
 - [Fuzz targets](../fuzz/README.md)
 - [阶段 A-H 历史验收报告](A_H_ACCEPTANCE_REPORT.md)
 - [ADR-005：R4-A 组提交候选设计与证据门槛](decisions/005-group-commit.md)
+- [ADR-006：R4-A 组提交实现](decisions/006-group-commit-implementation.md)
+- [ADR-007：R4-B 后台全量 checkpoint](decisions/007-background-checkpoint.md)
 
 ## 9. 后续工作
 
-R4-A 已关闭：实现、G1-G7、G4 artifact 和最终证据 CI 均已完成。
+R4-A 和 R4-B 已关闭：实现、本地门禁、正式 artifact、文档和发布门禁均已闭环。
 
-1. R4-B（后台/增量 checkpoint）仍保持 evidence-gated；启动前必须用 G4 的
-   checkpoint pause 中位数 14,587 us 和实际负载证明 stop-the-world 成本不可接受，
-   并单独写 ADR；
-2. R4-C（MVCC/事务）保持独立阶段，不与 WAL/checkpoint 基线混合；
-3. 任何后续 R4 工作都必须重新通过 TSan、崩溃矩阵、fuzz 和资源上限验证，不能
-   牺牲“确认写不丢、恢复失败不发布部分 Store”的语义。
+1. R4-B 的最终证据提交必须先在自身 `main` HEAD 上通过 GitHub Actions 9/9；
+2. R4-C（MVCC/事务）是独立阶段：先写 ADR，只提交 ADR 并等待 9/9，之后才写实现；
+3. R4-C 实现必须重新通过 TSan、崩溃矩阵、fuzz 和资源上限验证，不能牺牲
+   “确认写不丢、恢复失败不发布部分 Store”的语义；
+4. R4-D（AI Agent 持久状态后端）同样先写 ADR、提交并等待 9/9，之后才实现；
+5. 许可证保持最后处理。
 
-> 注：上面的“最终证据 CI 均已完成”以本次 G4 文档提交后 `main` 的 GitHub
-> Actions 9/9 结果为准；提交前不得把该行当作已经发生的事实。
+> 注：R4-B 文档提交前，上面的远程 CI 9/9 尚未发生；必须以该提交自身的 checks
+> 为准，不能用实现提交 `fbfd6a6` 的结果替代。

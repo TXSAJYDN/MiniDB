@@ -112,8 +112,9 @@ manifest_size = 24 + 8 * retained_count + 4
   manifest 形态。
 - 非空时，第一个 retained start 必须等于 `checkpoint_lsn + 1`。
 - manifest 引用的每个 segment 必须在恢复时存在。
-- 当前 checkpoint 只保留一个 active segment；恢复仍支持多个 retained starts，
-  以便格式和未来扩展。
+- manifest 保存从 `checkpoint_lsn + 1` 开始的完整 live segment 集合，而不是
+  只保存一个 active segment；后台 checkpoint 在 worker 写 RDB 期间允许继续
+  admission，因此最终发布边界可能跨过多个 segment。
 - 恢复会扫描第一个 retained start 之后的**所有** segment，包括 manifest 发布后
   才轮转出来的更新 segment。
 

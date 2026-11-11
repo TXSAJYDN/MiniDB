@@ -6,7 +6,7 @@ MiniDB keeps four complementary benchmark harnesses:
   to validate the measurement plumbing;
 - `bench/run_reliability_benchmark.py` is the R0-R3 durability, concurrency,
   SIGKILL recovery, and checkpoint-pause harness, the R4-A v2 baseline
-  collector, and the formal clean-HEAD G4 benefit harness;
+  collector, the formal clean-HEAD G4 benefit harness, and the R4-B v3 checkpoint-probe/evidence harness;
 - `bench/run_r4a_batch_formation.py` is the external, non-production R4-A G3
   batch-formation experiment;
 - `bench/run_acceptance_benchmark.py` is the historical Stage H timed harness,
@@ -16,9 +16,10 @@ None of these harnesses is a saturation, capacity, open-loop, or
 production-SLA test. The R3 reliability benchmark supports current durability
 claims; the R4-A v2 baseline supports the diagnostic timing evidence used by
 ADR-005; the G3 harness observed external pending-request overlap around real
-WAL data fsyncs without changing the production write path; and the clean-HEAD
-G4 run measures the implemented bounded group-commit path in one frozen
-configuration. Stage H numbers are historical background.
+WAL data fsyncs without changing the production write path; the clean-HEAD G4
+run measures the implemented bounded group-commit path in one frozen
+configuration; and the v3 run adds the concurrent-writer checkpoint probe used
+by ADR-007. Stage H numbers are historical background.
 
 ## Reliability benchmark suite
 
@@ -63,9 +64,10 @@ python3 bench/run_reliability_benchmark.py \
 
 ### R4-A instrumentation baseline (v2)
 
-The current harness emits schema `minidb-reliability-benchmark-v2`. Its default
-artifact is `bench/results/reliability-20261111-r4a-baseline.json`; it must not
-overwrite the R3 artifact. The v2 schema adds:
+The R4-A-era harness emitted schema `minidb-reliability-benchmark-v2`. Its retained
+default artifact is `bench/results/reliability-20261111-r4a-baseline.json`; it must
+not overwrite the R3 artifact. The current harness emits v3, described below.
+The v2 schema added:
 
 - measured-window deltas for successful WAL append, WAL data-fsync, and
   `SYNC` persistence-path totals;
@@ -267,6 +269,78 @@ per client. It is not open-loop saturation capacity evidence and does not
 generalize beyond the measured 32-client configuration. Every `SYNC`
 acknowledgement still waited for the data fsync covering its LSN.
 
+### R4-B v3 background-checkpoint evidence
+
+Schema minidb-reliability-benchmark-v3 keeps the v2 timing and group-commit
+fields and adds:
+
+- a checkpoint probe that preloads a larger dataset, starts competing writers,
+  and issues five SAVE operations;
+- per-phase checkpoint timings for admission blocked, snapshot capture,
+  serialize, temporary-file write, RDB fsync, manifest publication, WAL
+  cleanup, and total duration;
+- client-observed SAVE latency, checkpoint failure count, and the
+  background-checkpoint state after each round;
+- probe reconciliation data: writer successes, explicit writer errors, and
+  client command intervals overlapping the SAVE response window.
+
+The retained formal artifact is:
+
+- bench/results/r4b-background-checkpoint-20261111.json
+- 43,519 bytes
+- SHA-256
+  d562809738df883e6bf9b9bf317569ab9aa66b8cfb7c72b2e5a8cbaec2ba6aa4
+- clean source HEAD fbfd6a6667285dd24448c6fa6df7dd1a73790119
+- harness SHA-256
+  e2672c0fcb38adf9d462849b6c2592baeb5ec5f3a4c3f88ba8c5e60a7e70f0b0
+- KV binary SHA-256
+  295434e3fe00d06f9644a7530edf7b14d0b557a59602a9ff0648949c9e539909
+
+The primary benchmark is 32 clients, SYNC, 100% writes, five rounds of two
+seconds, 128 keys, and 64-byte values. It recorded 34,916/34,916 successful
+requests, zero errors, median QPS 3,526.336, and pooled P50/P99/P999
+8,794.040/17,403.269/21,444.012 us.
+
+The checkpoint probe uses 22,000 records, 768-byte values, 16 writers, and five
+rounds. It recorded 10,467 writer successes, 233 explicit ERROR 100
+backpressure responses, zero checkpoint failures, and background state idle
+after every round.
+
+| Checkpoint phase | Median us |
+|---|---:|
+| SAVE client latency | 391,583.697 |
+| Admission blocked | 27,193 |
+| Snapshot capture | 13,207 |
+| Snapshot serialize | 331,836 |
+| Temporary RDB write | 13,373 |
+| RDB fsync | 11,553 |
+| Manifest publish | 3,639 |
+| WAL cleanup | 4,383 |
+| Checkpoint total | 387,509 |
+
+Maximum checkpoint total was 447,473 us. The in_flight_during_save field counts
+client command intervals overlapping the SAVE response interval, not a strict
+admission-block count. The 233 rejected writes are explicit backpressure, not
+acknowledged writes that disappeared. The probe is a synthetic workload and
+does not prove a capacity limit, production SLA, power-loss durability, or a
+bounded SAVE time for arbitrary datasets.
+
+Reproduce on a clean Release build with a new output path:
+
+~~~bash
+python3 bench/run_reliability_benchmark.py \
+  --kv build/ci-release/app/minidb_kv_server \
+  --rounds 5 --duration-seconds 2 --dataset-keys 128 --value-size 64 \
+  --seed 20261111 --modes sync --clients 32 --workloads write \
+  --checkpoint-probe-keys 22000 --checkpoint-probe-value-size 768 \
+  --checkpoint-probe-writers 16 --checkpoint-probe-rounds 5 \
+  --out /tmp/r4b-background-checkpoint-reproduction.json
+~~~
+
+The exact option names and schema are defined by the checked-in harness and its
+self-test; always verify the output provenance and digest instead of trusting a
+filename.
+
 ## Historical Stage H harness
 
 For HTTP and KV the timed harness:
@@ -370,8 +444,8 @@ ceiling.
 
 ## Interpretation limits
 
-These limits apply to both the historical Stage H harness and the current R3
-reliability benchmark. The R3 artifact additionally states its own limits.
+These limits apply to the historical Stage H harness and the reliability
+benchmark suite. Each retained artifact additionally states its own limits.
 
 - WSL2 virtualizes networking and shares host scheduling with other workloads.
 - Client and server compete for the same CPU, and Python client parsing is

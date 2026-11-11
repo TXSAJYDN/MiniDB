@@ -1,6 +1,6 @@
 # ADR-007：R4-B 后台全量 checkpoint
 
-- 状态：Accepted，实现与本地验证进行中
+- 状态：Accepted — 实现完成，本地六配置、故障注入、fuzz、格式和静态分析通过；正式证据 CI 以本提交后的 `main` 检查为准
 - 日期：2026-11-11
 - 关联：`docs/MiniDB-可靠性与持久化升级计划书.md`、`docs/crash-consistency.md`、`docs/recovery.md`、`docs/wal-format.md`
 - 决策范围：R4-B 的 checkpoint 执行模型、发布边界、失败语义和观测契约
@@ -250,3 +250,73 @@ serialize 若直接遍历 live store，必须长时间持有 scanner pause，等
 - HTTP `/stats` 和 KV `STATS` contract 覆盖全部新字段；
 - 现有 C01-C14 崩溃矩阵、四个 fuzz target、sanitizer、TSan、格式和静态分析
   全部通过。
+
+## 实现结果与证据（2026-11-11）
+
+实现提交 `fbfd6a6`（`feat: implement background R4-B checkpoint`）已完成：
+
+- 两阶段 pause/drain/rotate、capture 后恢复 writer、后台
+  serialize/write/fsync/rename，以及最终 pause + manifest + cleanup；
+- capture 使用独立 `RdbSnapshot`，worker 不再读取或暂停 live `KvStore`；
+- manifest 保留从 `checkpoint_lsn + 1` 开始的完整 live segment 集合；
+- cleanup 失败保留 writer paused，下一次 SAVE 重试，不把 residue 当作快照失败；
+- manager 析构后的残留 callback 安全 no-op；
+- checkpoint/shutdown 仍作为单控制操作互斥；
+- 新增 RDB rename 后、manifest 前崩溃的进程测试；
+- HTTP `GET /stats` 与 KV `STATS` 暴露 ADR 中规定的全部 checkpoint 字段和
+  `background_checkpoint_state`。
+
+本地门禁在修复 TSan 发现的锁序倒置后全部通过：
+
+| 配置 | 结果 |
+|---|---:|
+| Debug | 348/348 |
+| Release | 348/348 |
+| ASan | 348/348 |
+| UBSan | 348/348 |
+| ASan + UBSan | 348/348 |
+| TSan (`setarch x86_64 -R`) | 348/348 |
+
+进程级用例为 25 项；四个 fuzz target 各运行 20,000 次；clang-format、
+clang-tidy 和 `git diff --check` 通过。测试数量从 R4-A 的 338 增至 348，
+新增的主要是后台 checkpoint 状态机、manifest/live-segment、cleanup 重试、
+回调生命周期和进程崩溃测试。
+
+正式 benchmark artifact：
+
+- `bench/results/r4b-background-checkpoint-20261111.json`
+- 43,519 bytes
+- SHA-256 `d562809738df883e6bf9b9bf317569ab9aa66b8cfb7c72b2e5a8cbaec2ba6aa4`
+- clean HEAD `fbfd6a6667285dd24448c6fa6df7dd1a73790119`
+- harness SHA-256 `e2672c0fcb38adf9d462849b6c2592baeb5ec5f3a4c3f88ba8c5e60a7e70f0b0`
+- KV binary SHA-256 `295434e3fe00d06f9644a7530edf7b14d0b557a59602a9ff0648949c9e539909`
+- schema `minidb-reliability-benchmark-v3`
+
+主 benchmark 为 32 clients、`SYNC`、100% write、5 轮、每轮 2 秒：
+34,916/34,916 成功、0 错误；median QPS 3,526.336；pooled P50/P99/P999
+为 8,794.040 / 17,403.269 / 21,444.012 us；recovery median 0.043122 s；
+data fsyncs per `SYNC` mutation 0.157958；平均每 batch 6.330813 records。
+
+checkpoint probe 使用 22,000 records、768 B values、16 writers、5 轮：
+
+| 指标 | Median |
+|---|---:|
+| SAVE client latency | 391,583.697 us |
+| admission blocked | 27,193 us |
+| snapshot capture | 13,207 us |
+| snapshot serialize | 331,836 us |
+| temporary RDB write | 13,373 us |
+| RDB fsync | 11,553 us |
+| manifest | 3,639 us |
+| WAL cleanup | 4,383 us |
+| checkpoint total | 387,509 us |
+
+checkpoint failures 为 0，每轮结束后状态均为 `idle`；最大 checkpoint total
+为 447,473 us。probe 的 233 个 `SET returned 100` 是并发 writer 在资源压力下
+收到的显式 backpressure/error，不是已确认写丢失；
+`in_flight_during_save` 统计的是客户端命令区间与 SAVE 响应区间重叠，不是严格的
+admission-block 计数。主 benchmark 为 0 错误。数据只来自 WSL2 同机 loopback
+closed-loop，不是容量、生产 SLA 或掉电一致性证据。
+
+CI 结果：本证据文档提交后必须在其自身 `main` HEAD 上通过 GitHub Actions
+9/9；该检查是发布门禁，不能用前序提交的结果替代。

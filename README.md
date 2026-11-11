@@ -22,7 +22,8 @@ MiniDB 是可靠性工程原型，**不宣称生产可用**，不宣称 Redis/SQ
 - owner EventLoop 负责校验、排序、内存 apply 和协议响应，专用 writer thread 独占 WAL append/fsync；
 - 连续 WAL 记录由 writer 合并为有界 batch，一次 data fsync 覆盖整批；`SYNC` 的响应仍严格晚于覆盖该 LSN 的 fsync；
 - RDB 是全量 checkpoint，不再承担每一次写入的持久化承诺；
-- manifest 原子记录 `checkpoint_lsn` 和必须保留的 WAL segment；
+- manifest 原子记录 `checkpoint_lsn` 和必须保留的完整 WAL segment 集合；
+- SAVE/shutdown 采用两阶段短 barrier：先在 pause 内 capture 独立快照并恢复 writer，RDB 序列化、写入、fsync 和 rename 在后台 worker 完成，最终再次短暂 pause 发布 manifest；
 - 启动时先构建临时恢复镜像，RDB、manifest 和 WAL 全部验证通过后才发布 Store；
 - WAL 尾部半写可截断到最后合法记录，中间损坏、LSN 断层或缺失 segment 拒绝启动；
 - TTL 在 WAL 中保存绝对 Unix 毫秒 deadline，重启不会重新延长 TTL；
@@ -144,7 +145,7 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 
 - durability mode、last/next LSN、当前 WAL 字节数和 segment 数；
 - mutation、fsync、checkpoint、interval flush 计数；
-- checkpoint 暂停时间；
+- checkpoint admission pause、snapshot capture/serialize/write/fsync、manifest、WAL cleanup 分段耗时，以及 `background_checkpoint_state`；
 - WAL append、rotation、segment 清理和目录 fsync 计数；
 - 成功 append、data fsync 与 `SYNC` 持久化路径的累计/最大耗时，以及固定 fsync 延迟桶；
 - 顶层 `group_commit` 对象：queue/backlog 高水位、拒绝数、batch 数量与大小分布、data fsync 数、writer 各阶段耗时、失败计数和 writer 状态；
@@ -157,11 +158,12 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 
 ## 验证状态
 
-R4-A 组提交实现、本地质量门禁和正式 G4 收益证据均已完成：
+R4-A 组提交和 R4-B 后台全量 checkpoint 已实现，本地质量门禁及正式收益/延迟证据已完成：
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种构建配置；
-- 每个配置 **338 项 CTest**，包含 24 个 `ProcessIntegrationTest.*` 进程级用例；
+- 每个配置 **348 项 CTest**，包含 25 个 `ProcessIntegrationTest.*` 进程级用例；
 - 组提交 writer 的顺序、batch 上限、queue/backlog full、append/fsync 失败、cleanup barrier、fail-stop 和 callback 恰好一次测试；
+- 后台 checkpoint 状态机、完整 live segment 保留、cleanup 失败重试、manager 析构回调安全，以及 rename 后/manifest 前崩溃恢复测试；
 - HTTP/KV 异步 mutation、断开连接安全、流水线响应顺序、SAVE/STATS 和 shutdown 失败退出码测试；
 - HTTP、KV、WAL record、manifest 四个固定 seed fuzz target；
 - clang-format、clang-tidy 和 `git diff --check`；
@@ -179,9 +181,15 @@ R4-A 组提交实现、本地质量门禁和正式 G4 收益证据均已完成�
   4,836 KiB、WAL 写放大 1.527778、恢复时间中位数 0.044825 s；完整原始
   artifact、逐轮数据和限制见 [可靠性证据](docs/reliability-evidence.md)。
 
-具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。实现提交
-`a06d7c2` 已通过 9/9 GitHub Actions；G4 证据提交必须在最终 `main` HEAD 上再次
-通过完整 CI，最终结果以该 commit 的 checks 为准。本地门禁不替代 GitHub Actions。
+R4-B 在 clean HEAD `fbfd6a6` 上采集了正式 artifact：32 clients、`SYNC`、100% write
+的 5 轮主 benchmark 完成 34,916/34,916 次请求、0 错误，median QPS 3,526.336；
+checkpoint probe 的 5 轮 SAVE 全部成功，checkpoint failure 为 0，checkpoint total
+中位数为 387,509 us，其中 serialize 中位数 331,836 us。probe 同时出现 233 个显式
+backpressure `ERROR 100`，不是已确认写丢失；详细限制、逐项延迟和 artifact digest
+见 [可靠性证据](docs/reliability-evidence.md)。
+
+具体数字、限制和证据见 [可靠性证据](docs/reliability-evidence.md)。R4-B 文档提交
+仍必须在自身 `main` HEAD 上通过完整 9/9 GitHub Actions；本地门禁不替代远程 CI。
 G3 的 pending 计数是批处理机会上界，不是服务器队列已有记录的证据。
 
 ## 明确的非目标
@@ -194,7 +202,8 @@ G3 的 pending 计数是批处理机会上界，不是服务器队列已有记�
 - 不承诺生产 SLA、容量规划或高并发表现；
 - 不覆盖多进程共享数据目录、掉电一致性或设备故障证明；
 - 不提供公开 `BATCHED` durability mode；组提交只作为 `SYNC` 的内部优化存在；
-- R4-A 不包含后台/增量 checkpoint、事务、MVCC 或多写者。
+- 不提供自动周期 checkpoint、增量/COW checkpoint、事务或 MVCC；R4-B 的显式 SAVE/shutdown 使用后台全量快照；
+- 不提供多写者。
 
 ## 文档
 
@@ -213,4 +222,5 @@ G3 的 pending 计数是批处理机会上界，不是服务器队列已有记�
 - [Fuzz targets](fuzz/README.md)
 - [ADR-005：R4-A 组提交候选设计与证据门槛](docs/decisions/005-group-commit.md)
 - [ADR-006：R4-A 组提交实现](docs/decisions/006-group-commit-implementation.md)
+- [ADR-007：R4-B 后台全量 checkpoint](docs/decisions/007-background-checkpoint.md)
 - [架构决策记录](docs/decisions/)

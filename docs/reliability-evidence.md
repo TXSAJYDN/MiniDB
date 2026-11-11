@@ -3,9 +3,10 @@
 ## Scope
 
 This document records the R0-R3 baseline, the R4-A instrumentation and G3
-batch-formation experiments, and the implemented group-commit validation for
-MiniDB's crash-consistent persistence work. It is deliberately a statement
-about a tested engineering prototype, not a production qualification.
+batch-formation experiments, the implemented group-commit validation, and the
+R4-B background full-checkpoint validation for MiniDB's crash-consistent
+persistence work. It is deliberately a statement about a tested engineering
+prototype, not a production qualification.
 
 The evidence covers:
 
@@ -17,6 +18,8 @@ The evidence covers:
   top-level group-commit metrics contract;
 - an external batch-formation opportunity experiment, the implemented bounded
   group-commit writer, and its clean-HEAD G4 benefit run;
+- the implemented two-phase background checkpoint, its phase timings under a
+  concurrent-writer probe, and its clean-HEAD formal artifact;
 - explicit limits and non-claims.
 
 ## Source and environment
@@ -39,19 +42,19 @@ is about that baseline commit, not a claim about every later commit.
 
 ## Test matrix
 
-The local matrix for R4-A runs each configuration from its own CMake build
+The local matrix for R4-B runs each configuration from its own CMake build
 directory:
 
 | Configuration | CTest |
 |---|---:|
-| Debug | 338/338 |
-| Release | 338/338 |
-| ASan | 338/338 |
-| UBSan | 338/338 |
-| ASan + UBSan | 338/338 |
-| TSan (`setarch x86_64 -R`) | 338/338 |
+| Debug | 348/348 |
+| Release | 348/348 |
+| ASan | 348/348 |
+| UBSan | 348/348 |
+| ASan + UBSan | 348/348 |
+| TSan (`setarch x86_64 -R`) | 348/348 |
 
-Each configuration includes the 24 `ProcessIntegrationTest.*` cases:
+Each configuration includes the 25 `ProcessIntegrationTest.*` cases. The R4-A historical matrix was 338 tests and 24 process cases.
 
 ~~~text
 CliContract
@@ -65,6 +68,7 @@ ShutdownFailureExit
 HttpSyncCrashRecovery
 KvSyncCrashRecovery
 IntervalFlushRecovery
+BackgroundCheckpointRenameCrash
 WriterLockConflict
 WalTailTruncation
 ManifestCorruption
@@ -94,12 +98,15 @@ The unit and integration inventory also includes:
   failure, cleanup barriers, and writer stop/drain;
 - HTTP/KV asynchronous mutation and disconnect no-op behavior, pipelined
   response ordering, SAVE/checkpoint barriers, and shutdown failure exit codes;
+- background-checkpoint state transitions, independent snapshot capture,
+  complete live WAL-segment retention, cleanup retry, manager-destruction
+  callback safety, and crash recovery between RDB rename and manifest publish;
 - C01-C14 deterministic crash points.
 
 This is local reproducibility evidence. It is not a substitute for a public CI
 run. The R0-R3 baseline commit `cfbda60` and the R4-A implementation commit
-`a06d7c2` both passed 9/9 GitHub Actions jobs. The final G4 evidence commit must
-pass its own full CI run; status must be read from the GitHub checks for that
+`a06d7c2` both passed 9/9 GitHub Actions jobs. The R4-A G4 evidence commit and
+the R4-B evidence commit must each pass their own full CI run; status must be read from the GitHub checks for that
 commit, not inherited from an earlier one.
 
 ## Fuzz evidence
@@ -220,6 +227,78 @@ See [ADR-005](decisions/005-group-commit.md) for candidate boundaries and
 [ADR-006](decisions/006-group-commit-implementation.md) for the implementation.
 The absence of a public `BATCHED` mode is intentional: group commit is an
 internal `SYNC` optimization.
+
+## R4-B background full-checkpoint evidence
+
+R4-B removes RDB serialization and durable I/O from the long owner-loop
+checkpoint section. A successful SAVE has two short admission cuts: the first
+drains accepted mutations, rotates/flushes the WAL, and captures an independent
+RdbSnapshot; normal admission then resumes while the checkpoint worker
+serializes, writes, fsyncs, renames, and directory-fsyncs the RDB. The final cut
+drains writes admitted during that work, publishes a manifest containing the
+complete live WAL-segment set beginning at checkpoint_lsn + 1, and schedules
+prefix cleanup. Snapshot capture remains O(records) and runs while admission is
+paused; this is not a zero-pause design.
+
+### Formal artifact
+
+- bench/results/r4b-background-checkpoint-20261111.json
+- 43,519 bytes
+- SHA-256
+  d562809738df883e6bf9b9bf317569ab9aa66b8cfb7c72b2e5a8cbaec2ba6aa4
+- clean source HEAD fbfd6a6667285dd24448c6fa6df7dd1a73790119
+- working_tree_dirty_at_collection=false
+- harness SHA-256
+  e2672c0fcb38adf9d462849b6c2592baeb5ec5f3a4c3f88ba8c5e60a7e70f0b0
+- KV binary SHA-256
+  295434e3fe00d06f9644a7530edf7b14d0b557a59602a9ff0648949c9e539909
+- schema minidb-reliability-benchmark-v3
+
+The retained primary benchmark used 32 closed-loop clients, SYNC, 100%
+writes, five rounds of two seconds, 128 keys, and 64-byte values. It recorded
+34,916/34,916 successful requests and zero errors. Median QPS was
+3,526.336. Pooled P50/P99/P999 latency was
+8,794.040/17,403.269/21,444.012 us. Recovery median was 0.043122 s,
+data fsyncs per successful SYNC mutation were 0.157958, and the mean batch
+size was 6.330813 records. Server RSS peaked at 4,836 KiB.
+
+The checkpoint probe preloaded 22,000 keys with 768-byte values and then ran
+five SAVE rounds with 16 competing writers. Writers completed 10,467 requests
+and received 233 explicit ERROR 100 backpressure responses. All five
+checkpoints succeeded, checkpoint_failures was zero, and the state after each
+SAVE was idle.
+
+| Checkpoint phase | Median us |
+|---|---:|
+| SAVE client latency | 391,583.697 |
+| Admission blocked | 27,193 |
+| Snapshot capture | 13,207 |
+| Snapshot serialize | 331,836 |
+| Temporary RDB write | 13,373 |
+| RDB fsync | 11,553 |
+| Manifest publish | 3,639 |
+| WAL cleanup | 4,383 |
+| Checkpoint total | 387,509 |
+
+Maximum observed checkpoint total was 447,473 us. The large SAVE duration is
+dominated by snapshot serialization, but that work is outside admission-blocked
+time. These phase counters use monotonic time from the first admission cut to
+completion; barrier scheduling, wakeups, completion delivery, and network
+response work need not sum exactly to the end-to-end value.
+
+Limits specific to this probe:
+
+- in_flight_during_save counts client command intervals overlapping the SAVE
+  response interval; it is not a strict count of requests blocked by admission.
+- The 233 SET returned 100 responses are explicit backpressure/errors, not
+  confirmed writes that later disappeared. The primary benchmark recorded zero
+  errors.
+- The probe uses a synthetic 22,000-record dataset and is not a capacity or SLA
+  result.
+- The evidence covers process crash consistency, not power loss, kernel crash,
+  storage-cache violations, or media corruption.
+- It does not establish automatic checkpointing, incremental/COW checkpointing,
+  multi-writer operation, or bounded SAVE latency for arbitrary datasets.
 
 ## R4-A G3 batch-formation experiment
 
@@ -431,8 +510,8 @@ Total successful requests: 340,240. Total errors: 0. Wall-clock collection time:
   boundary observation, not evidence of scaling beyond 32 clients.
 - Recovery times here are for small datasets and one quiescent crash point per
   round. They are not a worst-case recovery bound.
-- Checkpoint pause is stop-the-world owner-loop time; no background checkpoint
-  exists.
+- At the time of the historical R3 run, checkpoint pause was stop-the-world
+  owner-loop time; R4-B introduced the background checkpoint later.
 
 ## What the evidence does not prove
 

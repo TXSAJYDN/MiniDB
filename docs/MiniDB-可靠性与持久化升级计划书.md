@@ -1,6 +1,6 @@
 # MiniDB 可靠性与持久化升级计划书
 
-> 文档状态：`R0-R3 Completed / R4-A Completed / G1-G7 PASS`
+> 文档状态：`R0-R3 Completed / R4-A Completed / R4-B Completed / R4-C Next`
 >
 > 编写日期：2026-11-10（Asia/Shanghai）
 >
@@ -10,10 +10,11 @@
 >
 > 最近历史功能验收基线：`9da4b48`（阶段 A-H 技术验收 PASS）
 >
-> 计划性质：R0-R3 已按本文完成实现并通过本地验证；R4-A 已完成 ADR-005、
-> 诊断指标、clean v2 baseline、独立 G3 batch formation 实验、ADR-006 实现和
-> clean-HEAD G4 收益验证，G1-G7 PASS。组提交作为 `SYNC` 的内部优化落地，
-> 不暴露新的 durability mode。其他 R4 路线仍是证据驱动的可选项。
+> 计划性质：R0-R3、R4-A 和 R4-B 已按本文完成实现并通过本地验证；R4-A 的
+> ADR-005、诊断指标、G3 和 clean-HEAD G4，以及 R4-B 的 ADR-007、两阶段
+> checkpoint、正式 artifact 和本地六配置门禁均已记录。R4-C/R4-D 仍需遵守
+> “先 ADR、后实现、每阶段独立 CI”的准入顺序。所有远程 CI 结论只引用对应
+> `main` HEAD 的实际检查。
 >
 > 推进方式：按技术依赖和验收门槛推进，不设置固定总工期或强制周计划。阶段状态、证据链接、已知限制和下一步准入条件随实现同步更新。
 >
@@ -33,6 +34,7 @@
 - [可靠性证据](reliability-evidence.md)
 - [ADR-005：R4-A 组提交候选设计与证据门槛](decisions/005-group-commit.md)
 - [ADR-006：R4-A 组提交实现](decisions/006-group-commit-implementation.md)
+- [ADR-007：R4-B 后台全量 checkpoint](decisions/007-background-checkpoint.md)
 
 ## 目录
 
@@ -118,7 +120,7 @@ R0 重新定位与证据规范
 | 持久化 | RDB v2 全量快照、CRC32C、临时文件、fsync、原子 rename、目录 fsync | 工程质量强，但只有全量快照 |
 | 恢复 | 启动时加载最近一次 RDB；损坏时拒绝发布 | 没有基于 WAL 的崩溃恢复 |
 | 资源边界 | 32 连接、每连接 1.25 MiB 输入/输出预算、64 MiB RDB 上限 | 已有“有界资源”的雏形，应上升为项目命题 |
-| 测试 | 计划立项时历史基线为六配置各 214/214 CTest；R0-R3 为六配置各 305/305；R4-A 为六配置各 338/338，含 24 个进程用例和四个 20,000-run fuzz target | 已形成可复现的工程证据 |
+| 测试 | 计划立项时历史基线为六配置各 214/214 CTest；R0-R3 为六配置各 305/305；R4-A 为六配置各 338/338；R4-B 为六配置各 348/348，含 25 个进程用例和四个 20,000-run fuzz target | 已形成可复现的工程证据 |
 | 故障注入 | RDB EINTR、短写、ENOSPC、open/fsync/close/rename/dir-fsync 等 | 可复用为 WAL 崩溃矩阵的基础 |
 | 性能 | HTTP 约 1,782 req/s、KV 约 1,968 req/s，单连接、单 in-flight、closed-loop | 只能作为基线，不能作为容量或生产 SLA 结论 |
 | 主要缺口 | 无 WAL/AOF；无 ack 后崩溃一致性；SAVE stop-the-world；无事务、复制、多进程所有权 | 缺少一个真正硬的存储可靠性闭环 |
@@ -846,18 +848,34 @@ durability/客户端数/负载矩阵，seed 为 `20261111`。原始数据保存�
 - [x] G4：在 clean HEAD `a06d7c2` 上用相同环境、数据集和 5 轮实验验证 32 客户端 write；median QPS 2,858.989，相对 418.018 提升 6.84x，PASS；
 - [x] 将 G4 artifact、限制和 digest 写回 ADR-005、ADR-006、证据文档与项目状态，完成 G7；最终证据提交以自身 `main` HEAD 的完整 CI 为发布门禁。
 
-**R4-B：后台/增量 checkpoint**
+**R4-B：后台全量 checkpoint（已完成）**
 
-- [ ] 只有在 checkpoint 停顿被证明不可接受时实施；
-- [ ] 先比较 background snapshot、copy-on-write 和增量 checkpoint 的复杂度；
-- [ ] 不得牺牲当前原子发布语义。
+实施状态（2026-11-11）：[ADR-007](decisions/007-background-checkpoint.md) 已冻结
+两阶段 admission cut、独立 snapshot、完整 live WAL segment manifest、worker
+I/O、cleanup 重试和失败语义。实现提交 `fbfd6a6` 的本地六配置各 348/348 项
+CTest、25 个进程用例、TSan、sanitizer、四个 20,000-run fuzz target、格式和
+静态分析通过。正式 artifact
+`bench/results/r4b-background-checkpoint-20261111.json`（43,519 bytes，SHA-256
+`d562809738df883e6bf9b9bf317569ab9aa66b8cfb7c72b2e5a8cbaec2ba6aa4`）采集于
+clean HEAD `fbfd6a6`。主 benchmark 5 轮、32 clients `SYNC` write 完成
+34,916/34,916 次请求、0 错误，median QPS 3,526.336；checkpoint probe 5 轮
+SAVE 全部成功、0 failure，checkpoint total 中位数 387,509 us，serialize 中位数
+331,836 us。probe 的 233 个 `ERROR 100` 是显式 backpressure，不是已确认写丢失；
+指标不能证明容量、掉电一致性或任意数据集的 SAVE 延迟上界。
 
-**R4-C：MVCC/事务**
+- [x] 比较 background snapshot、copy-on-write 和增量 checkpoint 的边界；
+- [x] 采用后台全量 snapshot，保留两阶段短 admission cut；
+- [x] 保证 manifest 记录完整 live segment 集合和原子发布顺序；
+- [x] 覆盖 rename 后/manifest 前崩溃、cleanup 残留和 callback 生命周期；
+- [x] 完成本地六配置、sanitizer、TSan、fuzz 和静态分析门禁；
+- [x] 采集 clean-HEAD 正式 artifact，并把限制、digest 和分段延迟写回文档；
+- 本证据提交必须在自身 `main` HEAD 上通过完整 GitHub Actions 9/9；在该提交的远程检查完成前不写成“已通过”。
 
-- [ ] 适合数据库内核方向；
-- [ ] 需要版本化存储、冲突检测、GC、恢复和隔离级别；
-- [ ] 不应在 WAL 之前启动；
-- [ ] 作为独立阶段，不与 R1 混合。
+**R4-C：MVCC/事务（下一阶段）**
+
+- [ ] 先写 ADR-008，冻结版本链、隔离级别、冲突检测、事务 WAL、GC、TTL 交互、协议、资源上限、snapshot/checkpoint barrier 和 rollback 恢复；
+- [ ] ADR-008 单独提交、推送并通过自身 9/9 CI 后才开始实现；
+- [ ] 适合数据库内核方向，但不与 WAL/checkpoint 阶段混合。
 
 **R4-D：AI Agent 持久状态后端**
 
@@ -958,7 +976,9 @@ R1-R3 完成后可以写：
 | R2 | 崩溃点矩阵、恢复模型、fuzz 和 sanitizer 全部通过 |
 | R3 | 持久化性能、恢复时间、checkpoint 停顿有可复现报告 |
 | R4-A | 组提交只在 G1-G3 证明机会后实现，并完成 G1-G7、clean-HEAD G4 和完整门禁 |
-| R4-B/C | 后台 checkpoint、事务和 MVCC 只有在测量证明需要时单独启动 |
+| R4-B | 两阶段后台全量 checkpoint、完整 live segment manifest、失败恢复和正式证据通过独立门禁 |
+| R4-C | 先冻结事务/MVCC ADR，再实现版本链、冲突、事务 WAL、GC、TTL 和恢复；独立提交与 CI |
+| R4-D | 先冻结 Agent 状态后端 ADR，再实现幂等键、lease、CAS、会话恢复和有界资源；独立提交与 CI |
 
 任何阶段如果出现：
 
@@ -992,9 +1012,9 @@ R4-A 已完成 G1-G7，不再处于待验证状态。ADR-005 的证据门槛与 
 相对基线 6.84x、0 错误以及 CPU/RSS/恢复时间代价。最终证据提交仍必须以自身
 `main` HEAD 的完整 GitHub Actions 作为发布门禁，不能继承实现提交的结果。
 
-后台/增量 checkpoint、MVCC/事务和多写者仍是独立阶段，不随 R4-A 自动启动。任何
-后续 R4 变更仍必须保持 manifest 原子发布、ack 后不丢、全局顺序和有界资源，并重新
-通过 sanitizer、崩溃矩阵、fuzz 和资源上限验证。
+R4-B 已完成并保持 R4-A 的 manifest 原子发布、ack 后不丢、全局顺序和有界资源。
+R4-C/R4-D 仍是独立阶段，不随 R4-B 自动进入实现；每个阶段必须先提交并验证 ADR，
+再开始代码。任何后续变更仍必须重新通过 sanitizer、崩溃矩阵、fuzz 和资源上限验证。
 
 ---
 
@@ -1008,3 +1028,4 @@ R4-A 已完成 G1-G7，不再处于待验证状态。ADR-005 的证据门槛与 
 | 2026-11-11 | 0.4 | R4-A 完成独立非生产 G3 batch formation 实验：5 轮、2,985 个窗口、0 错误，汇总 `>=8` 比例 0.987605，G3 PASS；等待实现级 ADR，组提交仍未实现 |
 | 2026-11-11 | 0.5 | R4-A 实现完成：ADR-006、writer/queue/batch/completion、异步 HTTP/KV、SAVE/checkpoint/shutdown barrier、`group_commit` 指标和本地六配置 338 项测试；G1-G3 PASS、G5/G6 本地 PASS、G7 已记录，G4 待 clean HEAD 采集 |
 | 2026-11-11 | 0.6 | R4-A G4 PASS：clean HEAD `a06d7c2`、5 轮 32 客户端 `SYNC` write、median QPS 2,858.989、相对 418.018 为 6.84x、29,100 次成功 0 错误；artifact、digest、CPU/RSS/恢复代价和 G7 状态已写回，R4-A 完成 |
+| 2026-11-11 | 0.7 | R4-B 完成：ADR-007、两阶段后台全量 checkpoint、完整 live segment manifest、cleanup 重试、348/25 本地门禁和 clean-HEAD v3 artifact；下一步先提交 ADR-008，再实现 R4-C |

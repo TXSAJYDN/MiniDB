@@ -75,7 +75,7 @@ Given `-r /var/lib/minidb/kv/minidb.rdb`:
 ~~~
 
 - the RDB file is the latest full checkpoint;
-- the manifest records the checkpoint LSN and the first retained WAL segment;
+- the manifest records the checkpoint LSN and the complete retained WAL segment set starting after it;
 - the WAL directory holds the logical mutations after that checkpoint;
 - the lock file is held for the process lifetime.
 
@@ -224,14 +224,17 @@ nonzero on shutdown.
 
 `/stats` and `STATS` expose a coherent snapshot of the durability mode, LSNs,
 WAL bytes and segment count, mutation/fsync/checkpoint counters, checkpoint
-pause time, recovery statistics, R4-A timing diagnostics, and the top-level
+admission/capture/serialize/write/fsync/manifest/cleanup timings,
+background_checkpoint_state, recovery statistics, R4-A timing diagnostics, and
+the top-level
 `group_commit` queue/batch/completion snapshot. Timing counters cover successful
 operations only; process-lifetime maxima include preload and warm-up, and fixed
 fsync buckets do not provide arbitrary quantiles. They are diagnostic endpoints,
 not an SLO or health-check substitute. See
 [ADR-005](decisions/005-group-commit.md) for the evidence gates and
-[ADR-006](decisions/006-group-commit-implementation.md) for the implementation
-contract.
+[ADR-006](decisions/006-group-commit-implementation.md), and
+[ADR-007](decisions/007-background-checkpoint.md) for the implementation
+contracts.
 
 ## Backup
 
@@ -287,12 +290,15 @@ Operationally:
 - 100,000 RDB records and 64 MiB maximum RDB file;
 - 16 MiB WAL segment, 256 MiB total WAL, 128 segments;
 - 1,000,000 recovered records and 512 MiB recovered WAL bytes;
-- owner-loop processing, so a synchronous checkpoint blocks new requests.
+- two short owner-loop admission cuts per checkpoint plus an O(records) snapshot
+  capture; RDB serialize/write/fsync/rename runs on a checkpoint worker.
 
-WAL growth triggers a synchronous checkpoint before the segment budget is
-exhausted. If that checkpoint fails, the mutation is rejected and persistence
-may fail-stop. Set an appropriate service file-descriptor limit and keep the
-data directory on a filesystem with reliable fsync and rename semantics.
+WAL growth triggers a checkpoint before the segment budget is exhausted. The
+checkpoint's long RDB work does not block request admission, but capture and the
+two barriers do. If checkpoint startup or publication fails, the mutation is
+rejected and persistence may fail-stop. Set an appropriate service file
+descriptor limit and keep the data directory on a filesystem with reliable
+fsync and rename semantics.
 
 ## Security
 

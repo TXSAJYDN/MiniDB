@@ -73,30 +73,40 @@ and preserved files.
 
 ## Checkpoint ordering under crash
 
-A checkpoint publishes in this order:
+R4-B uses two admission cuts and a background worker:
 
-1. flush and fsync WAL;
-2. rotate the active segment if needed;
-3. write, fsync, rename, and directory-fsync the RDB snapshot;
-4. write, fsync, rename, and directory-fsync the manifest;
-5. remove obsolete WAL segments and fsync the WAL directory.
+1. first cut: pause mutation admission, pause and drain the writer, apply every
+   accepted record, pause the TTL scanner, flush the WAL, rotate the active
+   segment when needed, and capture an independent snapshot;
+2. resume admission and the writer; the checkpoint worker serializes the
+   snapshot, writes and fsyncs a temporary RDB, renames it, and directory-fsyncs
+   its parent;
+3. second cut: pause admission and drain/apply writes admitted while the worker
+   ran;
+4. write, fsync, rename, and directory-fsync a manifest naming the complete live
+   WAL segment set beginning at `checkpoint_lsn + 1`;
+5. remove obsolete WAL segments and fsync the WAL directory, then resume the
+   writer or finish shutdown.
 
 The important crash boundaries are:
 
 - **before snapshot rename**: the old snapshot remains authoritative; WAL still
   contains every mutation after the old checkpoint;
-- **after snapshot rename, before manifest publish**: the new snapshot may exist,
-  but the old manifest and WAL are sufficient; replay from the old checkpoint LSN
-  is deterministic;
+- **after snapshot rename, before manifest publish**: the new snapshot may be
+  visible, but the old manifest and its complete WAL segment set are sufficient;
+  replay from the old checkpoint LSN is deterministic;
 - **after manifest publish, before WAL cleanup**: the new manifest names the
-  correct snapshot and retained segment; leftover old segments are residue and
-  are ignored;
+  complete live segment set; leftover old segments are residue and are ignored;
 - **during WAL cleanup**: the manifest already defines the live chain; deleting a
   segment it references would be a bug, not an allowed outcome.
 
 Snapshot and manifest writes use temporary files, file fsync, atomic rename, and
 parent-directory fsync. A directory-fsync failure after rename is reported as
 durability unconfirmed, marks persistence fail-stop, and leaves the WAL intact.
+The dedicated process test `BackgroundCheckpointRenameCrash` exercises the
+rename-before-manifest window. Cleanup failure after manifest publication is
+safe residue and can be retried; it is not evidence that the published
+checkpoint failed.
 
 ## Tail versus middle corruption
 

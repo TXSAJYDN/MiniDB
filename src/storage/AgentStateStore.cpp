@@ -215,7 +215,7 @@ AgentStateStore::deadline_from_absolute(std::int64_t absolute_ms) const {
     }
     const std::int64_t wall_now = now_wall_ms();
     if (absolute_ms <= wall_now) {
-        return current;
+        return TimePoint::min();
     }
     const std::int64_t remaining = absolute_ms - wall_now;
     const auto duration = Clock::ms_to_duration(remaining);

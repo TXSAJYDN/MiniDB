@@ -143,6 +143,17 @@ from the GitHub checks for that exact commit, not inherited from an earlier one.
 The R4-D ADR records the final implementation/evidence commit and run after the
 remote matrix completes.
 
+The first R4-D evidence run, commit `10ca3f1` in workflow run
+[`43099105106`](https://github.com/TXSAJYDN/MiniDB/actions/runs/43099105106),
+completed 8/9: the `asan-ubsan` job exited 8 while the other eight jobs passed.
+The failed job log is not accessible without an authenticated Actions session,
+so the exact test name was not recovered from the service. The identical local
+ASan+UBSan configuration then passed 440/440, and
+`ctest --repeat until-fail:5 -j2` completed five consecutive 440/440 passes
+(2,200 test executions). A docs-only follow-up commit triggers a fresh full
+workflow; the final R4-D acceptance record must name that exact commit and 9/9
+run, and this earlier failure remains recorded rather than being rewritten.
+
 ## Fuzz evidence
 
 Six Clang libFuzzer targets are built with ASan and UBSan:

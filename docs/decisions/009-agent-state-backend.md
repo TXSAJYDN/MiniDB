@@ -392,6 +392,10 @@ lease_expires_at_ms:i64
 `last_fence` 是 session 生命周期内单调递增的 fencing token。session 创建时为 0，
 第一次成功 acquire 得到 1。没有 acquire 就没有 worker 有权执行 tool mutation。
 
+lease 的唯一权威是父 session 封套。tool 封套中的 `lease_expires_at_ms` 始终为 0；
+tool 的 `last_fence` 只记录最近一次 claim/complete/requeue 使用的父 session fence，
+不构成独立 lease，也不能让 tool 单独存活于父 session lease 之外。
+
 ### 7.2 规则
 
 - lease TTL 范围为 1 秒到 1 小时；
@@ -400,6 +404,12 @@ lease_expires_at_ms:i64
 - acquire、renew、release 都写 session revision；
 - renew/release 必须同时匹配 expected revision 和 fence；
 - lease 已过期时 renew/release 返回 `LEASE_EXPIRED`，不能复活旧 lease；
+- `TOOL_CLAIM` 必须在同一 `kTxn` 内延长父 session lease：新 deadline 为
+  `max(当前 deadline, now + ttl_ms)`，且不得超过 `session_expires_at_ms`；
+  claim TTL 不能延长 session 本身，也不能把父 session lease 缩短；
+- `TOOL_COMPLETE` 和 `TOOL_REQUEUE` 只校验父 session 的 live lease 与 fence，
+  不修改 lease deadline；每次成功的 tool mutation 都把父 session fence 写入
+  tool 封套的 `last_fence`；
 - 每次 acquire 成功后，旧 fence 永久失效；即使旧 worker 尚未意识到 lease
   已过期，也不能 claim/complete/requeue；
 - fence 达到 `UINT64_MAX` 时返回 `CAPACITY`，不得回绕；
@@ -444,7 +454,9 @@ PENDING；新 worker 必须先获得新的 session fence，然后显式 requeue 
 | TOOL_REQUEUE | RUNNING -> PENDING，要求 live lease 和匹配 fence |
 
 所有 tool mutation 都在同一 `kTxn` 内更新父 session 的 revision 和 updated time，
-即使 session 的业务 payload 不变。这样 tool mutation 与 session close、
+即使 session 的业务 payload 不变。tool 记录自身不持有 lease：`TOOL_CLAIM` 的
+TTL 只通过同一事务延长父 session lease，`TOOL_COMPLETE`/`TOOL_REQUEUE`
+只匹配父 session 的 live lease 和当前 fence。这样 tool mutation 与 session close、
 lease 变更、purge 共享同一个写冲突边界，不会出现“父 session 已关闭但 tool
 刚被 claim 成功”的已提交分叉。
 

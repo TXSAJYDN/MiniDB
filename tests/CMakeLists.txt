@@ -10,6 +10,7 @@ add_executable(base_test
     BufferTest.cpp
     ClockTest.cpp
     LogTest.cpp
+    Sha256Test.cpp
     ErrorTest.cpp
     HttpParserP0Test.cpp
     ContentLengthParserTest.cpp

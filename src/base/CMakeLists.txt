@@ -2,6 +2,7 @@ add_library(minidb_base STATIC
     FileDescriptor.cpp
     Buffer.cpp
     Clock.cpp
+    Sha256.cpp
     Log.cpp
 )
 

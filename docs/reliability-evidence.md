@@ -150,9 +150,9 @@ The failed job log is not accessible without an authenticated Actions session,
 so the exact test name was not recovered from the service. The identical local
 ASan+UBSan configuration then passed 440/440, and
 `ctest --repeat until-fail:5 -j2` completed five consecutive 440/440 passes
-(2,200 test executions). A docs-only follow-up commit triggers a fresh full
-workflow; the final R4-D acceptance record must name that exact commit and 9/9
-run, and this earlier failure remains recorded rather than being rewritten.
+(2,200 test executions). The docs-only follow-up commit `c07b977` then passed its own full workflow
+[`43101139773`](https://github.com/TXSAJYDN/MiniDB/actions/runs/43101139773)
+with 9/9 jobs; this earlier failure remains recorded rather than being rewritten.
 
 ## Fuzz evidence
 
@@ -427,9 +427,10 @@ TSan, ASan, UBSan, clang-format, clang-tidy, `git diff --check`, and Python
 syntax compilation are part of the same gate.
 
 This evidence covers process crashes and restart, not power loss, multi-node
-lease safety, or exactly-once external tool side effects. The implementation and
-evidence commit must obtain its own 9/9 GitHub Actions result; the ADR acceptance
-record names the exact commit and run.
+lease safety, or exactly-once external tool side effects. The evidence commit
+`c07b977` obtained its own 9/9 GitHub Actions result in run
+[`43101139773`](https://github.com/TXSAJYDN/MiniDB/actions/runs/43101139773);
+ADR-009 now records this outcome as Accepted.
 
 ## R4-A G3 batch-formation experiment
 

@@ -1,11 +1,11 @@
 # ADR-009：R4-D AI Agent 持久状态后端
 
-- 状态：**Proposed — implementation complete; final CI acceptance pending**
+- 状态：**Accepted**
 - 日期：2026-11-12
-- 实现状态：2026-11-12 完成本地实现与门禁；最终证据提交自身 9/9 通过后才转为 Accepted
+- 实现状态：2026-11-12 完成本地实现与门禁；证据提交 `c07b977` 的 GitHub Actions run `43101139773` 取得 9/9，ADR 转为 Accepted
 - 关联：`docs/MiniDB-可靠性与持久化升级计划书.md`、ADR-002、ADR-003、ADR-004、ADR-006、ADR-007、ADR-008、`docs/wal-format.md`、`docs/recovery.md`、`docs/protocol-kv.md`
 - 决策范围：R4-D 的持久布局、revision/CAS、幂等、session/tool 状态机、lease/fencing、二进制 KV 协议、资源上限、GC、checkpoint、恢复、失败语义、观测和验收门槛
-- 准入条件：ADR 以 docs-only 提交进入 `main` 并完成准入检查；实现已按该顺序完成。最终证据提交仍需取得自身 9/9 GitHub Actions，之后才能把状态改为 Accepted
+- 准入条件：ADR 以 docs-only 提交进入 `main` 并完成准入检查；实现已按该顺序完成。证据提交 `c07b977` 的 GitHub Actions run `43101139773` 取得 9/9，状态已更新为 Accepted
 
 ## 背景
 
@@ -877,7 +877,14 @@ runner 预装的固定工具链，并取得 `500d67d` 自身的 9/9。包含本�
 2026-11-12 本地实现记录：六个配置各 **440/440 CTest**，**31 个
 `ProcessIntegrationTest.*` 进程用例**，六个固定 seed 的 20,000-run fuzz target
 全部通过；Agent 进程用例为 `AgentIdempotencyCrashRecovery`、`AgentLeaseTakeover`、`AgentCrashRecovery`、`AgentNamespaceCollision` 和 `AgentStatsContract`。
-最终证据提交的 GitHub Actions 9/9 尚未执行，不能用本记录替代远程 CI。
+
+2026-11-12 发布验收记录：证据提交 `c07b97725e361cdb821a9b4102328ff501ca8dcf`
+的 GitHub Actions [run `43101139773`](https://github.com/TXSAJYDN/MiniDB/actions/runs/43101139773)
+共 9 个 job，全部 `completed/success`：debug、release、asan、ubsan、
+asan-ubsan、tsan、format、static-analysis 和 fuzz-smoke。首次证据提交 `10ca3f1`
+的 run `43099105106` 中 `asan-ubsan` 一次失败；本地相同 ASan/UBSan 配置复跑
+440/440，并以 `--repeat until-fail:5` 完成五次连续 440/440，随后以 docs-only
+提交重新触发完整 CI 并通过。失败记录保留，不继承为通过证据。
 
 历史测试数量必须按新配置实际采集；不得把 R4-A 的 338/24、R4-B 的 348/25 或
 R4-C 的既有数字机械复制为 R4-D 证据。
@@ -944,6 +951,6 @@ R4-D 选择“普通 committed KV 上的版本化 Agent 记录 + 单 kTxn 幂等
 lease/fence”作为实现边界。它不新增持久化格式，不改变 R4-A/R4-B/R4-C 的已确认
 语义，并用严格 revision、幂等和启动 fail-stop 把可恢复性变成可测试契约。
 
-本 ADR 当前状态为 **Proposed — implementation complete; final CI acceptance pending**。
-实现和本地证据已完成；最终证据提交取得自身 9/9 CI 后，才可把状态更新为
-**Accepted**。
+本 ADR 当前状态为 **Accepted**。实现、六配置本地门禁、六个 fuzz target 和
+证据提交自身的 9/9 GitHub Actions 均已完成；后续扩展必须另立 ADR，并重新通过
+相应质量门禁。

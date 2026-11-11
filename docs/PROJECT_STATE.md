@@ -5,7 +5,7 @@
 - 权威开发工作树：`/home/win11/projects/miniDB`（WSL2 Ubuntu 24.04）
 - Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
-- 当前阶段：**R0-R3、R4-A、R4-B、R4-C 和 R4-D 已实现；R4-D 本地门禁完成，等待最终证据提交自身的 9/9 CI 发布验收**
+- 当前阶段：**R0-R3、R4-A、R4-B、R4-C 和 R4-D 全部完成；R4-D 已通过证据提交自身的 9/9 CI 发布验收**
 - 当前测试清单：**440 项 CTest**（R4-D 六配置本地验证矩阵）；31 个进程级用例、六个固定 seed fuzz target
 
 ## 1. 当前结论
@@ -55,7 +55,7 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 | R4-A 组提交 | DONE; G1-G7 PASS | ADR-006、writer/queue/batch/completion、异步协议、SAVE/shutdown barrier、338 项测试、完整质量门禁和正式 G4（5 轮，median QPS 2,858.989） |
 | R4-B 后台全量 checkpoint | DONE | ADR-007、两阶段 barrier、独立 snapshot capture、后台 RDB I/O、完整 live segment manifest、348 项测试和正式 artifact |
 | R4-C MVCC/事务 | DONE | ADR-008、版本链、Snapshot Isolation、first-committer-wins、单记录 `kTxn`、GC/TTL、事务协议和恢复；395 项测试 |
-| R4-D Agent 持久状态后端 | DONE（本地实现与门禁）；发布验收待最终证据提交 9/9 CI | ADR-009、`AGENT=12`、MDAR/MDOR、幂等/CAS/lease/fence、session/tool/generic/GC、恢复和 stats；440 项测试、31 个进程用例、六个 fuzz target |
+| R4-D Agent 持久状态后端 | DONE; run 43101139773 9/9 | ADR-009（Accepted）、`AGENT=12`、MDAR/MDOR、幂等/CAS/lease/fence、session/tool/generic/GC、恢复和 stats；440 项测试、31 个进程用例、六个 fuzz target |
 
 ## 3. 新定位与范围
 
@@ -187,9 +187,13 @@ R4-A 组提交、R4-B 后台 checkpoint、R4-C MVCC 事务与 R4-D Agent 状态�
   次成功、0 错误，平均 6.70 records/batch，queue rejection 与 writer failure
   均为 0，判定 PASS；
 - 远程 CI：R0-R3 基线 `cfbda60` 的 GitHub Actions 9/9 通过；R4-A 实现提交
-  `a06d7c2` 的 GitHub Actions run `43006353520` 同样 9/9 通过；历史阶段只引用
-  对应 `main` HEAD 的检查。R4-D 当前实现尚未作为最终证据提交推送，发布结论
-  必须等待该证据提交自身的 GitHub Actions 9/9；
+  `a06d7c2` 的 GitHub Actions run `43006353520` 同样 9/9 通过；R4-D 证据提交
+  `c07b977` 的 [run `43101139773`](https://github.com/TXSAJYDN/MiniDB/actions/runs/43101139773)
+  9/9 通过（debug、release、asan、ubsan、asan-ubsan、tsan、format、
+  static-analysis、fuzz-smoke）。首次 `10ca3f1` 的 run `43099105106` 仅
+  `asan-ubsan` 失败；本地相同配置复跑 440/440，并以 `--repeat until-fail:5`
+  完成五次连续 440/440，docs-only 重新触发后全绿。历史结论只引用对应
+  `main` HEAD 的检查；
 - R4-B 正式 benchmark 在 clean HEAD `fbfd6a6` 上采集：主 benchmark 5 轮、32
   clients、`SYNC`、100% write，34,916/34,916 成功、0 错误，median QPS
   3,526.336；checkpoint probe 5 轮 SAVE 全部成功、0 checkpoint failure，总耗时
@@ -311,16 +315,14 @@ R4-A v2 clean baseline 则为 4.63x。吞吐和延迟改善伴随更高的 clien
 
 ## 9. 后续工作
 
-R4-A、R4-B、R4-C 和 R4-D 的实现与本地门禁已闭环；R4-D 的最终证据提交仍处于
-发布验收阶段。
+R4-A、R4-B、R4-C 和 R4-D 的实现、本地门禁、文档和发布门禁均已闭环。
 
-1. 提交并推送 R4-D 文档与验证证据，确认该 `main` HEAD 自身的 GitHub Actions
-   9/9；在此之前不把 R4-D 写成已发布验收；
-2. R4-D 已实现并验证的内容包括 `AGENT=12`、MDAR/MDOR、幂等/CAS、lease/fence、
+1. R4-D 已按 ADR-009 交付 `AGENT=12`、MDAR/MDOR、幂等/CAS、lease/fence、
    session/tool/generic 状态机、同 `kTxn` 原子提交、GC、恢复 fail-stop 和
-   `agent` stats，不能以新的无界状态或第二套持久化格式扩展；
-3. 最终证据同步后，再处理许可证和后续独立 ADR；许可证继续保持最后处理，不在
-   R4-D 提交中修改 `LICENSE`/`COPYING`。
+   `agent` stats；证据提交 `c07b977` 的 run `43101139773` 已达到 9/9；
+2. 后续扩展必须另立 ADR，不得以新的无界状态或第二套持久化格式扩张 R4-D；
+3. 下一步处理许可证；在所有者决定前继续保持 `LICENSE`/`COPYING` 未创建、
+   未修改。
 
 > 注：每个发布结论只引用对应 `main` HEAD 自身的 checks，不能继承实现提交或任何
 > 更早提交的结果。

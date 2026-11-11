@@ -223,7 +223,11 @@ Agent 持久状态后端均已实现，本地质量门禁及对应证据已完�
   queue rejection 与 writer failure 均为 0；
 - 同一 G4 运行中 server CPU 中位数 24.383%（单核）、server RSS 峰值
   4,836 KiB、WAL 写放大 1.527778、恢复时间中位数 0.044825 s；完整原始
-  artifact、逐轮数据和限制见 [可靠性证据](docs/reliability-evidence.md)。
+  artifact、逐轮数据和限制见 [可靠性证据](docs/reliability-evidence.md)；
+- R4-D 证据提交 `c07b977` 的 GitHub Actions
+  [run `43101139773`](https://github.com/TXSAJYDN/MiniDB/actions/runs/43101139773)
+  9/9 通过，ADR-009 状态为 Accepted；首次证据提交的 `asan-ubsan` 单次失败、
+  本地五次重复 440/440 和重新触发记录见可靠性证据。
 
 R4-B 在 clean HEAD `fbfd6a6` 上采集了正式 artifact：32 clients、`SYNC`、100% write
 的 5 轮主 benchmark 完成 34,916/34,916 次请求、0 错误，median QPS 3,526.336；

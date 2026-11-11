@@ -1,6 +1,6 @@
 # MiniDB 可靠性与持久化升级计划书
 
-> 文档状态：`R0-R3 Completed / R4-A Completed / R4-B Completed / R4-C Completed / R4-D Implemented — Final CI Acceptance Pending`
+> 文档状态：`R0-R3 Completed / R4-A Completed / R4-B Completed / R4-C Completed / R4-D Accepted`
 >
 > 编写日期：2026-11-10（Asia/Shanghai）
 >
@@ -14,9 +14,9 @@
 > R4-A 的 ADR-005、诊断指标、G3 和 clean-HEAD G4，R4-B 的 ADR-007、两阶段
 > checkpoint 和正式 artifact，R4-C 的 ADR-008、Snapshot Isolation、单记录事务
 > WAL、GC/TTL/checkpoint 交互，以及 R4-D 的 ADR-009、AGENT 持久状态后端、
-> 幂等/CAS/lease/fence、恢复/GC 和六配置门禁均已记录。R4-D 已通过本地门禁，
-> 但最终证据提交仍需取得自身 9/9 CI 后才能写成发布验收。所有远程 CI 结论只引用
-> 对应 `main` HEAD 的实际检查。
+> 幂等/CAS/lease/fence、恢复/GC 和六配置门禁均已记录。R4-D 证据提交 `c07b977`
+> 已取得自身 9/9 GitHub Actions，发布验收完成。所有远程 CI 结论只引用对应
+> `main` HEAD 的实际检查。
 >
 > 推进方式：按技术依赖和验收门槛推进，不设置固定总工期或强制周计划。阶段状态、证据链接、已知限制和下一步准入条件随实现同步更新。
 >
@@ -900,7 +900,7 @@ session 析构和 shutdown 时回滚。HTTP `/kv` 的每个 mutation 仍是隐�
 - [x] 完成本地六配置、sanitizer、TSan、fuzz、格式和静态分析门禁；
 - 本实现与证据提交必须在自身 `main` HEAD 上通过完整 GitHub Actions 9/9；在该提交的远程检查完成前不写成“已通过”。
 
-**R4-D：AI Agent 持久状态后端（实现完成，发布验收待最终 CI）**
+**R4-D：AI Agent 持久状态后端（Accepted）**
 
 实施状态（2026-11-12）：[ADR-009](decisions/009-agent-state-backend.md) 已先冻结
 幂等键、revision/CAS、session/tool 状态机、lease/fence、保留命名空间、资源上限、
@@ -909,8 +909,9 @@ GC、checkpoint、恢复和统计契约，并按独立 docs-only 提交通过准
 启动 namespace/marker 校验、孤儿 tool 处理、周期 GC 和 `agent` stats。本地门禁为
 六配置各 440/440 项 CTest、31 个进程用例和六个 20,000-run fuzz target；Agent
 进程用例覆盖 idempotency crash recovery、lease takeover、RUNNING tool 恢复、
-namespace collision 和 stats contract。最终证据提交仍必须在自身 `main` HEAD 上
-取得完整 GitHub Actions 9/9 后才能写成发布验收。
+namespace collision 和 stats contract。证据提交 `c07b977` 的
+[run `43101139773`](https://github.com/TXSAJYDN/MiniDB/actions/runs/43101139773)
+已取得自身 `main` HEAD 的完整 GitHub Actions 9/9，R4-D 发布验收完成。
 
 - [x] 写 ADR-009，冻结幂等键、lease、版本号/CAS、会话与工具调用状态恢复、有界资源、崩溃与恢复语义；
 - [x] ADR-009 单独提交、推送并通过自身 9/9 CI 后才开始实现；
@@ -921,7 +922,7 @@ namespace collision 和 stats contract。最终证据提交仍必须在自身 `m
 - [x] generic record 边界、资源计数、周期 GC、checkpoint/WAL/RDB 恢复和启动 fail-stop；
 - [x] KV `AGENT=12` 协议、显式事务拒绝、MDOR 错误映射、`agent` stats 和文档；
 - [x] 六配置 440/440 本地门禁、31 个进程用例、六个 fuzz target、格式和静态分析；
-- 最终证据提交必须在自身 `main` HEAD 上通过完整 GitHub Actions 9/9；在该提交的远程检查完成前不写成“已通过”。
+- [x] 最终证据提交 `c07b977` 在自身 `main` HEAD 上通过完整 GitHub Actions 9/9（run `43101139773`）。
 
 ---
 
@@ -1015,7 +1016,7 @@ R1-R3 完成后可以写：
 | R4-A | 组提交只在 G1-G3 证明机会后实现，并完成 G1-G7、clean-HEAD G4 和完整门禁 |
 | R4-B | 两阶段后台全量 checkpoint、完整 live segment manifest、失败恢复和正式证据通过独立门禁 |
 | R4-C | ADR-008 已冻结；版本链、Snapshot Isolation、冲突、单记录事务 WAL、GC、TTL 和恢复通过六配置 395/395、26 个进程用例及独立提交/CI 门禁 |
-| R4-D | ADR-009 已冻结；`AGENT=12`、MDAR/MDOR、幂等键、revision/CAS、lease/fence、会话/工具状态恢复、保留命名空间、GC 和同 `kTxn` 原子提交已实现；六配置 440/440、31 个进程用例、六个 fuzz target；最终证据提交待自身 9/9 CI |
+| R4-D | ADR-009 Accepted；`AGENT=12`、MDAR/MDOR、幂等键、revision/CAS、lease/fence、会话/工具状态恢复、保留命名空间、GC 和同 `kTxn` 原子提交已实现；六配置 440/440、31 个进程用例、六个 fuzz target；证据提交 `c07b977` 的 run `43101139773` 9/9 |
 
 任何阶段如果出现：
 
@@ -1056,9 +1057,9 @@ R4-C 已完成并新增 per-key 版本链、Snapshot Isolation、first-committer
 
 R4-D 已按 ADR-009 完成实现：二进制 `AGENT=12`、MDAR/MDOR、幂等键、lease/fence、
 revision/CAS、会话/工具状态恢复、保留命名空间、GC 和同 `kTxn` 原子提交均已落地，
-并通过六配置 440/440、31 个进程用例和六个 fuzz target 的本地门禁。最终证据提交
-仍必须以自身 `main` HEAD 的 9/9 CI 作为发布门禁，不能继承实现提交的结果。任何
-后续变更仍必须重新通过 sanitizer、崩溃矩阵、fuzz 和资源上限验证。
+并通过六配置 440/440、31 个进程用例和六个 fuzz target 的本地门禁。证据提交
+`c07b977` 的 run `43101139773` 已取得自身 `main` HEAD 的 9/9 CI；R4-D 的发布
+验收完成。任何后续变更仍必须重新通过 sanitizer、崩溃矩阵、fuzz 和资源上限验证。
 
 ---
 
@@ -1074,4 +1075,5 @@ revision/CAS、会话/工具状态恢复、保留命名空间、GC 和同 `kTxn`
 | 2026-11-11 | 0.6 | R4-A G4 PASS：clean HEAD `a06d7c2`、5 轮 32 客户端 `SYNC` write、median QPS 2,858.989、相对 418.018 为 6.84x、29,100 次成功 0 错误；artifact、digest、CPU/RSS/恢复代价和 G7 状态已写回，R4-A 完成 |
 | 2026-11-11 | 0.7 | R4-B 完成：ADR-007、两阶段后台全量 checkpoint、完整 live segment manifest、cleanup 重试、348/25 本地门禁和 clean-HEAD v3 artifact；下一步先提交 ADR-008，再实现 R4-C |
 | 2026-11-11 | 0.8 | R4-C 完成：ADR-008、per-key 版本链、Snapshot Isolation、first-committer-wins、单记录 `kTxn`、事务协议/stats、GC/TTL/checkpoint/恢复和 395/26 本地门禁；下一步先写 ADR-009，再实现 R4-D |
-| 2026-11-12 | 0.9 | R4-D 实现完成：ADR-009、`AGENT=12`、MDAR/MDOR、幂等/CAS/lease/fence、session/tool/generic、同 `kTxn` 原子提交、GC/恢复、`agent` stats 和六配置 440/31/六个 fuzz target 本地门禁；最终证据提交待自身 9/9 CI |
+| 2026-11-12 | 0.9 | R4-D 实现完成：ADR-009、`AGENT=12`、MDAR/MDOR、幂等/CAS/lease/fence、session/tool/generic、同 `kTxn` 原子提交、GC/恢复、`agent` stats 和六配置 440/31/六个 fuzz target 本地门禁 |
+| 2026-11-12 | 1.0 | R4-D 发布验收完成：证据提交 `c07b977` 的 GitHub Actions run `43101139773` 9/9 通过，ADR-009 状态更新为 Accepted；首次 `10ca3f1` 的 `asan-ubsan` 失败保留为历史记录，本地五次重复 440/440 后以 docs-only 重触发通过 |

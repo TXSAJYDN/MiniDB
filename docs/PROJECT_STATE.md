@@ -5,6 +5,7 @@
 - 权威开发工作树：`/home/win11/projects/miniDB`（WSL2 Ubuntu 24.04）
 - Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
+- 当前发布：**v0.1.0（2026-11-12），Apache-2.0**
 - 当前阶段：**R0-R3、R4-A、R4-B、R4-C 和 R4-D 全部完成；R4-D 已通过证据提交自身的 9/9 CI 发布验收**
 - 当前测试清单：**440 项 CTest**（R4-D 六配置本地验证矩阵）；31 个进程级用例、六个固定 seed fuzz target
 
@@ -288,7 +289,8 @@ R4-A v2 clean baseline 则为 4.63x。吞吐和延迟改善伴随更高的 clien
   lease 依赖客户端正确传播 fence，无法保证外部工具副作用 exactly-once。
 - Agent generic record 不支持删除、TTL 或遍历；64 MiB 是逻辑 key+value 预算，
   不包含 allocator、索引和其他运行时 overhead。
-- 许可证仍由所有者决定；仓库未创建 `LICENSE`/`COPYING`。
+- 许可证已选定为 Apache License 2.0，版权与归属见根目录 `LICENSE`、`NOTICE`；
+  `0.x` 发布仍不承诺生产稳定性。
 
 ## 8. 文档入口
 
@@ -321,8 +323,8 @@ R4-A、R4-B、R4-C 和 R4-D 的实现、本地门禁、文档和发布门禁均�
    session/tool/generic 状态机、同 `kTxn` 原子提交、GC、恢复 fail-stop 和
    `agent` stats；证据提交 `c07b977` 的 run `43101139773` 已达到 9/9；
 2. 后续扩展必须另立 ADR，不得以新的无界状态或第二套持久化格式扩张 R4-D；
-3. 下一步处理许可证；在所有者决定前继续保持 `LICENSE`/`COPYING` 未创建、
-   未修改。
+3. 许可证已选定为 Apache-2.0，发布说明见 `CHANGELOG.md`；后续扩展必须遵守
+   `LICENSE`/`NOTICE`，并在新的 ADR 中记录兼容性与发布影响。
 
 > 注：每个发布结论只引用对应 `main` HEAD 自身的 checks，不能继承实现提交或任何
 > 更早提交的结果。

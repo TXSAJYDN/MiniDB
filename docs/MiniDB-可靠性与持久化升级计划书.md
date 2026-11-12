@@ -1,6 +1,7 @@
 # MiniDB 可靠性与持久化升级计划书
 
 > 文档状态：`R0-R3 Completed / R4-A Completed / R4-B Completed / R4-C Completed / R4-D Accepted`
+> 发布基线：`v0.1.0`（2026-11-12），Apache License 2.0。
 >
 > 编写日期：2026-11-10（Asia/Shanghai）
 >
@@ -1077,3 +1078,4 @@ revision/CAS、会话/工具状态恢复、保留命名空间、GC 和同 `kTxn`
 | 2026-11-11 | 0.8 | R4-C 完成：ADR-008、per-key 版本链、Snapshot Isolation、first-committer-wins、单记录 `kTxn`、事务协议/stats、GC/TTL/checkpoint/恢复和 395/26 本地门禁；下一步先写 ADR-009，再实现 R4-D |
 | 2026-11-12 | 0.9 | R4-D 实现完成：ADR-009、`AGENT=12`、MDAR/MDOR、幂等/CAS/lease/fence、session/tool/generic、同 `kTxn` 原子提交、GC/恢复、`agent` stats 和六配置 440/31/六个 fuzz target 本地门禁 |
 | 2026-11-12 | 1.0 | R4-D 发布验收完成：证据提交 `c07b977` 的 GitHub Actions run `43101139773` 9/9 通过，ADR-009 状态更新为 Accepted；首次 `10ca3f1` 的 `asan-ubsan` 失败保留为历史记录，本地五次重复 440/440 后以 docs-only 重触发通过 |
+| 2026-11-12 | 1.1 | 发布收尾：采用 Apache License 2.0，增加 NOTICE 与 CHANGELOG，正式发布首个公开基线 v0.1.0（2026-11-12） |

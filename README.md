@@ -276,3 +276,9 @@ backpressure `ERROR 100`，不是已确认写丢失；详细限制、逐项延�
 - [ADR-008：R4-C MVCC 与快照隔离事务](docs/decisions/008-mvcc-transactions.md)
 - [ADR-009：R4-D AI Agent 持久状态后端](docs/decisions/009-agent-state-backend.md)
 - [架构决策记录](docs/decisions/)
+
+## 版本与许可证
+
+- 当前发布：[v0.1.0](https://github.com/TXSAJYDN/MiniDB/releases/tag/v0.1.0)，发布说明见 [CHANGELOG.md](CHANGELOG.md)。
+- 许可证：[Apache License 2.0](LICENSE)；版权与归属见 [NOTICE](NOTICE)。
+- `0.x` 版本仍按可靠性工程原型演进，不构成生产稳定性承诺。

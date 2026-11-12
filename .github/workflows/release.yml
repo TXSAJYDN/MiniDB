@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'TXSAJYDN/MiniDB'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify annotated tag and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch --force --tags origin
+          test "$(git cat-file -t "refs/tags/$TAG")" = "tag"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$SHA"
+          test -f "docs/releases/$TAG.md"
+          echo "Tag $TAG -> $SHA; release notes present."
+
+      - name: Wait for CI success on tagged commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 4800))
+          run_id=""
+          while (( SECONDS < deadline )); do
+            if runs=$(gh run list \
+              --repo "$REPO" \
+              --workflow ci.yml \
+              --commit "$SHA" \
+              --limit 100 \
+              --json databaseId,status,conclusion,event,headBranch,createdAt 2>/dev/null); then
+              run_id=$(jq -r --arg tag "$TAG" '
+                [.[] | select(.event == "push" and .headBranch == $tag)]
+                | sort_by(.createdAt)
+                | last
+                | .databaseId // empty
+              ' <<<"$runs")
+              if [[ -n "$run_id" ]]; then
+                break
+              fi
+            fi
+            echo "Waiting for CI run for tag $TAG..."
+            sleep 15
+          done
+          if [[ -z "$run_id" ]]; then
+            echo "Timed out waiting for a CI run for $TAG ($SHA)."
+            exit 1
+          fi
+
+          echo "Watching CI run $run_id."
+          while (( SECONDS < deadline )); do
+            if ! status=$(gh run view "$run_id" \
+              --repo "$REPO" \
+              --json status,conclusion,url 2>/dev/null); then
+              echo "Unable to read CI run $run_id; retrying..."
+              sleep 15
+              continue
+            fi
+            state=$(jq -r '.status' <<<"$status")
+            conclusion=$(jq -r '.conclusion // ""' <<<"$status")
+            url=$(jq -r '.url' <<<"$status")
+            echo "CI $run_id: status=$state conclusion=${conclusion:-pending} url=$url"
+            case "$state" in
+              completed)
+                if [[ "$conclusion" == "success" ]]; then
+                  echo "CI 9/9 succeeded for $SHA."
+                  exit 0
+                fi
+                echo "CI did not succeed for $SHA: ${conclusion:-unknown}"
+                exit 1
+                ;;
+              queued|in_progress|waiting|requested|pending)
+                sleep 20
+                ;;
+              *)
+                echo "Unexpected CI status: $state"
+                exit 1
+                ;;
+            esac
+          done
+          echo "Timed out waiting for CI run $run_id."
+          exit 1
+
+      - name: Publish GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving it unchanged."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --verify-tag \
+            --latest \
+            --title "MiniDB $TAG" \
+            --notes-file "docs/releases/$TAG.md"

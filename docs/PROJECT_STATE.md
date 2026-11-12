@@ -324,7 +324,9 @@ R4-A、R4-B、R4-C 和 R4-D 的实现、本地门禁、文档和发布门禁均�
    `agent` stats；证据提交 `c07b977` 的 run `43101139773` 已达到 9/9；
 2. 后续扩展必须另立 ADR，不得以新的无界状态或第二套持久化格式扩张 R4-D；
 3. 许可证已选定为 Apache-2.0，发布说明见 `CHANGELOG.md`；后续扩展必须遵守
-   `LICENSE`/`NOTICE`，并在新的 ADR 中记录兼容性与发布影响。
+   `LICENSE`/`NOTICE`，并在新的 ADR 中记录兼容性与发布影响；
+4. 发布自动化已配置：annotated tag push 触发发布工作流，校验 tag 与发布说明后，
+   必须等待同一 tagged commit 的 CI 9/9 成功，才创建 GitHub Release。
 
 > 注：每个发布结论只引用对应 `main` HEAD 自身的 checks，不能继承实现提交或任何
 > 更早提交的结果。

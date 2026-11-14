@@ -1177,6 +1177,11 @@ TEST_F(HttpSessionIntegrationTest, HeadInternalServerErrorSuppressesBody) {
     ExpectHeadStatus(reply, 500);
     EXPECT_EQ(reply.content_length,
               std::string("Internal Server Error\n").size());
+    // The connection callback captures the session; break that ownership
+    // cycle explicitly in this hand-built connection test.
+    connection->set_message_callback({});
+    session.reset();
+    connection.reset();
 }
 
 TEST_F(HttpSessionIntegrationTest, HeadServiceUnavailableSuppressesBody) {

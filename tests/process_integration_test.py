@@ -87,7 +87,10 @@ def recv_exact(sock, count):
     return b"".join(chunks)
 
 
-def read_http_response(port, method, path, body=b"", timeout=5.0):
+def read_http_response(port, method, path, body=b"", timeout=5.0,
+                       expect_body=None):
+    if expect_body is None:
+        expect_body = method != "HEAD"
     request = (
         f"{method} {path} HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{port}\r\n"
@@ -125,6 +128,11 @@ def read_http_response(port, method, path, body=b"", timeout=5.0):
             headers.setdefault(name.strip().lower(), value.strip())
 
         content_length = int(headers.get("content-length", "0"))
+        if not expect_body:
+            # HEAD carries GET metadata and Content-Length, but no body.
+            check(len(payload) == 0,
+                  f"HEAD response included {len(payload)} body bytes")
+            return status, headers, b""
         while len(payload) < content_length:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -158,7 +166,7 @@ class HttpSocketReader:
         self.buffer += chunk
         return True
 
-    def read_response(self, timeout=None):
+    def read_response(self, timeout=None, expect_body=True):
         if timeout is None:
             timeout = self.timeout
         deadline = time.monotonic() + timeout
@@ -179,6 +187,11 @@ class HttpSocketReader:
             headers.setdefault(name.strip().lower(), value.strip())
 
         content_length = int(headers.get("content-length", "0"))
+        if not expect_body:
+            # HEAD shares GET Content-Length but sends no body bytes.
+            # Preserve buffered bytes for the next pipelined response.
+            self.buffer = payload
+            return status, headers, b""
         while len(payload) < content_length:
             if not self._receive_more(deadline):
                 raise TestError("EOF before HTTP body completed")
@@ -1724,6 +1737,23 @@ def test_http_async_protocol():
                         check(json.loads(body.decode("utf-8"))["status"] == "ok",
                               f"HTTP SAVE response was {body!r}")
 
+            with connect_http(port) as head_sock:
+                head_sock.sendall(
+                    http_request_bytes(port, "HEAD", "/kv/http-remain") +
+                    http_request_bytes(port, "GET", "/kv/http-remain"))
+                head_reader = HttpSocketReader(head_sock)
+                status, headers, body = head_reader.read_response(
+                    expect_body=False)
+                head_length = headers.get("content-length")
+                check(status == 200 and body == b"",
+                      f"HTTP HEAD response was status={status}, body={body!r}")
+                check(head_length == "6",
+                      f"HTTP HEAD Content-Length was {head_length!r}")
+                status, _, body = head_reader.read_response()
+                check(status == 200 and body == b"remain",
+                      f"HTTP pipelined GET after HEAD was "
+                      f"status={status}, body={body!r}")
+
             with connect_http(port) as close_sock:
                 close_sock.sendall(http_request_bytes(
                     port, "POST", "/kv/http-close", b"close-value",
@@ -2335,7 +2365,7 @@ def test_stats_contract():
 
             status, headers, payload = read_http_response(
                 http_port, "POST", "/stats")
-            check(status == 405 and headers.get("allow") == "GET",
+            check(status == 405 and headers.get("allow") == "GET, HEAD",
                   f"POST /stats returned {status}, headers={headers!r}, "
                   f"body={payload!r}")
             check(http_server.terminate_group(signal.SIGTERM) == 0,

@@ -121,6 +121,25 @@ struct GroupCommitWalSnapshot {
     std::vector<std::uint64_t> live_segment_starts;
 };
 
+enum class GroupCommitSubmitStatus : std::uint8_t {
+    kAccepted,
+    kNotAccepting,
+    kInvalidLsn,
+    kLsnExhausted,
+    kQueueFull,
+    kInvalidRecord,
+    kByteOverflow,
+};
+
+struct GroupCommitSubmitResult {
+    GroupCommitSubmitStatus status = GroupCommitSubmitStatus::kNotAccepting;
+    std::string error;
+
+    bool accepted() const noexcept {
+        return status == GroupCommitSubmitStatus::kAccepted;
+    }
+};
+
 struct GroupCommitCompletion {
     enum class Kind : std::uint8_t {
         kRecords,
@@ -163,6 +182,9 @@ class GroupCommitWriter
 
     // The caller must own this object through shared_ptr before start().
     bool start(std::uint64_t first_lsn, std::string* error = nullptr);
+    GroupCommitSubmitResult submit_result(GroupCommitEntry entry);
+    // Compatibility wrapper. Control-flow callers should use submit_result()
+    // so admission decisions never depend on error text.
     bool submit(GroupCommitEntry entry, std::string* error = nullptr);
     bool request_flush(BarrierCompletion completion,
                        std::string* error = nullptr);

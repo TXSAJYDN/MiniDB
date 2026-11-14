@@ -26,6 +26,7 @@ The evidence covers:
   protocol/recovery evidence;
 - durable Agent sessions, tools, leases/fences, generic records, idempotency,
   bounded GC, namespace isolation, and their protocol/recovery evidence;
+- post-R4-D HTTP control-plane hardening, including HEAD, strict query/TTL metadata, typed control outcomes, and the production/test checkpoint-hook split;
 - explicit limits and non-claims.
 
 ## Source and environment
@@ -644,6 +645,45 @@ Total successful requests: 340,240. Total errors: 0. Wall-clock collection time:
   round. They are not a worst-case recovery bound.
 - At the time of the historical R3 run, checkpoint pause was stop-the-world
   owner-loop time; R4-B introduced the background checkpoint later.
+
+## Post-R4-D HTTP control hardening evidence
+
+- Date: 2026-11-14 (Asia/Shanghai)
+- Environment: Ubuntu 24.04 WSL2, x86_64, GCC 13.3.0, CMake 3.28.3
+- Scope: local Debug validation only; no performance or remote-CI claim
+
+The complete Debug worktree build and test gate was:
+
+~~~bash
+cmake --build build/debug -j2
+ctest --test-dir build/debug --output-on-failure -j2
+~~~
+
+Result: **449/449 CTest passed**, including **31**
+`ProcessIntegrationTest.*` cases. The suite newly exercises:
+
+- `HEAD /health`, `HEAD /stats`, and `HEAD /kv/<key>` with GET-equivalent
+  status/headers/`Content-Length` and zero body bytes, including 500, 503,
+  keep-alive, and pipelined HEAD/GET ordering;
+- the exact query matrix: only `GET/HEAD /kv/<key>?ttl=1` is accepted; empty,
+  duplicate, unknown, other-valued, and non-KV/non-GET queries return 400;
+- TTL JSON bodies `{"ttl_ms":12345}\n` and `{"ttl_ms":null}\n`, plus 404 for
+  missing keys;
+- JSON escaping for quotes, backslashes, short escapes, every other C0 control
+  byte, and non-UTF-8 bytes preserved byte-for-byte;
+- typed persistence control outcomes used for SAVE, shutdown, INTERVAL flush,
+  and Agent GC decisions instead of matching error strings;
+- the shared `ServerPersistenceRuntime` used by the HTTP and binary KV
+  frontends for store ownership, persistence manager lifetime, TTL scanner
+  lease, INTERVAL timer, and graceful shutdown;
+- the process-level checkpoint crash window through
+  `minidb_http_test_server`. The RDB-publication hook is compiled only when
+  `MINIDB_TEST_HOOKS=1`; the production `minidb_http_server` does not install
+  or contain that test seam.
+
+This is a Debug-only local reproducibility record. It does not replace the
+historical six-configuration R4-D matrix, fuzz matrix, benchmark artifacts, or
+the GitHub Actions result for the commit containing this section.
 
 ## What the evidence does not prove
 

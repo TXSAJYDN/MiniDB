@@ -76,6 +76,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
     bool drain_scheduled_;
     bool awaiting_async_response_;
     bool request_close_;
+    bool request_is_head_;
     size_t requests_handled_;
     Buffer pending_buffer_;
     std::chrono::milliseconds idle_timeout_{30000};

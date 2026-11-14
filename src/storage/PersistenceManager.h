@@ -74,6 +74,29 @@ struct MutationAdmission {
     }
 };
 
+// Typed outcome for persistence control operations.  Protocol code must make
+// retry/fail-closed decisions from these statuses rather than inspecting
+// human-readable error text.
+enum class PersistenceControlStatus : std::uint8_t {
+    kAccepted,
+    kNotOpen,
+    kGroupCommitNotStarted,
+    kBusy,
+    kShuttingDown,
+    kShutdownComplete,
+    kNotReady,
+    kIoError,
+};
+
+struct PersistenceControlResult {
+    PersistenceControlStatus status = PersistenceControlStatus::kNotReady;
+    std::string error;
+
+    bool accepted() const noexcept {
+        return status == PersistenceControlStatus::kAccepted;
+    }
+};
+
 using MutationCompletion = std::function<void(MutationOutcome)>;
 using AgentMutationCompletion = std::function<void(AgentResult)>;
 using CheckpointCompletion =
@@ -269,12 +292,15 @@ class PersistenceManager {
     AgentResult agent_query(const AgentRequest& request);
     AgentResult agent_mutate_async(const AgentRequest& request,
                                    AgentMutationCompletion completion);
+    PersistenceControlResult agent_gc_async_result();
     bool agent_gc_async(std::string* error = nullptr);
 
     // INTERVAL timer hooks.  The synchronous form remains available before
     // group commit starts and returns false afterwards; the asynchronous form
     // is serialized through the writer barrier.
     bool flush_interval(std::string* error = nullptr);
+    PersistenceControlResult flush_interval_async_result(
+        GroupCommitWriter::BarrierCompletion completion);
     bool flush_interval_async(GroupCommitWriter::BarrierCompletion completion,
                               std::string* error = nullptr);
 
@@ -283,8 +309,12 @@ class PersistenceManager {
     // the manifest, cleanup, then resume or stop the writer.  Completion runs
     // on the owner loop.  A SAVE response must not be sent before it fires.
     RdbSaveResult checkpoint(std::string* error = nullptr);
+    PersistenceControlResult
+    checkpoint_async_result(CheckpointCompletion completion);
     bool checkpoint_async(CheckpointCompletion completion,
                           std::string* error = nullptr);
+    PersistenceControlResult
+    shutdown_async_result(CheckpointCompletion completion);
     bool shutdown_async(CheckpointCompletion completion,
                         std::string* error = nullptr);
     bool shutdown_complete() const;
@@ -315,6 +345,12 @@ class PersistenceManager {
     set_after_apply_callback(std::function<void(const WalRecord&)> callback) {
         after_apply_callback_ = std::move(callback);
     }
+
+    // Explicit test seam for the checkpoint publication boundary.  The hook
+    // runs on the checkpoint worker after the new RDB and its directory are
+    // durable, but before the owner-loop manifest publication.  Production
+    // binaries never install it.
+    void set_checkpoint_rdb_publish_hook(std::function<void()> callback);
 
   private:
     enum class PendingMutationKind : std::uint8_t {
@@ -425,8 +461,10 @@ class PersistenceManager {
 
     bool ensure_bootstrapped_locked(std::string* error);
     bool ensure_group_commit_writer_locked(std::string* error);
-    bool start_checkpoint_locked(CheckpointCompletion completion, bool shutdown,
-                                 std::string* error);
+    PersistenceControlResult
+    start_checkpoint_locked(CheckpointCompletion completion, bool shutdown);
+    PersistenceControlResult control_fail(PersistenceControlStatus status,
+                                          const std::string& error) const;
     void on_checkpoint_paused(bool success, const std::string& error);
     void on_checkpoint_rotated(const GroupCommitWalBarrierInfo& info);
     void on_checkpoint_written(RdbSaveResult result, const std::string& error,
@@ -481,6 +519,7 @@ class PersistenceManager {
     PersistenceStats stats_;
     TransactionStats transaction_stats_;
     std::function<void(const WalRecord&)> after_apply_callback_;
+    std::function<void()> checkpoint_rdb_publish_hook_;
     std::thread checkpoint_worker_;
 };
 

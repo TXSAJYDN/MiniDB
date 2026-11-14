@@ -14,6 +14,7 @@ add_executable(base_test
     ErrorTest.cpp
     HttpParserP0Test.cpp
     ContentLengthParserTest.cpp
+    JsonTest.cpp
 )
 
 target_link_libraries(base_test
@@ -217,7 +218,7 @@ foreach(process_case IN LISTS MINIDB_PROCESS_CASES)
         NAME ProcessIntegrationTest.${process_case}
         COMMAND Python3::Interpreter
                 "${CMAKE_CURRENT_SOURCE_DIR}/process_integration_test.py"
-                --http "$<TARGET_FILE:minidb_http_server>"
+                --http "$<TARGET_FILE:minidb_http_test_server>"
                 --kv "$<TARGET_FILE:minidb_kv_server>"
                 --case "${process_case}"
     )

@@ -13,8 +13,8 @@ class HttpRequest {
     enum Version : std::uint8_t { kUnknown, kHttp10, kHttp11 };
 
     HttpRequest()
-        : method_(kInvalid), version_(kUnknown), method_token_valid_(false),
-          header_parse_error_(false) {}
+        : method_(kInvalid), version_(kUnknown), has_query_(false),
+          method_token_valid_(false), header_parse_error_(false) {}
 
     void set_version(Version v) {
         version_ = v;
@@ -48,7 +48,13 @@ class HttpRequest {
         return path_;
     }
     void set_query(const char* start, const char* end) {
+        has_query_ = true;
         query_.assign(start, end);
+    }
+    // Distinguishes "no query component" from a present but empty query
+    // ("/kv/key?").  The latter is a malformed query, not an absent one.
+    bool has_query() const {
+        return has_query_;
     }
     const std::string& query() const {
         return query_;
@@ -90,6 +96,7 @@ class HttpRequest {
         query_.swap(that.query_);
         headers_.swap(that.headers_);
         body_.swap(that.body_);
+        swap(has_query_, that.has_query_);
         swap(method_token_valid_, that.method_token_valid_);
         swap(header_parse_error_, that.header_parse_error_);
     }
@@ -102,6 +109,7 @@ class HttpRequest {
     std::string query_;
     std::map<std::string, std::string> headers_;
     std::string body_;
+    bool has_query_;
     bool method_token_valid_;
     bool header_parse_error_;
 };

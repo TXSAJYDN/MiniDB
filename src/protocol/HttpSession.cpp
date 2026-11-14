@@ -88,7 +88,8 @@ const char* reason_phrase(int status) {
 HttpSession::HttpSession(const TcpConnectionPtr& conn)
     : conn_(conn), started_(false), processing_(false), closing_(false),
       closed_(false), drain_scheduled_(false), awaiting_async_response_(false),
-      request_close_(false), requests_handled_(0), idle_timer_id_(0) {}
+      request_close_(false), request_is_head_(false), requests_handled_(0),
+      idle_timer_id_(0) {}
 
 HttpSession::~HttpSession() {
     cancel_idle_timeout();
@@ -192,6 +193,7 @@ void HttpSession::drain() {
         return;
     }
 
+    request_is_head_ = req.method() == HttpRequest::kHead;
     processing_ = true;
     cancel_idle_timeout();
     conn_->stop_reading();
@@ -363,8 +365,15 @@ bool HttpSession::send_response(const HttpResponse& resp) {
         return false;
     }
 
+    // HEAD keeps the Content-Length a GET would produce but omits the body
+    // bytes.  Copying here covers synchronous, deferred, validation, and
+    // error responses without teaching every route about HEAD.
+    HttpResponse effective = resp;
+    if (request_is_head_) {
+        effective.set_suppress_body(true);
+    }
     Buffer buf;
-    resp.append_to_buffer(&buf);
+    effective.append_to_buffer(&buf);
     if (buf.readable_bytes() == 0) {
         return true;
     }
@@ -420,6 +429,10 @@ void HttpSession::on_write_complete() {
     if (closed_) {
         return;
     }
+
+    // The current request has been fully answered.  A later timeout or
+    // protocol error must not inherit HEAD body suppression.
+    request_is_head_ = false;
 
     if (closing_) {
         closed_ = true;

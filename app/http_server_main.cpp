@@ -8,6 +8,15 @@
 #include <ostream>
 #include <string>
 
+#ifdef MINIDB_TEST_HOOKS
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
+#include <thread>
+#endif
+
 using namespace minidb;
 
 namespace {
@@ -20,6 +29,47 @@ void print_usage(const char* prog, std::ostream& out) {
         << "  -d <mode>      Durability: sync or interval (default: sync)\n"
         << "  -h             Show this help\n";
 }
+
+#ifdef MINIDB_TEST_HOOKS
+// Test-only seam used by the process integration suite.  The hook runs after
+// the checkpoint RDB is durable but before the manifest is published, so the
+// test can kill the process in the exact recovery window.
+void install_test_checkpoint_rdb_publish_hook(HttpServer& server) {
+    PersistenceManager* manager = server.persistence_manager();
+    if (!manager) {
+        return;
+    }
+    manager->set_checkpoint_rdb_publish_hook([] {
+        const char* marker = std::getenv("MINIDB_TEST_RDB_PUBLISH_MARKER");
+        if (!marker || *marker == '\0') {
+            return;
+        }
+        {
+            std::ofstream output(marker, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                return;
+            }
+            output << "published\n";
+        }
+
+        const char* release = std::getenv("MINIDB_TEST_RDB_PUBLISH_RELEASE");
+        if (!release || *release == '\0') {
+            return;
+        }
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        std::error_code error;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (std::filesystem::exists(std::filesystem::path(release),
+                                        error)) {
+                return;
+            }
+            error.clear();
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    });
+}
+#endif
 
 } // namespace
 
@@ -64,15 +114,23 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::cout << "Persistence image recovered successfully\n";
+#ifdef MINIDB_TEST_HOOKS
+    install_test_checkpoint_rdb_publish_hook(server);
+#endif
 
     std::cout << "\nMiniDB HTTP server starting on port " << options.port
               << '\n';
     std::cout << "\nEndpoints:\n";
-    std::cout << "  GET    /health      - Health check\n";
-    std::cout << "  GET    /kv/<key>    - Get value\n";
-    std::cout << "  POST   /kv/<key>    - Set value (body as value)\n";
-    std::cout << "  DELETE /kv/<key>    - Delete key\n";
-    std::cout << "  POST   /save        - Publish a durable RDB checkpoint\n";
+    std::cout
+        << "  GET, HEAD /health      - Health check (HEAD sends no body)\n";
+    std::cout << "  GET, HEAD /stats       - Persistence statistics JSON\n";
+    std::cout << "  POST      /echo        - Echo the request body\n";
+    std::cout << "  GET, HEAD /kv/<key>    - Get value (HEAD sends no body)\n";
+    std::cout << "  GET, HEAD /kv/<key>?ttl=1 - Read TTL metadata JSON\n";
+    std::cout << "  POST      /kv/<key>    - Set value (body as value)\n";
+    std::cout << "  DELETE    /kv/<key>    - Delete key\n";
+    std::cout
+        << "  POST      /save        - Publish a durable RDB checkpoint\n";
     std::cout << "\nPress Ctrl+C to stop\n\n";
 
     server.start();

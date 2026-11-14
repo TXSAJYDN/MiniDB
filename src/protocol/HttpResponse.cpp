@@ -24,6 +24,7 @@ void HttpResponse::append_to_buffer(Buffer* output) const {
 
     // Content-Length is mandatory on every response, including close
     // responses, so clients can frame the final error/body deterministically.
+    // HEAD deliberately keeps this length while suppressing the body bytes.
     output->append("Content-Length: ");
     output->append(std::to_string(body_.size()));
     output->append("\r\n");
@@ -36,7 +37,9 @@ void HttpResponse::append_to_buffer(Buffer* output) const {
     }
 
     output->append("\r\n");
-    output->append(body_);
+    if (!suppress_body_) {
+        output->append(body_);
+    }
 }
 
 } // namespace minidb

@@ -52,7 +52,8 @@ TEST_F(IntegrationTest, SaveAndLoadCyclePreservesBinaryValues) {
         store->set("key3", "value3");
         server.set_kv_store(store);
 
-        EXPECT_EQ(server.save_rdb(), RdbSaveResult::Ok);
+        EXPECT_EQ(RdbManager(rdb_path).save_checked(*server.kv_store()),
+                  RdbSaveResult::Ok);
         EXPECT_TRUE(fs::exists(rdb_path));
     }
 
@@ -75,7 +76,8 @@ TEST_F(IntegrationTest, EmptyDatabase) {
     EventLoop loop;
     HttpServer server(&loop, InetAddress(0), rdb_path);
 
-    EXPECT_EQ(server.save_rdb(), RdbSaveResult::Ok);
+    EXPECT_EQ(RdbManager(rdb_path).save_checked(*server.kv_store()),
+              RdbSaveResult::Ok);
     EXPECT_TRUE(fs::exists(rdb_path));
 
     ASSERT_TRUE(server.load_rdb());
@@ -99,13 +101,16 @@ TEST_F(IntegrationTest, MultipleSavesReplaceSnapshot) {
     server.set_kv_store(store);
 
     store->set("a", "1");
-    EXPECT_EQ(server.save_rdb(), RdbSaveResult::Ok);
+    EXPECT_EQ(RdbManager(rdb_path).save_checked(*server.kv_store()),
+              RdbSaveResult::Ok);
 
     store->set("b", "2");
-    EXPECT_EQ(server.save_rdb(), RdbSaveResult::Ok);
+    EXPECT_EQ(RdbManager(rdb_path).save_checked(*server.kv_store()),
+              RdbSaveResult::Ok);
 
     store->set("c", "3");
-    EXPECT_EQ(server.save_rdb(), RdbSaveResult::Ok);
+    EXPECT_EQ(RdbManager(rdb_path).save_checked(*server.kv_store()),
+              RdbSaveResult::Ok);
 
     ASSERT_TRUE(fs::exists(rdb_path));
     EventLoop load_loop;
@@ -128,7 +133,8 @@ TEST_F(IntegrationTest, SaveAndLoadWithTTLPreservesDeadline) {
         ASSERT_TRUE(store->expire("expiring", 3600000));
         server.set_kv_store(store);
 
-        EXPECT_EQ(server.save_rdb(), RdbSaveResult::Ok);
+        EXPECT_EQ(RdbManager(rdb_path).save_checked(*server.kv_store()),
+                  RdbSaveResult::Ok);
     }
 
     {

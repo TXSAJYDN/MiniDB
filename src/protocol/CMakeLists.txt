@@ -2,11 +2,13 @@ add_library(minidb_protocol
     HttpRequest.cpp
     HttpResponse.cpp
     HttpParser.cpp
+    Json.cpp
     HttpSession.cpp
     HttpServer.cpp
     KvProtocol.cpp
     KvSession.cpp
     KvServer.cpp
+    ServerPersistenceRuntime.cpp
 )
 
 target_include_directories(minidb_protocol PUBLIC )

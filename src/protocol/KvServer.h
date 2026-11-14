@@ -1,11 +1,13 @@
 #pragma once
+
 #include "../net/TcpServer.h"
 #include "KvSession.h"
+#include "ServerPersistenceRuntime.h"
 #include "../storage/KvStore.h"
-#include "../storage/PersistenceManager.h"
-#include "../storage/RdbManager.h"
-#include <memory>
+
+#include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -31,16 +33,16 @@ class KvServer {
         return shutdown_started_;
     }
     bool shutdown_complete() const {
-        return shutdown_complete_;
+        return runtime_.shutdown_complete();
     }
     RdbSaveResult shutdown_result() const {
-        return shutdown_result_;
+        return runtime_.shutdown_result();
     }
     const std::string& shutdown_error() const {
-        return shutdown_error_;
+        return runtime_.shutdown_error();
     }
-    // Stops this server's TTL scanner lease.  Idempotent.  begin_shutdown()
-    // already performs this step.
+    // Cancels runtime-owned timers and releases the TTL scanner lease.
+    // Idempotent.  begin_shutdown() already performs this step.
     void stop();
     // Must be called before start().
     void set_kv_store(std::shared_ptr<KvStore> store);
@@ -48,40 +50,23 @@ class KvServer {
         return server_.listen_address();
     }
     bool load_rdb();
-    // Returns Ok only after the snapshot and its parent directory were made
-    // durable.  DurabilityUnconfirmed is intentionally not treated as success
-    // by the process exit path.
-    RdbSaveResult save_rdb();
 
     PersistenceManager* persistence_manager() const {
-        return persistence_manager_.get();
+        return runtime_.persistence_manager();
     }
 
   private:
     void on_connection(const TcpConnectionPtr& conn);
     void on_message(const TcpConnectionPtr& conn, Buffer* buf);
-    void flush_interval();
     void run_agent_gc();
-    void try_start_persistence_shutdown();
     void finish_shutdown(RdbSaveResult result, const std::string& error);
 
     EventLoop* loop_;
-    std::shared_ptr<KvStore> kv_store_;
-    std::unique_ptr<RdbManager> rdb_manager_;
-    std::string rdb_path_;
-    DurabilityMode durability_mode_;
-    std::unique_ptr<PersistenceManager> persistence_manager_;
-    std::uint64_t interval_timer_id_ = 0;
-    std::uint64_t agent_gc_timer_id_ = 0;
-    KvStore::ScannerLease scanner_lease_;
+    ServerPersistenceRuntime runtime_;
     bool started_ = false;
+    std::uint64_t agent_gc_timer_id_ = 0;
     bool shutdown_started_ = false;
-    bool shutdown_complete_ = false;
-    bool persistence_shutdown_pending_ = false;
-    RdbSaveResult shutdown_result_ = RdbSaveResult::Failed;
-    std::string shutdown_error_;
     std::vector<ShutdownCompletion> shutdown_completions_;
-    std::uint64_t shutdown_retry_timer_id_ = 0;
     std::map<std::string, std::shared_ptr<KvSession>> sessions_;
     // Destroy the server (and invoke close callbacks) before the session map
     // and storage dependencies it refers to.

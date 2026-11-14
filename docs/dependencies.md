@@ -26,6 +26,7 @@ availability.
 
 ## Licensing note
 
-No repository-level license file is currently present. Distribution or
-public-contribution terms therefore require an explicit owner decision; this
-document does not infer or grant a license.
+MiniDB is licensed under the Apache License 2.0; see the repository-level
+`LICENSE` and `NOTICE` files. GoogleTest is test-only third-party code and
+retains its own BSD-3-Clause license. Redistributions must preserve the
+applicable license and notice material.

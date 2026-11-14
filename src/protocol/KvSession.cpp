@@ -459,16 +459,17 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
 bool KvSession::handle_save() {
     if (persistence_manager_) {
         std::weak_ptr<KvSession> weak = weak_from_this();
-        std::string error;
-        if (!persistence_manager_->checkpoint_async(
-                [weak](RdbSaveResult result,
+        const PersistenceControlResult result =
+            persistence_manager_->checkpoint_async_result(
+                [weak](RdbSaveResult checkpoint_result,
                        const std::string& completion_error) {
                     if (auto self = weak.lock()) {
-                        self->on_save_completed(result, completion_error);
+                        self->on_save_completed(checkpoint_result,
+                                                completion_error);
                     }
-                },
-                &error)) {
-            Log::Error("SAVE could not start: " + error);
+                });
+        if (!result.accepted()) {
+            Log::Error("SAVE could not start: " + result.error);
             send_response(KvProtocol::kError, {"Failed to save RDB"});
         }
         return true;

@@ -113,15 +113,15 @@ empty POST body and an empty value are valid.
 ## Routing
 
 Routing uses the decoded-free path component. Percent escapes are not decoded.
-The query string is retained in the parsed request but is not used for routing.
+The query component is never part of route matching.
 
 | Method | Path | Behavior |
 |---|---|---|
-| GET | `/health` | Returns `OK\n` with 200 |
-| GET | `/stats` | Returns persistence statistics JSON with 200 |
+| GET, HEAD | `/health` | Returns `OK\n` with 200 |
+| GET, HEAD | `/stats` | Returns persistence statistics JSON with 200 |
 | POST | `/echo` | Returns the exact request body as `application/octet-stream` |
 | POST | `/save` | Starts the durable checkpoint state machine and defers the response until publication completes |
-| GET | `/kv/<key>` | Returns the raw value or 404 |
+| GET, HEAD | `/kv/<key>` | Returns the raw value, TTL metadata with `?ttl=1`, or 404 |
 | POST | `/kv/<key>` | Stores the exact body as the value and returns 200 |
 | DELETE | `/kv/<key>` | Deletes a live key or returns 404 |
 
@@ -132,14 +132,60 @@ For `/kv/<key>`:
 - the key must be 1..1024 bytes;
 - values are binary-safe and may be empty;
 - POST clears any existing TTL for the key;
-- HTTP does not expose EXPIRE, TTL, BEGIN, COMMIT, or ROLLBACK; use the binary
-  protocol for those commands.
-- Each HTTP KV mutation is an independent implicit transaction. Two requests
+- POST and DELETE do not accept a query component;
+- HTTP does not expose EXPIRE, BEGIN, COMMIT, or ROLLBACK; use the binary
+  protocol for those commands;
+- each HTTP KV mutation is an independent implicit transaction. Two requests
   cannot be committed atomically together, and an HTTP connection cannot pin a
   snapshot across requests.
 
 A known path with the wrong method returns 405 with an `Allow` header. A known
 method on an unknown path returns 404. A valid extension method returns 501.
+
+### Query policy
+
+The only supported query is the exact byte string `ttl=1` on
+`GET/HEAD /kv/<key>`. There is no percent-decoding, case folding, whitespace
+trimming, duplicate merging, or default parameter.
+
+| Query | Result |
+|---|---|
+| absent | Normal value retrieval |
+| `?ttl=1` | TTL metadata for the key |
+| `?` | 400 |
+| `?ttl=2` or any other value | 400 |
+| repeated, duplicate, or unknown parameters | 400 |
+| any query on another route or method | 400 |
+
+An unsupported query is rejected before route-specific handling, so, for
+example, `POST /kv/key?ttl=1` and `GET /health?` both return 400.
+
+### HEAD semantics
+
+A HEAD response carries the same status code, response headers, and
+`Content-Length` that the corresponding GET would produce, but the server omits
+the body bytes. This applies to successful routes and to 4xx/5xx responses,
+including keep-alive and pipelined requests. `Content-Length` therefore describes
+the would-be GET body, not the zero bytes on the HEAD wire; clients must not wait
+for a HEAD body.
+
+### KV TTL metadata
+
+`GET /kv/<key>?ttl=1` returns `application/json` with one of these bodies:
+
+~~~json
+{"ttl_ms":12345}
+~~~
+
+~~~json
+{"ttl_ms":null}
+~~~
+
+A non-negative integer is the remaining TTL in milliseconds, rounded down. A
+`null` value means the key exists without an expiry. A missing or expired key
+returns the normal 404 response. `HEAD /kv/<key>?ttl=1` returns the same status
+and headers with no body bytes. The metadata route is read-only; setting TTL
+still requires the binary KV `EXPIRE` command.
 
 ## `/save` semantics
 
@@ -176,7 +222,7 @@ checkpoint: residue is safe and a later SAVE retries cleanup.
 
 ## `/stats` response
 
-`GET /stats` returns `application/json` with a stable top-level shape:
+`GET /stats` and `HEAD /stats` return `application/json` with a stable top-level shape:
 
 ~~~json
 {
@@ -367,7 +413,7 @@ connection.
 | Status | Meaning in MiniDB |
 |---:|---|
 | 200 | Successful route |
-| 400 | Malformed request, invalid Host, invalid method token, unsupported Upgrade, or bad framing |
+| 400 | Malformed request, invalid Host, invalid method token, unsupported Upgrade, bad framing, or unsupported/ambiguous query |
 | 404 | Unknown path or missing KV key |
 | 405 | Known path, unsupported method |
 | 408 | Idle/incomplete request timeout |
@@ -386,14 +432,18 @@ Health and diagnostics:
 
 ~~~bash
 curl -i http://127.0.0.1:8080/health
+curl -I http://127.0.0.1:8080/health
 curl -i http://127.0.0.1:8080/stats
 ~~~
 
-Store and fetch a binary-safe value:
+Store, fetch, and inspect TTL metadata for a binary-safe value:
 
 ~~~bash
 curl -i -X POST --data-binary 'value' http://127.0.0.1:8080/kv/key
 curl -i http://127.0.0.1:8080/kv/key
+curl -I http://127.0.0.1:8080/kv/key
+curl -i 'http://127.0.0.1:8080/kv/key?ttl=1'
+curl -I 'http://127.0.0.1:8080/kv/key?ttl=1'
 ~~~
 
 Delete:

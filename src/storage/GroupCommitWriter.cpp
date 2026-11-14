@@ -121,48 +121,48 @@ bool GroupCommitWriter::start(std::uint64_t first_lsn, std::string* error) {
     return true;
 }
 
-bool GroupCommitWriter::submit(GroupCommitEntry entry, std::string* error) {
-    if (!WalFormat::validate(entry.record, error)) {
-        return false;
+GroupCommitSubmitResult
+GroupCommitWriter::submit_result(GroupCommitEntry entry) {
+    GroupCommitSubmitResult result;
+    std::string validation_error;
+    if (!WalFormat::validate(entry.record, &validation_error)) {
+        result.status = GroupCommitSubmitStatus::kInvalidRecord;
+        result.error = std::move(validation_error);
+        return result;
     }
 
     const std::uint64_t bytes = command_bytes(entry);
     if (bytes == std::numeric_limits<std::uint64_t>::max()) {
-        if (error != nullptr) {
-            *error = "group commit entry byte count overflows";
-        }
-        return false;
+        result.status = GroupCommitSubmitStatus::kByteOverflow;
+        result.error = "group commit entry byte count overflows";
+        return result;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (state_ != GroupCommitWriterState::kRunning || !accepting_) {
         ++stats_.queue_rejections;
-        if (error != nullptr) {
-            *error = "group commit writer is not accepting mutations";
-        }
-        return false;
+        result.status = GroupCommitSubmitStatus::kNotAccepting;
+        result.error = "group commit writer is not accepting mutations";
+        return result;
     }
     if (entry.record.lsn != next_lsn_) {
         ++stats_.queue_rejections;
-        if (error != nullptr) {
-            *error = "group commit mutation LSN is not the next admitted LSN";
-        }
-        return false;
+        result.status = GroupCommitSubmitStatus::kInvalidLsn;
+        result.error = "group commit mutation LSN is not the next admitted LSN";
+        return result;
     }
     if (entry.record.lsn == std::numeric_limits<std::uint64_t>::max()) {
         ++stats_.queue_rejections;
-        if (error != nullptr) {
-            *error = "group commit LSN space is exhausted";
-        }
-        return false;
+        result.status = GroupCommitSubmitStatus::kLsnExhausted;
+        result.error = "group commit LSN space is exhausted";
+        return result;
     }
     if (queued_mutations_ >= limits_.max_queue_entries ||
         bytes > limits_.max_queue_bytes - queue_bytes_) {
         ++stats_.queue_rejections;
-        if (error != nullptr) {
-            *error = "group commit admission queue is full";
-        }
-        return false;
+        result.status = GroupCommitSubmitStatus::kQueueFull;
+        result.error = "group commit admission queue is full";
+        return result;
     }
 
     Command command;
@@ -183,7 +183,16 @@ bool GroupCommitWriter::submit(GroupCommitEntry entry, std::string* error) {
     stats_.queue_max_bytes =
         std::max(stats_.queue_max_bytes, stats_.queue_current_bytes);
     condition_.notify_one();
-    return true;
+    result.status = GroupCommitSubmitStatus::kAccepted;
+    return result;
+}
+
+bool GroupCommitWriter::submit(GroupCommitEntry entry, std::string* error) {
+    GroupCommitSubmitResult result = submit_result(std::move(entry));
+    if (!result.accepted() && error != nullptr) {
+        *error = std::move(result.error);
+    }
+    return result.accepted();
 }
 
 bool GroupCommitWriter::enqueue_barrier_locked(CommandKind kind,

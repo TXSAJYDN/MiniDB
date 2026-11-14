@@ -46,6 +46,41 @@ TEST_F(HttpParserP0Test, AcceptValidPostWithHostAndBinarySafeBody) {
     EXPECT_EQ(request.body(), body);
 }
 
+TEST_F(HttpParserP0Test, QueryPresenceIsExplicit) {
+    HttpRequest absent;
+    Result result =
+        Parse("GET /kv/key HTTP/1.1\r\nHost: localhost\r\n\r\n", &absent);
+    EXPECT_TRUE(result.ok);
+    EXPECT_TRUE(result.got_all);
+    EXPECT_EQ(absent.path(), "/kv/key");
+    EXPECT_FALSE(absent.has_query());
+
+    HttpRequest empty;
+    result = Parse("GET /kv/key? HTTP/1.1\r\nHost: localhost\r\n\r\n", &empty);
+    EXPECT_TRUE(result.ok);
+    EXPECT_TRUE(result.got_all);
+    EXPECT_EQ(empty.path(), "/kv/key");
+    EXPECT_TRUE(empty.has_query());
+    EXPECT_TRUE(empty.query().empty());
+
+    HttpRequest ttl;
+    result =
+        Parse("GET /kv/key?ttl=1 HTTP/1.1\r\nHost: localhost\r\n\r\n", &ttl);
+    EXPECT_TRUE(result.ok);
+    EXPECT_TRUE(result.got_all);
+    EXPECT_EQ(ttl.path(), "/kv/key");
+    EXPECT_TRUE(ttl.has_query());
+    EXPECT_EQ(ttl.query(), "ttl=1");
+
+    HttpRequest embedded;
+    result =
+        Parse("GET /kv/a?b?c HTTP/1.1\r\nHost: localhost\r\n\r\n", &embedded);
+    EXPECT_TRUE(result.ok);
+    EXPECT_TRUE(result.got_all);
+    EXPECT_EQ(embedded.path(), "/kv/a");
+    EXPECT_EQ(embedded.query(), "b?c");
+}
+
 TEST_F(HttpParserP0Test, RequireExactlyOneValidHost) {
     EXPECT_EQ(Parse("GET / HTTP/1.1\r\n\r\n").error,
               HttpParser::ParseError::kBadRequest);

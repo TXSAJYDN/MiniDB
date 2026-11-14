@@ -34,6 +34,8 @@ MiniDB 是可靠性工程原型，**不宣称生产可用**，不宣称 Redis/SQ
 - Agent 的 session、tool、lease、generic record 和 idempotency 结果使用保留命名空间与版本化记录，复用同一 WAL、RDB、checkpoint 和 manifest；
 - Agent mutation 与其幂等结果在同一个 `kTxn`、同一个 LSN 原子提交，重试相同请求不会重复 bump revision；
 - session lease 使用单调 fence 和严格 CAS，崩溃后的接管不会复活旧 worker 的写入。
+- HTTP 与 KV 前端共用 `ServerPersistenceRuntime` 管理 store、PersistenceManager、TTL scanner、INTERVAL timer 和优雅关闭；SAVE/shutdown/flush/GC 控制流使用 typed status，不依赖错误字符串匹配。
+- HTTP 控制面执行严格 query 校验，并为 `/health`、`/stats` 和 `/kv/<key>` 提供 GET 等价 Header、零 body 的 HEAD 语义。
 
 ## Durability 语义
 
@@ -70,6 +72,27 @@ curl -i http://127.0.0.1:8080/kv/greeting
 curl -i http://127.0.0.1:8080/stats
 curl -i -X POST http://127.0.0.1:8080/save
 ~~~
+
+### HTTP 路由、HEAD 与 TTL 元数据
+
+| Method | Path | 行为 |
+|---|---|---|
+| GET, HEAD | `/health` | 健康检查，GET body 为 `OK\n` |
+| GET, HEAD | `/stats` | 持久化统计 JSON |
+| POST | `/echo` | 原样回显请求 body |
+| POST | `/save` | 启动 checkpoint，发布 manifest 后才响应 |
+| GET, HEAD | `/kv/<key>` | 返回原始 value 或 404 |
+| POST | `/kv/<key>` | 将 body 写为 value，并清除旧 TTL |
+| DELETE | `/kv/<key>` | 删除 key，不存在时 404 |
+
+`HEAD` 使用与对应 GET 相同的状态码、响应 Header 和 `Content-Length`，但不发送
+body 字节；该规则同样适用于错误响应、keep-alive 和流水线请求。
+
+只有 `GET/HEAD /kv/<key>` 接受精确查询 `?ttl=1`。成功时返回
+`{"ttl_ms":12345}\n`，无过期时间时返回 `{"ttl_ms":null}\n`，key 不存在时
+返回 404。空查询 `?`、重复/未知参数、其他值，以及在 POST/DELETE `/kv` 或
+非 KV 路由上携带查询，均返回 400。HTTP 不暴露 EXPIRE；设置 TTL 仍使用二进制
+KV 协议。
 
 ### 启动 KV 服务
 
@@ -199,13 +222,20 @@ KV 的 `STATS`（命令类型 8）和 HTTP 的 `GET /stats` 返回同一稳定 J
 ## 验证状态
 
 R4-A 组提交、R4-B 后台全量 checkpoint、R4-C Snapshot Isolation 事务和 R4-D
-Agent 持久状态后端均已实现，本地质量门禁及对应证据已完成：
+Agent 持久状态后端均已实现。R4-D 的历史本地六配置质量门禁为：
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种构建配置；
 - 每个配置 **440 项 CTest**，包含 31 个 `ProcessIntegrationTest.*` 进程级用例；
+- 当前 post-R4-D HTTP 控制面加固在 **Debug 配置通过 449/449 项 CTest**，
+  仍包含 31 个进程级用例；本次没有重跑六配置，不把 Debug 结果外推到其他
+  配置，也不继承历史提交的远程 CI；
 - 组提交 writer 的顺序、batch 上限、queue/backlog full、append/fsync 失败、cleanup barrier、fail-stop 和 callback 恰好一次测试；
 - 后台 checkpoint 状态机、完整 live segment 保留、cleanup 失败重试、manager 析构回调安全，以及 rename 后/manifest 前崩溃恢复测试；
 - HTTP/KV 异步 mutation、断开连接安全、流水线响应顺序、SAVE/STATS 和 shutdown 失败退出码测试；
+- HTTP HEAD 在成功、500、503、keep-alive 和流水线中保持 GET 等价
+  `Content-Length` 且零 body；严格 query/TTL 矩阵、JSON escaping、typed
+  control outcomes 和共享 runtime 测试；进程级 rename-before-manifest 崩溃
+  用例使用独立的 `minidb_http_test_server`，生产二进制不编译 test hook；
 - 事务快照读、read-your-writes、first-committer-wins、pending commit 冲突窗口、只读提交、断连回滚、原子 `kTxn` 恢复、TTL/GC、资源上限和事务 stats 契约测试；
 - Agent codec、保留命名空间、revision/CAS、幂等重放、lease/fence 接管、tool 状态机、GC、恢复 fail-stop 和 stats 契约测试；
 - Agent 进程级用例覆盖幂等崩溃恢复、lease takeover、RUNNING tool 恢复、命名空间碰撞和 stats；

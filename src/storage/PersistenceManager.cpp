@@ -8,10 +8,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
-#include <cstdlib>
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -73,42 +71,35 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Crash-test seam for the asynchronous checkpoint path only.  A process test
-// can observe that the new RDB and parent directory are durable while the old
-// manifest is still authoritative, then SIGKILL the server.  Production never
-// sets these variables, so this is a no-op outside crash tests.
-void maybe_pause_after_checkpoint_rdb_publish() {
-    const char* marker_path = std::getenv("MINIDB_TEST_RDB_PUBLISH_MARKER");
-    if (marker_path == nullptr || *marker_path == '\0') {
-        return;
-    }
-    std::ofstream marker(marker_path, std::ios::trunc);
-    if (!marker.is_open()) {
-        return;
-    }
-    marker << "rdb-published\n";
-    marker.close();
-
-    const char* release_path = std::getenv("MINIDB_TEST_RDB_PUBLISH_RELEASE");
-    if (release_path == nullptr || *release_path == '\0') {
-        return;
-    }
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(60);
-    std::error_code ec;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (fs::exists(release_path, ec) && !ec) {
-            return;
-        }
-        ec.clear();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-}
-
 const char* mutation_io_error = "persistence I/O failure";
 const char* group_commit_active_error =
     "group commit is active; use the asynchronous persistence API";
 const char* reserved_agent_key_error = "key is in the reserved agent namespace";
+
+MutationAdmissionStatus
+admission_status_from_submit(GroupCommitSubmitStatus status,
+                             GroupCommitWriterState writer_state) noexcept {
+    switch (status) {
+    case GroupCommitSubmitStatus::kQueueFull:
+    case GroupCommitSubmitStatus::kByteOverflow:
+        return MutationAdmissionStatus::kResourceLimit;
+    case GroupCommitSubmitStatus::kNotAccepting:
+        if (writer_state == GroupCommitWriterState::kFailed) {
+            return MutationAdmissionStatus::kIoError;
+        }
+        if (writer_state == GroupCommitWriterState::kStopped ||
+            writer_state == GroupCommitWriterState::kDraining) {
+            return MutationAdmissionStatus::kShuttingDown;
+        }
+        return MutationAdmissionStatus::kNotReady;
+    case GroupCommitSubmitStatus::kAccepted:
+    case GroupCommitSubmitStatus::kInvalidLsn:
+    case GroupCommitSubmitStatus::kLsnExhausted:
+    case GroupCommitSubmitStatus::kInvalidRecord:
+        break;
+    }
+    return MutationAdmissionStatus::kNotReady;
+}
 
 bool is_reserved_agent_key(const std::string& key) noexcept {
     return AgentRecordCodec::is_reserved_key(key);
@@ -1731,31 +1722,31 @@ PersistenceManager::agent_mutate_async(const AgentRequest& request,
     return result;
 }
 
-bool PersistenceManager::agent_gc_async(std::string* error) {
+PersistenceControlResult PersistenceManager::agent_gc_async_result() {
     std::lock_guard<std::mutex> lock(operation_mutex_);
-    if (!opened_ || failed_) {
-        if (error != nullptr) {
-            *error = failed_ ? mutation_io_error : "persistence is not open";
-        }
-        return false;
+    if (!opened_) {
+        return control_fail(PersistenceControlStatus::kNotOpen,
+                            "persistence is not open");
+    }
+    if (failed_) {
+        return control_fail(PersistenceControlStatus::kIoError,
+                            mutation_io_error);
     }
     if (!group_commit_started_) {
-        if (error != nullptr) {
-            *error = "group commit writer is not started";
-        }
-        return false;
+        return control_fail(PersistenceControlStatus::kGroupCommitNotStarted,
+                            "group commit writer is not started");
     }
     if (shutdown_requested_ || shutdown_complete_ || !accepting_mutations_) {
-        return true;
+        return control_fail(PersistenceControlStatus::kShuttingDown,
+                            "persistence is shutting down");
     }
 
     std::string writer_error;
     if (!ensure_group_commit_writer_locked(&writer_error)) {
-        if (error != nullptr) {
-            *error = writer_error.empty() ? "group commit is not ready"
-                                          : writer_error;
-        }
-        return !failed_;
+        return control_fail(failed_ ? PersistenceControlStatus::kIoError
+                                    : PersistenceControlStatus::kNotReady,
+                            writer_error.empty() ? "group commit is not ready"
+                                                 : writer_error);
     }
 
     const std::vector<AgentStateStore::GcCandidate> candidates =
@@ -1783,7 +1774,7 @@ bool PersistenceManager::agent_gc_async(std::string* error) {
     }
 
     if (selected_keys.empty()) {
-        return true;
+        return control_fail(PersistenceControlStatus::kAccepted, {});
     }
 
     std::vector<WalTxnOp> operations;
@@ -1800,11 +1791,10 @@ bool PersistenceManager::agent_gc_async(std::string* error) {
         WalFormat::encode_transaction(operations, &payload_error);
     if (payload.empty()) {
         agent_store_.note_gc_failure();
-        if (error != nullptr) {
-            *error = payload_error.empty() ? "Agent GC transaction is invalid"
-                                           : payload_error;
-        }
-        return true;
+        return control_fail(PersistenceControlStatus::kNotReady,
+                            payload_error.empty()
+                                ? "Agent GC transaction is invalid"
+                                : payload_error);
     }
 
     WalRecord record;
@@ -1819,19 +1809,36 @@ bool PersistenceManager::agent_gc_async(std::string* error) {
                           PendingMutationKind::kAgentGc, {},
                           selected_candidates, selected_keys.size());
     if (admission.accepted()) {
-        return true;
+        return control_fail(PersistenceControlStatus::kAccepted, {});
     }
 
     agent_store_.note_gc_failure();
-    if (error != nullptr) {
-        *error = admission.error.empty() ? "Agent GC admission failed"
-                                         : admission.error;
+    PersistenceControlStatus status = PersistenceControlStatus::kNotReady;
+    if (admission.status == MutationAdmissionStatus::kIoError) {
+        status = PersistenceControlStatus::kIoError;
+    } else if (admission.status == MutationAdmissionStatus::kShuttingDown) {
+        status = PersistenceControlStatus::kShuttingDown;
+    } else if (admission.status == MutationAdmissionStatus::kResourceLimit) {
+        status = PersistenceControlStatus::kBusy;
     }
-    if (admission.status == MutationAdmissionStatus::kIoError ||
-        admission.status == MutationAdmissionStatus::kShuttingDown) {
-        return false;
+    return control_fail(status, admission.error.empty()
+                                    ? "Agent GC admission failed"
+                                    : admission.error);
+}
+
+bool PersistenceManager::agent_gc_async(std::string* error) {
+    PersistenceControlResult result = agent_gc_async_result();
+    if (!result.accepted() && error != nullptr) {
+        *error = result.error;
     }
-    return true;
+    // The legacy API treated a shutdown no-op and a transient deferred GC as
+    // successful fire-and-forget scheduling.  Preserve that contract while the
+    // typed API lets protocol code distinguish the cases.
+    return result.status == PersistenceControlStatus::kAccepted ||
+           result.status == PersistenceControlStatus::kBusy ||
+           result.status == PersistenceControlStatus::kShuttingDown ||
+           result.status == PersistenceControlStatus::kShutdownComplete ||
+           result.status == PersistenceControlStatus::kNotReady;
 }
 
 MutationAdmission PersistenceManager::admit_agent_async(
@@ -1892,24 +1899,17 @@ MutationAdmission PersistenceManager::admit_agent_async(
     GroupCommitEntry entry;
     entry.record = std::move(record);
     entry.submitted_us = steady_now_us();
-    std::string submit_error;
-    if (!group_commit_writer_->submit(std::move(entry), &submit_error)) {
+    const GroupCommitSubmitResult submit =
+        group_commit_writer_->submit_result(std::move(entry));
+    if (!submit.accepted()) {
         const PendingMutation& rejected = pending_mutations_.back();
         remove_pending_keys_locked(rejected.keys, rejected.lsn);
         agent_store_.cancel_reservation(rejected.agent_reservation_id);
         pending_mutations_.pop_back();
 
-        MutationAdmissionStatus status = MutationAdmissionStatus::kNotReady;
-        const GroupCommitWriterState state = group_commit_writer_->state();
-        if (state == GroupCommitWriterState::kFailed) {
-            status = MutationAdmissionStatus::kIoError;
-        } else if (state == GroupCommitWriterState::kStopped ||
-                   state == GroupCommitWriterState::kDraining) {
-            status = MutationAdmissionStatus::kShuttingDown;
-        } else if (submit_error.find("full") != std::string::npos) {
-            status = MutationAdmissionStatus::kResourceLimit;
-        }
-        return admission_fail(status, submit_error);
+        return admission_fail(admission_status_from_submit(
+                                  submit.status, group_commit_writer_->state()),
+                              submit.error);
     }
 
     MutationAdmission admission;
@@ -1956,8 +1956,9 @@ MutationAdmission PersistenceManager::admit_async(WalRecord record,
     GroupCommitEntry entry;
     entry.record = std::move(record);
     entry.submitted_us = started_us;
-    std::string submit_error;
-    if (!group_commit_writer_->submit(std::move(entry), &submit_error)) {
+    const GroupCommitSubmitResult submit =
+        group_commit_writer_->submit_result(std::move(entry));
+    if (!submit.accepted()) {
         const PendingMutation& rejected = pending_mutations_.back();
         remove_pending_keys_locked(rejected.keys, rejected.lsn);
         const PendingMutationKind rejected_kind = rejected.kind;
@@ -1971,17 +1972,9 @@ MutationAdmission PersistenceManager::admit_async(WalRecord record,
             observe_transaction_metrics_locked();
         }
 
-        MutationAdmissionStatus status = MutationAdmissionStatus::kNotReady;
-        const GroupCommitWriterState state = group_commit_writer_->state();
-        if (state == GroupCommitWriterState::kFailed) {
-            status = MutationAdmissionStatus::kIoError;
-        } else if (state == GroupCommitWriterState::kStopped ||
-                   state == GroupCommitWriterState::kDraining) {
-            status = MutationAdmissionStatus::kShuttingDown;
-        } else if (submit_error.find("full") != std::string::npos) {
-            status = MutationAdmissionStatus::kResourceLimit;
-        }
-        return admission_fail(status, submit_error);
+        return admission_fail(admission_status_from_submit(
+                                  submit.status, group_commit_writer_->state()),
+                              submit.error);
     }
 
     MutationAdmission admission;
@@ -2023,32 +2016,28 @@ bool PersistenceManager::flush_interval(std::string* error) {
     return true;
 }
 
-bool PersistenceManager::flush_interval_async(
-    GroupCommitWriter::BarrierCompletion completion, std::string* error) {
+PersistenceControlResult PersistenceManager::flush_interval_async_result(
+    GroupCommitWriter::BarrierCompletion completion) {
     std::lock_guard<std::mutex> lock(operation_mutex_);
-    if (!opened_ || failed_) {
-        if (error != nullptr) {
-            *error = failed_ ? mutation_io_error : "persistence is not open";
-        }
-        return false;
+    if (!opened_) {
+        return control_fail(PersistenceControlStatus::kNotOpen,
+                            "persistence is not open");
+    }
+    if (failed_) {
+        return control_fail(PersistenceControlStatus::kIoError,
+                            mutation_io_error);
     }
     if (!group_commit_started_) {
-        if (error != nullptr) {
-            *error = "group commit writer is not started";
-        }
-        return false;
+        return control_fail(PersistenceControlStatus::kGroupCommitNotStarted,
+                            "group commit writer is not started");
     }
     if (shutdown_requested_ || shutdown_complete_) {
-        if (error != nullptr) {
-            *error = "persistence is shutting down";
-        }
-        return false;
+        return control_fail(PersistenceControlStatus::kShuttingDown,
+                            "persistence is shutting down");
     }
     if (control_pending_ || !accepting_mutations_) {
-        if (error != nullptr) {
-            *error = "persistence control operation is in progress";
-        }
-        return false;
+        return control_fail(PersistenceControlStatus::kBusy,
+                            "persistence control operation is in progress");
     }
     if (!group_commit_writer_) {
         // No record has been admitted since startup, so there is nothing to
@@ -2059,7 +2048,7 @@ bool PersistenceManager::flush_interval_async(
                 completion(true, {});
             });
         }
-        return true;
+        return control_fail(PersistenceControlStatus::kAccepted, {});
     }
 
     const bool count_interval_flush =
@@ -2075,7 +2064,30 @@ bool PersistenceManager::flush_interval_async(
             completion(success, flush_error);
         }
     };
-    return group_commit_writer_->request_flush(std::move(wrapped), error);
+    std::string request_error;
+    if (!group_commit_writer_->request_flush(std::move(wrapped),
+                                             &request_error)) {
+        const GroupCommitWriterState state = group_commit_writer_->state();
+        PersistenceControlStatus status = PersistenceControlStatus::kBusy;
+        if (state == GroupCommitWriterState::kFailed || failed_) {
+            status = PersistenceControlStatus::kIoError;
+        } else if (state == GroupCommitWriterState::kStopped ||
+                   state == GroupCommitWriterState::kDraining) {
+            status = PersistenceControlStatus::kShuttingDown;
+        }
+        return control_fail(status, request_error);
+    }
+    return control_fail(PersistenceControlStatus::kAccepted, {});
+}
+
+bool PersistenceManager::flush_interval_async(
+    GroupCommitWriter::BarrierCompletion completion, std::string* error) {
+    PersistenceControlResult result =
+        flush_interval_async_result(std::move(completion));
+    if (!result.accepted() && error != nullptr) {
+        *error = result.error;
+    }
+    return result.accepted();
 }
 
 RdbSaveResult PersistenceManager::checkpoint(std::string* error) {
@@ -2095,69 +2107,85 @@ RdbSaveResult PersistenceManager::checkpoint(std::string* error) {
     return checkpoint_locked(error);
 }
 
+PersistenceControlResult
+PersistenceManager::checkpoint_async_result(CheckpointCompletion completion) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    return start_checkpoint_locked(std::move(completion), false);
+}
+
 bool PersistenceManager::checkpoint_async(CheckpointCompletion completion,
                                           std::string* error) {
+    PersistenceControlResult result =
+        checkpoint_async_result(std::move(completion));
+    if (!result.accepted() && error != nullptr) {
+        *error = result.error;
+    }
+    return result.accepted();
+}
+
+PersistenceControlResult
+PersistenceManager::shutdown_async_result(CheckpointCompletion completion) {
     std::lock_guard<std::mutex> lock(operation_mutex_);
-    return start_checkpoint_locked(std::move(completion), false, error);
+    if (shutdown_complete_) {
+        return control_fail(PersistenceControlStatus::kShutdownComplete,
+                            "persistence shutdown is complete");
+    }
+    if (shutdown_requested_) {
+        return control_fail(PersistenceControlStatus::kShuttingDown,
+                            "persistence shutdown has already been requested");
+    }
+    return start_checkpoint_locked(std::move(completion), true);
 }
 
 bool PersistenceManager::shutdown_async(CheckpointCompletion completion,
                                         std::string* error) {
-    std::lock_guard<std::mutex> lock(operation_mutex_);
-    if (shutdown_requested_ || shutdown_complete_) {
-        if (error != nullptr) {
-            *error = "persistence shutdown has already been requested";
-        }
-        return false;
+    PersistenceControlResult result =
+        shutdown_async_result(std::move(completion));
+    if (!result.accepted() && error != nullptr) {
+        *error = result.error;
     }
-    return start_checkpoint_locked(std::move(completion), true, error);
+    return result.accepted();
 }
 
-bool PersistenceManager::start_checkpoint_locked(
-    CheckpointCompletion completion, bool shutdown, std::string* error) {
-    if (!opened_ || failed_) {
-        if (error != nullptr) {
-            *error = failed_ ? mutation_io_error : "persistence is not open";
-        }
-        return false;
+PersistenceControlResult
+PersistenceManager::start_checkpoint_locked(CheckpointCompletion completion,
+                                            bool shutdown) {
+    if (!opened_) {
+        return control_fail(PersistenceControlStatus::kNotOpen,
+                            "persistence is not open");
+    }
+    if (failed_) {
+        return control_fail(PersistenceControlStatus::kIoError,
+                            mutation_io_error);
     }
     if (!group_commit_started_) {
-        if (error != nullptr) {
-            *error = "group commit writer is not started";
-        }
-        return false;
+        return control_fail(PersistenceControlStatus::kGroupCommitNotStarted,
+                            "group commit writer is not started");
     }
     if (checkpoint_operation_) {
-        if (error != nullptr) {
-            *error = "another persistence control operation is in progress";
-        }
-        return false;
+        return control_fail(
+            PersistenceControlStatus::kBusy,
+            "another persistence control operation is in progress");
     }
     if (shutdown_complete_) {
-        if (error != nullptr) {
-            *error = "persistence shutdown is complete";
-        }
-        return false;
+        return control_fail(PersistenceControlStatus::kShutdownComplete,
+                            "persistence shutdown is complete");
     }
     if (!shutdown && shutdown_requested_) {
-        if (error != nullptr) {
-            *error = "persistence is shutting down";
-        }
-        return false;
+        return control_fail(PersistenceControlStatus::kShuttingDown,
+                            "persistence is shutting down");
     }
     if (checkpoint_worker_.joinable()) {
-        if (error != nullptr) {
-            *error = "previous checkpoint worker has not been joined";
-        }
-        return false;
+        return control_fail(PersistenceControlStatus::kBusy,
+                            "previous checkpoint worker has not been joined");
     }
 
     std::string writer_error;
     if (!ensure_group_commit_writer_locked(&writer_error)) {
-        if (error != nullptr) {
-            *error = writer_error;
-        }
-        return false;
+        return control_fail(failed_ ? PersistenceControlStatus::kIoError
+                                    : PersistenceControlStatus::kNotReady,
+                            writer_error.empty() ? "group commit is not ready"
+                                                 : writer_error);
     }
 
     auto operation = std::make_unique<CheckpointOperation>();
@@ -2205,10 +2233,16 @@ bool PersistenceManager::start_checkpoint_locked(
         stats_.background_checkpoint_state =
             failed_ ? BackgroundCheckpointState::kFailed
                     : BackgroundCheckpointState::kIdle;
-        if (error != nullptr) {
-            *error = control_error;
+        PersistenceControlStatus status = PersistenceControlStatus::kBusy;
+        if (failed_) {
+            status = PersistenceControlStatus::kIoError;
+        } else if (state == GroupCommitWriterState::kStopped ||
+                   state == GroupCommitWriterState::kDraining) {
+            status = PersistenceControlStatus::kShuttingDown;
         }
-        return false;
+        return control_fail(status, control_error.empty()
+                                        ? "checkpoint could not start"
+                                        : control_error);
     }
 
     if (shutdown) {
@@ -2225,7 +2259,22 @@ bool PersistenceManager::start_checkpoint_locked(
         }
         observe_transaction_metrics_locked();
     }
-    return true;
+    return control_fail(PersistenceControlStatus::kAccepted, {});
+}
+
+PersistenceControlResult
+PersistenceManager::control_fail(PersistenceControlStatus status,
+                                 const std::string& error) const {
+    PersistenceControlResult result;
+    result.status = status;
+    result.error = error;
+    return result;
+}
+
+void PersistenceManager::set_checkpoint_rdb_publish_hook(
+    std::function<void()> callback) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    checkpoint_rdb_publish_hook_ = std::move(callback);
 }
 
 void PersistenceManager::pause_checkpoint_admission_locked(
@@ -2372,61 +2421,80 @@ void PersistenceManager::on_checkpoint_rotated(
                         try {
                             CheckpointJob job;
                             job.snapshot = std::move(snapshot);
-                            checkpoint_worker_ = std::thread([this,
-                                                              job = std::move(
-                                                                  job)]() mutable {
-                                std::vector<std::uint8_t> image;
-                                RdbSaveTimings timings;
-                                std::string serialize_error;
-                                RdbSaveResult write_result =
-                                    RdbSaveResult::Failed;
-                                std::string write_error;
-                                if (!rdb_manager_->serialize(
-                                        job.snapshot, &image, &timings,
-                                        &serialize_error)) {
-                                    write_error =
-                                        serialize_error.empty()
-                                            ? "RDB serialization failed"
-                                            : serialize_error;
-                                } else {
-                                    write_result = rdb_manager_->write_durable(
-                                        image, &timings, &write_error);
-                                    if (write_result == RdbSaveResult::Ok) {
-                                        maybe_pause_after_checkpoint_rdb_publish();
-                                    }
-                                    if (write_result != RdbSaveResult::Ok &&
-                                        write_error.empty()) {
+                            std::function<void()> rdb_publish_hook =
+                                checkpoint_rdb_publish_hook_;
+                            checkpoint_worker_ =
+                                std::thread([this, job = std::move(job),
+                                             rdb_publish_hook = std::move(
+                                                 rdb_publish_hook)]() mutable {
+                                    std::vector<std::uint8_t> image;
+                                    RdbSaveTimings timings;
+                                    std::string serialize_error;
+                                    RdbSaveResult write_result =
+                                        RdbSaveResult::Failed;
+                                    std::string write_error;
+                                    if (!rdb_manager_->serialize(
+                                            job.snapshot, &image, &timings,
+                                            &serialize_error)) {
                                         write_error =
-                                            write_result ==
-                                                    RdbSaveResult::
-                                                        DurabilityUnconfirmed
-                                                ? "checkpoint snapshot "
-                                                  "durability is "
-                                                  "unconfirmed"
-                                                : "failed to publish "
-                                                  "checkpoint snapshot";
+                                            serialize_error.empty()
+                                                ? "RDB serialization failed"
+                                                : serialize_error;
+                                    } else {
+                                        write_result =
+                                            rdb_manager_->write_durable(
+                                                image, &timings, &write_error);
+                                        if (write_result == RdbSaveResult::Ok &&
+                                            rdb_publish_hook) {
+                                            try {
+                                                rdb_publish_hook();
+                                            } catch (const std::exception& ex) {
+                                                Log::Error(std::string(
+                                                               "checkpoint RDB "
+                                                               "publish hook "
+                                                               "threw: ") +
+                                                           ex.what());
+                                            } catch (...) {
+                                                Log::Error("checkpoint RDB "
+                                                           "publish hook "
+                                                           "threw an unknown "
+                                                           "exception");
+                                            }
+                                        }
+                                        if (write_result != RdbSaveResult::Ok &&
+                                            write_error.empty()) {
+                                            write_error =
+                                                write_result ==
+                                                        RdbSaveResult::
+                                                            DurabilityUnconfirmed
+                                                    ? "checkpoint snapshot "
+                                                      "durability is "
+                                                      "unconfirmed"
+                                                    : "failed to publish "
+                                                      "checkpoint snapshot";
+                                        }
                                     }
-                                }
-                                try {
-                                    dispatch_owner([this, write_result,
-                                                    write_error =
-                                                        std::move(write_error),
-                                                    timings]() mutable {
-                                        on_checkpoint_written(
-                                            write_result, write_error,
-                                            timings.serialize_us,
-                                            timings.write_us, timings.fsync_us);
-                                    });
-                                } catch (const std::exception& ex) {
-                                    Log::Error(
-                                        std::string("checkpoint completion "
-                                                    "dispatch failed: ") +
-                                        ex.what());
-                                } catch (...) {
-                                    Log::Error("checkpoint completion "
-                                               "dispatch failed");
-                                }
-                            });
+                                    try {
+                                        dispatch_owner([this, write_result,
+                                                        write_error = std::move(
+                                                            write_error),
+                                                        timings]() mutable {
+                                            on_checkpoint_written(
+                                                write_result, write_error,
+                                                timings.serialize_us,
+                                                timings.write_us,
+                                                timings.fsync_us);
+                                        });
+                                    } catch (const std::exception& ex) {
+                                        Log::Error(
+                                            std::string("checkpoint completion "
+                                                        "dispatch failed: ") +
+                                            ex.what());
+                                    } catch (...) {
+                                        Log::Error("checkpoint completion "
+                                                   "dispatch failed");
+                                    }
+                                });
                         } catch (const std::exception& ex) {
                             mark_failed();
                             finish_now = true;

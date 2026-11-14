@@ -51,6 +51,14 @@ class HttpResponse {
     void set_body(const std::string& body) {
         body_ = body;
     }
+    // HEAD responses keep the Content-Length a GET would produce but omit
+    // the body bytes on the wire.  Suppression never changes framing.
+    void set_suppress_body(bool on) {
+        suppress_body_ = on;
+    }
+    bool suppress_body() const {
+        return suppress_body_;
+    }
     void add_header(const std::string& key, const std::string& value) {
         headers_[key] = value;
     }
@@ -61,6 +69,7 @@ class HttpResponse {
     HttpStatusCode status_code_;
     std::string status_message_;
     bool close_connection_;
+    bool suppress_body_ = false;
     std::string body_;
 };
 

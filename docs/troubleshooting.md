@@ -22,10 +22,11 @@ clang++ --version
 ctest --test-dir build/release -N | tail -n 3
 ~~~
 
-The final local acceptance inventory is 440 CTest cases, including 31
-`ProcessIntegrationTest.*` cases. Always identify the build directory and
-configuration you are actually using; an old or partial build can report a
-different count.
+The current post-R4-D HTTP hardening inventory is 449 CTest cases in the Debug
+build, including 31 `ProcessIntegrationTest.*` cases. The historical R4-D
+six-configuration matrix remains 440/440 per configuration. Always identify the
+build directory and configuration you are actually using; an old or partial
+build can report a different count.
 
 Do not use reset, checkout, clean, or a broad delete to fix a build problem.
 Preserve persistence images and test artifacts until the cause is understood.
@@ -52,20 +53,21 @@ cmake --build build/debug -j2
 ctest --test-dir build/debug -N | tail -n 3
 ~~~
 
-The current inventory is 395 tests. A lower count usually means an old build
+The current Debug inventory is 449 tests. A lower count usually means an old build
 directory or an incomplete build. The 214 count in
 `docs/A_H_ACCEPTANCE_REPORT.md` is historical pre-WAL evidence and is not the
 current inventory.
 
 ## A process integration test is missing
 
-The current process suite has 26 cases and covers CLI validation, HTTP/KV
+The current process suite has 31 cases and covers CLI validation, HTTP/KV
 persistence, TTL scanner lifecycle, corrupt startup, save failure, crash
 recovery, interval flush, writer-lock conflict, WAL tail truncation, manifest
 corruption, missing WAL segment, middle-of-file WAL corruption, legacy import,
-random kill replay, TTL crash recovery, async mutation ordering, group-commit
-stats, shutdown failure exit codes, the stats contract, the transaction
-contract, and the background-checkpoint rename-before-manifest crash.
+random kill replay, TTL crash recovery, async mutation ordering, pipelined
+HEAD/GET ordering, group-commit stats, shutdown failure exit codes, the stats
+contract, the transaction contract, Agent recovery/fencing, and the
+background-checkpoint rename-before-manifest crash.
 
 Run only that suite in Release:
 
@@ -73,7 +75,7 @@ Run only that suite in Release:
 ctest --preset release -R '^ProcessIntegrationTest\.' --output-on-failure
 ~~~
 
-If fewer than 26 are discovered, rebuild the full test target rather than
+If fewer than 31 are discovered, rebuild the full test target rather than
 running `process_integration_test.py` ad hoc outside CTest.
 
 ## TSan fails with unexpected memory mapping
@@ -429,7 +431,7 @@ nonzero.
 
 These are intentional protocol limits, not necessarily server bugs:
 
-- 400: malformed request line, invalid Host, bad framing, or unsupported Upgrade;
+- 400: malformed request line, invalid Host, bad framing, unsupported Upgrade, or an unsupported/ambiguous query;
 - 413: body or pending input exceeds the limit;
 - 414: request line or target exceeds the limit;
 - 431: header bytes or field count exceeds the limit;
@@ -448,7 +450,9 @@ can backpressure the server; the output budget is 1.25 MiB per connection.
 
 If the process accepts connections but no test progresses, capture a bounded
 strace and inspect the server log. Do not add unbounded sleeps to make tests
-pass.
+pass. For HEAD, read the status and headers, honor `Content-Length` as GET
+metadata, and do not wait for body bytes; the connection is ready for the next
+response immediately after the header terminator.
 
 ## KV returns ERROR and closes
 
@@ -480,7 +484,12 @@ are different and require a restart after repair.
   does not reset the countdown.
 - SET clears an existing TTL.
 
-TTL is not exposed through the HTTP route table; use the KV protocol.
+The HTTP control plane exposes read-only TTL metadata only through the exact
+query `GET/HEAD /kv/<key>?ttl=1`. It does not expose EXPIRE; use the binary KV
+protocol to set or change TTL. An empty, repeated, unknown, or differently
+valued query returns 400, and a missing or expired key returns 404. For HEAD,
+the same JSON length is reported in `Content-Length` but the JSON body is
+suppressed.
 
 ## Fuzz run produces an artifact
 

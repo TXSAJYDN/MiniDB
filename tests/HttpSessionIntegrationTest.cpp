@@ -4,6 +4,7 @@
 #include "../src/base/Buffer.h"
 #include "../src/net/EventLoop.h"
 #include "../src/net/InetAddress.h"
+#include "../src/net/TcpConnection.h"
 #include "../src/protocol/HttpParser.h"
 #include "../src/protocol/HttpServer.h"
 #include "../src/storage/KvStore.h"
@@ -25,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <map>
 #include <memory>
@@ -90,6 +92,7 @@ struct HttpReply {
 
 class HttpClient {
   public:
+    struct AdoptFdTag {};
     explicit HttpClient(uint16_t port) {
         fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
                        IPPROTO_TCP);
@@ -129,6 +132,8 @@ class HttpClient {
         const int one = 1;
         (void)::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     }
+
+    HttpClient(int fd, AdoptFdTag) : fd_(fd) {}
 
     ~HttpClient() {
         Close();
@@ -175,6 +180,12 @@ class HttpClient {
                                  std::chrono::milliseconds delay) {
         Deadline deadline(std::chrono::seconds(20));
         return ReadResponseInternal(deadline, chunk_size, delay);
+    }
+
+    HttpReply ReadHeadResponse() {
+        Deadline deadline(std::chrono::seconds(15));
+        return ReadResponseInternal(deadline, 64u * 1024u,
+                                    std::chrono::milliseconds(0), false);
     }
 
     void ExpectEof(
@@ -278,7 +289,8 @@ class HttpClient {
     }
 
     HttpReply ReadResponseInternal(Deadline& deadline, size_t chunk_size,
-                                   std::chrono::milliseconds delay) {
+                                   std::chrono::milliseconds delay,
+                                   bool expect_body = true) {
         if (chunk_size == 0) {
             chunk_size = 1;
         }
@@ -376,6 +388,13 @@ class HttpClient {
         }
 
         const size_t body_begin = header_end + 4;
+        if (!expect_body) {
+            // HEAD carries the GET metadata and Content-Length but no body
+            // bytes.  Consume only the header block so pipelined responses
+            // remain intact for the next read.
+            receive_buffer_.erase(0, body_begin);
+            return reply;
+        }
         while (receive_buffer_.size() < body_begin + reply.content_length) {
             const size_t before = receive_buffer_.size();
             ReceiveMore(deadline, chunk_size);
@@ -439,6 +458,15 @@ void ExpectStatus(const HttpReply& reply, int status) {
     EXPECT_EQ(reply.content_length, reply.body.size());
 }
 
+void ExpectHeadStatus(const HttpReply& reply, int status) {
+    EXPECT_EQ(reply.status_code, status)
+        << "reason: " << reply.reason << ", header-only response";
+    EXPECT_FALSE(reply.reason.empty());
+    EXPECT_TRUE(reply.has_header("content-length"));
+    EXPECT_TRUE(reply.has_header("connection"));
+    EXPECT_TRUE(reply.body.empty());
+}
+
 void ExpectAllow(const HttpReply& reply, const std::string& allow) {
     EXPECT_EQ(HeaderValue(reply, "Allow"), allow);
 }
@@ -467,9 +495,10 @@ HttpReply ExpectApplicationResponse(HttpClient& client, const std::string& raw,
     return reply;
 }
 
-HttpReply Exchange(HttpClient& client, const std::string& request) {
+HttpReply Exchange(HttpClient& client, const std::string& request,
+                   bool expect_body = true) {
     client.SendAll(request);
-    return client.ReadResponse();
+    return expect_body ? client.ReadResponse() : client.ReadHeadResponse();
 }
 
 class HttpSessionIntegrationTest : public ::testing::Test {
@@ -487,29 +516,24 @@ class HttpSessionIntegrationTest : public ::testing::Test {
 
     void TearDown() override {
         StopServer();
-        if (!rdb_path_.empty()) {
-            (void)::unlink(rdb_path_.c_str());
-        }
         if (!temp_dir_.empty()) {
-            (void)::rmdir(temp_dir_.c_str());
+            std::error_code ec;
+            std::filesystem::remove_all(temp_dir_, ec);
         }
     }
 
     void StartServer(
-        std::chrono::milliseconds idle_timeout = std::chrono::seconds(30)) {
+        std::chrono::milliseconds idle_timeout = std::chrono::seconds(30),
+        bool open_persistence = false) {
         ASSERT_FALSE(server_thread_.joinable());
 
         auto store = std::make_shared<KvStore>();
-        store->set("test_key", "test_value");
-        for (int i = 0; i < 100; ++i) {
-            store->set("key" + std::to_string(i), "value" + std::to_string(i));
-        }
-        store_ = store;
 
         std::promise<uint16_t> ready;
         std::future<uint16_t> port = ready.get_future();
-        server_thread_ = std::thread(
-            [this, store, idle_timeout, ready = std::move(ready)]() mutable {
+        server_thread_ =
+            std::thread([this, store, idle_timeout, open_persistence,
+                         ready = std::move(ready)]() mutable {
                 bool published = false;
                 try {
                     EventLoop loop;
@@ -518,12 +542,32 @@ class HttpSessionIntegrationTest : public ::testing::Test {
                     HttpServer server(&loop, listen_address, rdb_path_);
                     server.set_kv_store(store);
                     server.set_idle_timeout(idle_timeout);
+                    if (open_persistence) {
+                        if (!server.load_rdb()) {
+                            throw std::runtime_error(
+                                "failed to open HTTP test persistence");
+                        }
+                        // Recovery owns the authoritative store; seed only
+                        // after load() so a recovered image cannot hide test
+                        // keys.
+                        store_ = server.kv_store();
+                    } else {
+                        store_ = store;
+                    }
+                    store_->set("test_key", "test_value");
+                    for (int i = 0; i < 100; ++i) {
+                        store_->set("key" + std::to_string(i),
+                                    "value" + std::to_string(i));
+                    }
                     server.start();
+                    server_pointer_.store(&server);
                     ready.set_value(server.listen_address().port());
                     published = true;
                     loop.loop();
+                    server_pointer_.store(nullptr);
                     loop_pointer_.store(nullptr);
                 } catch (...) {
+                    server_pointer_.store(nullptr);
                     loop_pointer_.store(nullptr);
                     if (!published) {
                         ready.set_exception(std::current_exception());
@@ -543,8 +587,11 @@ class HttpSessionIntegrationTest : public ::testing::Test {
     }
 
     void StopServer() {
+        HttpServer* server = server_pointer_.exchange(nullptr);
         EventLoop* loop = loop_pointer_.exchange(nullptr);
-        if (loop != nullptr) {
+        if (server != nullptr && loop != nullptr) {
+            loop->queue_in_loop([server]() { server->begin_shutdown(); });
+        } else if (loop != nullptr) {
             loop->quit();
         }
         if (server_thread_.joinable()) {
@@ -557,6 +604,7 @@ class HttpSessionIntegrationTest : public ::testing::Test {
     std::shared_ptr<KvStore> store_;
     std::thread server_thread_;
     std::atomic<EventLoop*> loop_pointer_{nullptr};
+    std::atomic<HttpServer*> server_pointer_{nullptr};
     uint16_t port_ = 0;
 };
 
@@ -572,12 +620,12 @@ TEST_F(HttpSessionIntegrationTest, HealthRoutesAndMethodAllowMatrix) {
 
     reply = Exchange(client, BuildRequest("POST", "/health"));
     ExpectStatus(reply, 405);
-    ExpectAllow(reply, "GET");
+    ExpectAllow(reply, "GET, HEAD");
     EXPECT_EQ(reply.body, "405 Method Not Allowed\n");
 
     reply = Exchange(client, BuildRequest("DELETE", "/health"));
     ExpectStatus(reply, 405);
-    ExpectAllow(reply, "GET");
+    ExpectAllow(reply, "GET, HEAD");
 
     reply = Exchange(client, BuildRequest("GET", "/echo"));
     ExpectStatus(reply, 405);
@@ -607,10 +655,8 @@ TEST_F(HttpSessionIntegrationTest, KvCrudHandlesBinaryValuesAndQueries) {
     EXPECT_EQ(reply.body, "OK\n");
 
     reply = Exchange(client, BuildRequest("GET", "/kv/bin-key?ignored=yes"));
-    ExpectStatus(reply, 200);
-    EXPECT_EQ(reply.body, binary_value);
-    EXPECT_EQ(lower_ascii(HeaderValue(reply, "Content-Type")),
-              "application/octet-stream");
+    ExpectStatus(reply, 400);
+    EXPECT_EQ(reply.body, "Only the ttl=1 query is supported\n");
 
     reply = Exchange(client, BuildRequest("GET", "/kv/test_key"));
     ExpectStatus(reply, 200);
@@ -1020,6 +1066,220 @@ TEST_F(HttpSessionIntegrationTest,
     EXPECT_EQ(reply.body.size(), payload.size());
     EXPECT_EQ(reply.body, payload);
     client.ExpectEof(std::chrono::seconds(5));
+}
+
+TEST_F(HttpSessionIntegrationTest, HeadResponsesMatchGetMetadata) {
+    StartServer(std::chrono::seconds(30), true);
+    HttpClient client(port_);
+
+    const HttpReply health_get =
+        Exchange(client, BuildRequest("GET", "/health"));
+    const HttpReply health_head =
+        Exchange(client, BuildRequest("HEAD", "/health"), false);
+    ExpectHeadStatus(health_head, 200);
+    EXPECT_EQ(health_head.content_length, health_get.body.size());
+    EXPECT_EQ(health_head.content_length, 3u);
+    EXPECT_EQ(HeaderValue(health_head, "Content-Type"),
+              HeaderValue(health_get, "Content-Type"));
+
+    const HttpReply stats_get = Exchange(client, BuildRequest("GET", "/stats"));
+    const HttpReply stats_head =
+        Exchange(client, BuildRequest("HEAD", "/stats"), false);
+    ExpectHeadStatus(stats_head, 200);
+    EXPECT_EQ(stats_head.content_length, stats_get.body.size());
+    EXPECT_EQ(HeaderValue(stats_head, "Content-Type"),
+              HeaderValue(stats_get, "Content-Type"));
+
+    const HttpReply value_get =
+        Exchange(client, BuildRequest("GET", "/kv/test_key"));
+    const HttpReply value_head =
+        Exchange(client, BuildRequest("HEAD", "/kv/test_key"), false);
+    ExpectHeadStatus(value_head, 200);
+    EXPECT_EQ(value_head.content_length, value_get.body.size());
+    EXPECT_EQ(HeaderValue(value_head, "Content-Type"),
+              HeaderValue(value_get, "Content-Type"));
+
+    HttpReply reply =
+        Exchange(client, BuildRequest("HEAD", "/kv/no-such-key"), false);
+    ExpectHeadStatus(reply, 404);
+    EXPECT_EQ(reply.content_length, std::string("404 Not Found\n").size());
+
+    reply = Exchange(client, BuildRequest("HEAD", "/echo"), false);
+    ExpectHeadStatus(reply, 405);
+    ExpectAllow(reply, "POST");
+    EXPECT_EQ(reply.content_length,
+              std::string("405 Method Not Allowed\n").size());
+
+    reply = Exchange(client, BuildRequest("HEAD", "/missing"), false);
+    ExpectHeadStatus(reply, 404);
+
+    // A HEAD response must not consume bytes belonging to the next
+    // pipelined response.
+    client.SendAll(BuildRequest("HEAD", "/health") +
+                   BuildRequest("GET", "/kv/test_key"));
+    const HttpReply pipelined_head = client.ReadHeadResponse();
+    ExpectHeadStatus(pipelined_head, 200);
+    EXPECT_EQ(pipelined_head.content_length, 3u);
+    const HttpReply pipelined_get = client.ReadResponse();
+    ExpectStatus(pipelined_get, 200);
+    EXPECT_EQ(pipelined_get.body, "test_value");
+}
+
+TEST_F(HttpSessionIntegrationTest, HeadInternalServerErrorSuppressesBody) {
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                           0, fds),
+              0);
+
+    EventLoop loop;
+    auto connection = std::make_shared<TcpConnection>(
+        &loop, "head-500-connection", fds[1], InetAddress(0, true),
+        InetAddress(0, true));
+    auto session = std::make_shared<HttpSession>(connection);
+    session->set_async_request_callback(
+        [](const HttpRequest&, HttpResponse*,
+           HttpSession::ResponseSender) -> bool {
+            throw std::runtime_error("intentional HEAD failure");
+        });
+    connection->set_message_callback(
+        [session](const TcpConnectionPtr&, Buffer* input) {
+            session->on_message(input);
+        });
+    session->start();
+    connection->connect_established();
+
+    HttpReply reply;
+    std::exception_ptr client_error;
+    std::thread client_thread([&]() {
+        try {
+            HttpClient client(fds[0], HttpClient::AdoptFdTag{});
+            client.SendAll(BuildRequest("HEAD", "/throws"));
+            reply = client.ReadHeadResponse();
+            client.ExpectEof();
+        } catch (...) {
+            client_error = std::current_exception();
+        }
+        loop.queue_in_loop([&loop]() { loop.quit(); });
+    });
+
+    const auto timer = loop.run_after(5000, [&loop]() { loop.quit(); });
+    loop.loop();
+    client_thread.join();
+    loop.cancel_timer(timer);
+
+    if (client_error) {
+        try {
+            std::rethrow_exception(client_error);
+        } catch (const std::exception& ex) {
+            FAIL() << ex.what();
+        }
+    }
+    ExpectHeadStatus(reply, 500);
+    EXPECT_EQ(reply.content_length,
+              std::string("Internal Server Error\n").size());
+}
+
+TEST_F(HttpSessionIntegrationTest, HeadServiceUnavailableSuppressesBody) {
+    StartServer(std::chrono::seconds(30), false);
+    HttpClient client(port_);
+
+    const HttpReply get = Exchange(client, BuildRequest("GET", "/stats"));
+    ExpectStatus(get, 503);
+    EXPECT_EQ(get.body, "Persistence is not open\n");
+
+    const HttpReply head =
+        Exchange(client, BuildRequest("HEAD", "/stats"), false);
+    ExpectHeadStatus(head, 503);
+    EXPECT_EQ(head.content_length, get.body.size());
+    EXPECT_EQ(HeaderValue(head, "Content-Type"),
+              HeaderValue(get, "Content-Type"));
+}
+
+TEST_F(HttpSessionIntegrationTest, KvTtlQueryReturnsMetadata) {
+    StartServer();
+    HttpClient client(port_);
+
+    HttpReply reply =
+        Exchange(client, BuildRequest("POST", "/kv/ttl-key", "ttl-value"));
+    ExpectStatus(reply, 200);
+
+    const HttpReply no_expiry_get =
+        Exchange(client, BuildRequest("GET", "/kv/ttl-key?ttl=1"));
+    ExpectStatus(no_expiry_get, 200);
+    EXPECT_EQ(no_expiry_get.body, "{\"ttl_ms\":null}\n");
+    EXPECT_EQ(HeaderValue(no_expiry_get, "Content-Type"), "application/json");
+
+    const HttpReply no_expiry_head =
+        Exchange(client, BuildRequest("HEAD", "/kv/ttl-key?ttl=1"), false);
+    ExpectHeadStatus(no_expiry_head, 200);
+    EXPECT_EQ(no_expiry_head.content_length, no_expiry_get.body.size());
+    EXPECT_EQ(HeaderValue(no_expiry_head, "Content-Type"), "application/json");
+
+    ASSERT_TRUE(store_->expire("ttl-key", 60000));
+    const HttpReply expiring_get =
+        Exchange(client, BuildRequest("GET", "/kv/ttl-key?ttl=1"));
+    ExpectStatus(expiring_get, 200);
+    EXPECT_EQ(expiring_get.body.rfind("{\"ttl_ms\":", 0), 0u);
+    EXPECT_EQ(expiring_get.body.find("null"), std::string::npos);
+    EXPECT_EQ(expiring_get.body.back(), '\n');
+
+    const HttpReply expiring_head =
+        Exchange(client, BuildRequest("HEAD", "/kv/ttl-key?ttl=1"), false);
+    ExpectHeadStatus(expiring_head, 200);
+    EXPECT_GT(expiring_head.content_length, 0u);
+
+    const HttpReply missing_get =
+        Exchange(client, BuildRequest("GET", "/kv/missing-ttl?ttl=1"));
+    ExpectStatus(missing_get, 404);
+    const HttpReply missing_head =
+        Exchange(client, BuildRequest("HEAD", "/kv/missing-ttl?ttl=1"), false);
+    ExpectHeadStatus(missing_head, 404);
+
+    store_->set("expired-ttl", "gone");
+    ASSERT_TRUE(store_->expire("expired-ttl", 1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    reply = Exchange(client, BuildRequest("GET", "/kv/expired-ttl?ttl=1"));
+    ExpectStatus(reply, 404);
+    reply =
+        Exchange(client, BuildRequest("HEAD", "/kv/expired-ttl?ttl=1"), false);
+    ExpectHeadStatus(reply, 404);
+}
+
+TEST_F(HttpSessionIntegrationTest, HttpQueryContractMatrix) {
+    StartServer();
+    HttpClient client(port_);
+
+    const std::vector<std::string> rejected_get_targets = {
+        "/kv/test_key?",
+        "/kv/test_key?foo=bar",
+        "/kv/test_key?ttl=1&ttl=1",
+        "/kv/test_key?ttl",
+        "/kv/test_key?ttl=0",
+        "/kv/test_key?ttl=01",
+        "/kv/test_key?ttl=1&extra=1",
+        "/health?",
+        "/health?ttl=1",
+        "/stats?x=1",
+        "/missing?x=1",
+    };
+    for (const std::string& target : rejected_get_targets) {
+        const HttpReply reply = Exchange(client, BuildRequest("GET", target));
+        ExpectStatus(reply, 400);
+        EXPECT_FALSE(reply.body.empty()) << target;
+    }
+
+    HttpReply reply =
+        Exchange(client, BuildRequest("POST", "/kv/query-post?ttl=1", "value"));
+    ExpectStatus(reply, 400);
+    EXPECT_EQ(reply.body,
+              "Query parameters are not supported for this request\n");
+
+    reply = Exchange(client, BuildRequest("DELETE", "/kv/query-delete?ttl=1"));
+    ExpectStatus(reply, 400);
+
+    reply = Exchange(client, BuildRequest("HEAD", "/health?ttl=1"), false);
+    ExpectHeadStatus(reply, 400);
+    EXPECT_GT(reply.content_length, 0u);
 }
 
 } // namespace

@@ -1,13 +1,13 @@
 # MiniDB 项目状态
 
-- 更新时间：2026-11-12（Asia/Shanghai）
+- 更新时间：2026-11-14（Asia/Shanghai）
 - 当前定位：**面向有界资源的单机 crash-consistent KV 存储服务**
 - 权威开发工作树：`/home/win11/projects/miniDB`（WSL2 Ubuntu 24.04）
 - Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
 - 当前发布：**v0.1.0（2026-11-12），Apache-2.0**
 - 当前阶段：**R0-R3、R4-A、R4-B、R4-C 和 R4-D 全部完成；R4-D 已通过证据提交自身的 9/9 CI 发布验收**
-- 当前测试清单：**440 项 CTest**（R4-D 六配置本地验证矩阵）；31 个进程级用例、六个固定 seed fuzz target
+- 当前测试清单：**449 项 CTest**（post-R4-D HTTP 控制面加固的 Debug 本地验证）；31 个进程级用例、六个固定 seed fuzz target；R4-D 历史六配置矩阵为每配置 440/440
 
 ## 1. 当前结论
 
@@ -29,6 +29,9 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 - 有界 admission queue、物理 batch 和 completion backlog，满时明确拒绝或 fail-stop；
 - SAVE、checkpoint 和 shutdown 使用两阶段短 barrier：capture 独立快照后恢复 writer，RDB 序列化与持久化在后台 worker 完成，最终 pause 后发布 manifest；
 - HTTP `/stats` 与 KV `STATS` 共享的持久化诊断快照；
+- HTTP 与 KV 前端共用 `ServerPersistenceRuntime` 管理 store、manager、TTL scanner、INTERVAL timer 和优雅关闭，控制操作使用 typed outcome；
+- HTTP `HEAD` 对 `/health`、`/stats` 和 `/kv/<key>` 保持 GET 等价 Header 与 `Content-Length` 且发送零 body；
+- 严格 query 契约：只有 `GET/HEAD /kv/<key>?ttl=1` 返回 TTL JSON 元数据，其他查询返回 400；
 - R4-A 成功 append、data fsync、`SYNC` 持久化路径计时、固定 fsync 延迟桶和顶层 `group_commit` 指标；
 - R4-B checkpoint admission/capture/serialize/write/fsync/manifest/cleanup 分段指标及 `background_checkpoint_state`；
 - Snapshot Isolation + first-committer-wins 显式事务，per-key 版本链、私有写集和单条 `kTxn` 原子提交；
@@ -57,6 +60,7 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 | R4-B 后台全量 checkpoint | DONE | ADR-007、两阶段 barrier、独立 snapshot capture、后台 RDB I/O、完整 live segment manifest、348 项测试和正式 artifact |
 | R4-C MVCC/事务 | DONE | ADR-008、版本链、Snapshot Isolation、first-committer-wins、单记录 `kTxn`、GC/TTL、事务协议和恢复；395 项测试 |
 | R4-D Agent 持久状态后端 | DONE; run 43101139773 9/9 | ADR-009（Accepted）、`AGENT=12`、MDAR/MDOR、幂等/CAS/lease/fence、session/tool/generic/GC、恢复和 stats；440 项测试、31 个进程用例、六个 fuzz target |
+| Post-R4-D HTTP 控制面加固 | DONE（本地 Debug） | typed control outcomes、共享 `ServerPersistenceRuntime`、JSON escaping、HEAD 语义、严格 query/TTL 契约和独立 test hook 二进制；449 项测试、31 个进程用例；远程 CI 需由该提交自身完成 |
 
 ## 3. 新定位与范围
 
@@ -200,6 +204,9 @@ R4-A 组提交、R4-B 后台 checkpoint、R4-C MVCC 事务与 R4-D Agent 状态�
   3,526.336；checkpoint probe 5 轮 SAVE 全部成功、0 checkpoint failure，总耗时
   中位数 387,509 us；显式 backpressure 233 次，不是已确认写丢失；
 - 本地证据不替代远程 CI，也不构成生产验收。
+- post-R4-D HTTP 控制面加固的当前 Debug 门禁为 **449/449 CTest**，包含 31 个
+  进程级用例；本次未重跑 Release、ASan、UBSan、ASan+UBSan 或 TSan，也不把
+  历史 R4-D 的六配置/远程 CI 结果继承给该工作树。
 
 正式 benchmark 原始数据：
 

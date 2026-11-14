@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cstdint>
 #include <exception>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -179,6 +180,84 @@ bool KvSession::handle_command(const KvProtocol::Command& cmd) {
         }
         store_->set(cmd.args[0], cmd.args[1]);
         return send_response(KvProtocol::kOk, {});
+
+    case KvProtocol::kMset: {
+        if (cmd.args.empty() || (cmd.args.size() % 2) != 0) {
+            send_response(KvProtocol::kError,
+                          {"MSET requires one or more key value pairs"});
+            return true;
+        }
+        if (cmd.args.size() / 2 > KvProtocol::kMaxMsetPairs) {
+            send_response(KvProtocol::kError,
+                          {"MSET exceeds the 127-pair wire limit"});
+            return true;
+        }
+        if (active_txn_id_ != 0) {
+            send_response(
+                KvProtocol::kError,
+                {"MSET is unavailable inside an explicit transaction"});
+            return true;
+        }
+
+        std::vector<std::pair<std::string, std::string>> entries;
+        entries.reserve(cmd.args.size() / 2);
+        std::set<std::string> seen;
+        std::size_t payload_size = 0;
+        for (std::size_t index = 0; index < cmd.args.size(); index += 2) {
+            const std::string& key = cmd.args[index];
+            const std::string& value = cmd.args[index + 1];
+            if (!validate_key(key, "MSET")) {
+                return true;
+            }
+            if (!seen.insert(key).second) {
+                send_response(KvProtocol::kError,
+                              {"MSET contains a duplicate key"});
+                return true;
+            }
+            if (key.size() > KvProtocol::kMaxMsetPayloadSize ||
+                value.size() > KvProtocol::kMaxMsetPayloadSize - key.size() ||
+                payload_size > KvProtocol::kMaxMsetPayloadSize - key.size() -
+                                   value.size()) {
+                send_response(KvProtocol::kError,
+                              {"MSET key/value payload exceeds 1 MiB"});
+                return true;
+            }
+            payload_size += key.size() + value.size();
+            entries.emplace_back(key, value);
+        }
+
+        if (persistence_manager_) {
+            std::weak_ptr<KvSession> weak = weak_from_this();
+            const MutationAdmission admission =
+                persistence_manager_->mset_async(
+                    std::move(entries), [weak](MutationOutcome outcome) {
+                        if (auto self = weak.lock()) {
+                            self->on_mutation_completed(std::move(outcome),
+                                                        KvProtocol::kOk);
+                        }
+                    });
+            return begin_async_operation(admission);
+        }
+
+        const std::size_t versions = store_->version_count();
+        const std::size_t version_limit = store_->max_versions();
+        if (versions > version_limit ||
+            entries.size() > version_limit - versions) {
+            send_response(KvProtocol::kError,
+                          {"MSET exceeds the in-memory version limit"});
+            return true;
+        }
+        try {
+            for (const auto& [key, value] : entries) {
+                store_->set(key, value);
+            }
+        } catch (const std::exception& ex) {
+            Log::Error(std::string("in-memory MSET failed: ") + ex.what());
+            send_response(KvProtocol::kError, {"MSET failed"});
+            return true;
+        }
+        return send_response(KvProtocol::kOk, {});
+    }
 
     case KvProtocol::kGet:
         if (!require_args(1, "GET requires 1 argument") ||

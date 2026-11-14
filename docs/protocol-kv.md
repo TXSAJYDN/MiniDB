@@ -7,11 +7,12 @@ designed for MiniDB's single-node, bounded-resource environment. It is not a
 Redis wire-protocol implementation and does not provide a general command
 language.
 
-Explicit multi-key transactions and the `AGENT=12` durable Agent-state backend
-are available on the binary protocol only. Transactions provide snapshot
-isolation with first-committer-wins conflict detection; Agent operations use
-strict revision/CAS, idempotency, and session leases. HTTP exposes neither a
-transaction handle nor an Agent API. See
+Explicit multi-key transactions, atomic `MSET=13` writes, and the `AGENT=12`
+durable Agent-state backend are available on the binary protocol only.
+Transactions provide snapshot isolation with first-committer-wins conflict
+detection; `MSET` is one atomic multi-key record, not an explicit transaction;
+Agent operations use strict revision/CAS, idempotency, and session leases. HTTP
+exposes neither a transaction handle nor an Agent API. See
 [ADR-008](decisions/008-mvcc-transactions.md) and
 [ADR-009](decisions/009-agent-state-backend.md) for the frozen semantics.
 
@@ -73,12 +74,13 @@ value.
 | `COMMIT` | 10 | 0 | `OK` with one ASCII commit LSN (`0` for a read-only transaction) |
 | `ROLLBACK` | 11 | 0 | `OK` with no arguments |
 | `AGENT` | 12 | subcommand + subcommand arguments | `VALUE` containing one `MDOR` response; see below |
+| `MSET` | 13 | 1..127 `key value` pairs | `OK` with no arguments |
 
-Mutation commands are `SET`, `DEL`, and `EXPIRE`; Agent mutations are the
-specific `AGENT` subcommands listed below. A standalone KV mutation is an
-implicit one-operation transaction. Its response is sent only after the
-persistence manager accepts the mutation according to the selected durability
-mode.
+Mutation commands are `SET`, `MSET`, `DEL`, and `EXPIRE`; Agent mutations are
+the specific `AGENT` subcommands listed below. A standalone KV mutation is an
+implicit one-operation transaction; `MSET` is one atomic multi-key record. Its
+response is sent only after the persistence manager accepts the operation
+according to the selected durability mode.
 
 ## Durability modes
 
@@ -208,6 +210,76 @@ Conflict response:
 00 00 00 02 69 00
 ~~~
 
+
+## Atomic `MSET`
+
+`MSET` accepts one or more `key value` pairs. It is an atomic multi-key write
+that reuses MiniDB's existing transaction WAL record without creating an
+explicit transaction.
+
+### Arguments and limits
+
+| Item | Rule |
+|---|---|
+| Pair count | 1..127 over the wire |
+| Key | 1..1024 bytes |
+| Value | 0..1 MiB |
+| Raw key + value bytes | At most 1 MiB across the command |
+| Encoded `MTXN` payload | At most 1 MiB including transaction/operation headers |
+| Duplicate key | Rejected; input is not order-dependent |
+
+The wire limit is **127 pairs**, not 256: the frame has `argc:u8`, so a maximum
+of 255 arguments can be represented; `MSET` requires an even number and uses at
+most 254 arguments. The persistence API itself can admit up to the existing
+256-operation transaction limit for direct non-wire callers, but no protocol
+frame can reach that count.
+
+`MSET` is rejected as a whole before WAL admission when any of these checks
+fails:
+
+- the argument list is empty or has an odd length;
+- a key is empty or longer than 1 KiB;
+- a value is larger than 1 MiB;
+- the key/value list or encoded `MTXN` payload exceeds its 1 MiB limit;
+- a duplicate key occurs;
+- a key is in the reserved Agent namespace;
+- the command is issued inside an explicit transaction;
+- persistence admission or the group-commit queue rejects the record.
+
+### Atomicity and isolation
+
+The server sorts entries by key and encodes them as `SET` operations in one
+existing `MTXN` payload carried by one `kTxn` WAL record. The operation receives
+exactly one LSN and one completion callback. After recovery, every key from that
+record is replayed atomically: either all values are restored or none are.
+
+`MSET` does **not**:
+
+- allocate a transaction id or appear in transaction statistics;
+- create a snapshot or provide transaction-local reads;
+- run first-committer-wins validation for itself;
+- make `MGET` available, or return the values it wrote.
+
+Its admitted keys still participate in the pending-key conflict tracking used
+by explicit transactions. Therefore a concurrent transaction whose snapshot
+predates the `MSET` can return `CONFLICT` if it later commits a write to one of
+those keys. The transaction conflict formula and `kTxn` commit path are
+unchanged.
+
+`MSET` is unavailable inside `BEGIN`; it returns `ERROR` and leaves the active
+transaction unchanged. To update several keys with snapshot isolation or
+read-your-writes, use an explicit transaction instead.
+
+The success response is:
+
+~~~text
+OK argc=0
+~~~
+
+`SYNC` mode acknowledges only after the WAL record is fsynced and the complete
+multi-key apply succeeds. `INTERVAL` mode uses the same bounded flush window as
+ordinary KV mutations. A failed admission writes no key; a persistence fail-stop
+is never converted into a successful `MSET` response.
 
 ## Agent durable state backend
 
@@ -654,8 +726,8 @@ Responses use exactly the same frame layout as requests.
 - `AGENT` application outcomes such as `VERSION_MISMATCH`, `LEASE_HELD`, and
   `FENCED` are successful transport exchanges carrying an `MDOR` in a
   `VALUE` response. They are not connection errors.
-- `AGENT` inside an explicit transaction returns `ERROR` and leaves the
-  transaction active and unchanged.
+- `AGENT` or `MSET` inside an explicit transaction returns `ERROR` and
+  leaves the transaction active and unchanged.
 - Invalid transaction command sequences and argument errors leave an existing
   transaction active. `CONFLICT`, transaction resource exhaustion, or a
   persistence failure ends it.

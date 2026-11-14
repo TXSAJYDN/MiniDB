@@ -22,11 +22,11 @@ clang++ --version
 ctest --test-dir build/release -N | tail -n 3
 ~~~
 
-The current post-R4-D HTTP hardening inventory is 449 CTest cases in the Debug
-build, including 31 `ProcessIntegrationTest.*` cases. The historical R4-D
-six-configuration matrix remains 440/440 per configuration. Always identify the
-build directory and configuration you are actually using; an old or partial
-build can report a different count.
+The current post-R4-D HTTP-hardening plus `MSET` inventory is 459 CTest cases
+in the Debug build, including 32 `ProcessIntegrationTest.*` cases. The
+historical R4-D six-configuration matrix remains 440/440 per configuration.
+Always identify the build directory and configuration you are actually using;
+an old or partial build can report a different count.
 
 Do not use reset, checkout, clean, or a broad delete to fix a build problem.
 Preserve persistence images and test artifacts until the cause is understood.
@@ -53,21 +53,21 @@ cmake --build build/debug -j2
 ctest --test-dir build/debug -N | tail -n 3
 ~~~
 
-The current Debug inventory is 449 tests. A lower count usually means an old build
+The current Debug inventory is 459 tests. A lower count usually means an old build
 directory or an incomplete build. The 214 count in
 `docs/A_H_ACCEPTANCE_REPORT.md` is historical pre-WAL evidence and is not the
 current inventory.
 
 ## A process integration test is missing
 
-The current process suite has 31 cases and covers CLI validation, HTTP/KV
+The current process suite has 32 cases and covers CLI validation, HTTP/KV
 persistence, TTL scanner lifecycle, corrupt startup, save failure, crash
-recovery, interval flush, writer-lock conflict, WAL tail truncation, manifest
-corruption, missing WAL segment, middle-of-file WAL corruption, legacy import,
-random kill replay, TTL crash recovery, async mutation ordering, pipelined
-HEAD/GET ordering, group-commit stats, shutdown failure exit codes, the stats
-contract, the transaction contract, Agent recovery/fencing, and the
-background-checkpoint rename-before-manifest crash.
+recovery, atomic `MSET` crash recovery, interval flush, writer-lock conflict,
+WAL tail truncation, manifest corruption, missing WAL segment, middle-of-file
+WAL corruption, legacy import, random kill replay, TTL crash recovery, async
+mutation ordering, pipelined HEAD/GET ordering, group-commit stats, shutdown
+failure exit codes, the stats contract, the transaction contract, Agent
+recovery/fencing, and the background-checkpoint rename-before-manifest crash.
 
 Run only that suite in Release:
 
@@ -75,7 +75,7 @@ Run only that suite in Release:
 ctest --preset release -R '^ProcessIntegrationTest\.' --output-on-failure
 ~~~
 
-If fewer than 31 are discovered, rebuild the full test target rather than
+If fewer than 32 are discovered, rebuild the full test target rather than
 running `process_integration_test.py` ad hoc outside CTest.
 
 ## TSan fails with unexpected memory mapping

@@ -214,6 +214,48 @@ TEST(KvProtocolTest, AgentCommandCodeNameAndFrameRoundTrip) {
     EXPECT_EQ(parsed.args, args);
 }
 
+TEST(KvProtocolTest, MsetCommandCodeNameAndFrameRoundTrip) {
+    EXPECT_EQ(static_cast<int>(KvProtocol::kMset), 13);
+    EXPECT_EQ(KvProtocol::kMaxMsetPairs, 127u);
+    EXPECT_EQ(KvProtocol::command_type_to_string(KvProtocol::kMset), "MSET");
+
+    const std::vector<std::string> args = {
+        "alpha",
+        "one",
+        "beta",
+        "two",
+        std::string("bin\0key", 7),
+        std::string("bin\0value", 9),
+    };
+    const auto encoded = KvProtocol::encode_command(KvProtocol::kMset, args);
+    KvProtocol::Command parsed;
+    ASSERT_EQ(
+        KvProtocol::parse_command(encoded.data(), encoded.size(), &parsed),
+        static_cast<int>(encoded.size()));
+    EXPECT_EQ(static_cast<int>(parsed.type),
+              static_cast<int>(KvProtocol::kMset));
+    EXPECT_EQ(parsed.args, args);
+}
+
+TEST(KvProtocolTest, MsetWireLimitIsOneHundredTwentySevenPairs) {
+    std::vector<std::string> args;
+    args.reserve(2 * KvProtocol::kMaxMsetPairs);
+    for (std::size_t index = 0; index < KvProtocol::kMaxMsetPairs; ++index) {
+        args.push_back("key-" + std::to_string(index));
+        args.push_back("value");
+    }
+    const auto encoded = KvProtocol::encode_command(KvProtocol::kMset, args);
+    KvProtocol::Command parsed;
+    ASSERT_EQ(
+        KvProtocol::parse_command(encoded.data(), encoded.size(), &parsed),
+        static_cast<int>(encoded.size()));
+    EXPECT_EQ(parsed.args.size(), 2 * KvProtocol::kMaxMsetPairs);
+
+    args.push_back("overflow-key");
+    args.push_back("overflow-value");
+    EXPECT_THROW(KvProtocol::encode_command(KvProtocol::kMset, args),
+                 std::invalid_argument);
+}
 TEST(KvProtocolTest, NullInputsAreRejected) {
     KvProtocol::Command parsed;
     const uint8_t byte = 0;

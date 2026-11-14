@@ -39,6 +39,7 @@ KV_BEGIN = 9
 KV_COMMIT = 10
 KV_ROLLBACK = 11
 KV_AGENT = 12
+KV_MSET = 13
 KV_ERROR = 100
 KV_OK = 101
 KV_VALUE = 102
@@ -1152,6 +1153,45 @@ def test_kv_sync_crash_recovery():
                   f"KV recovery did not replay the write chain: {stats!r}")
             check(restarted.terminate_group(signal.SIGTERM) == 0,
                   f"KV recovery shutdown failed:\n{restarted.log}")
+        finally:
+            restarted.cleanup()
+
+
+def test_mset_crash_recovery():
+    with tempfile.TemporaryDirectory(prefix="minidb-process-mset-crash-") as temp_dir:
+        rdb_path = os.path.join(temp_dir, "mset-sync-crash.rdb")
+        port = free_loopback_port()
+        expected = (
+            (b"mset-a", b"value\x00a"),
+            (b"mset-b", b"value-b"),
+        )
+        server = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            args = []
+            for key, value in expected:
+                args.extend([key, value])
+            command_type, response_args = kv_request(port, KV_MSET, args)
+            check(command_type == KV_OK and response_args == [],
+                  f"KV MSET returned type={command_type}, "
+                  f"args={response_args!r}")
+            server.kill_group()
+        finally:
+            server.cleanup()
+
+        restarted = start_kv(port, rdb_path, temp_dir, "sync")
+        try:
+            for key, value in expected:
+                command_type, response_args = kv_request(port, HTTP_GET, [key])
+                check(command_type == KV_VALUE and response_args == [value],
+                      f"KV MSET key {key!r} was not recovered atomically: "
+                      f"type={command_type}, args={response_args!r}")
+            stats = read_kv_stats(port)
+            check(stats["recovery"]["wal_records_replayed"] >= 1,
+                  f"KV MSET recovery replayed no WAL record: {stats!r}")
+            check(stats["last_lsn"] >= 1,
+                  f"KV MSET recovery LSN moved backwards: {stats!r}")
+            check(restarted.terminate_group(signal.SIGTERM) == 0,
+                  f"KV MSET recovery shutdown failed:\n{restarted.log}")
         finally:
             restarted.cleanup()
 
@@ -2415,6 +2455,7 @@ CASES = {
     "ShutdownFailureExit": test_shutdown_failure_exit_code,
     "HttpSyncCrashRecovery": test_http_sync_crash_recovery,
     "KvSyncCrashRecovery": test_kv_sync_crash_recovery,
+    "MsetCrashRecovery": test_mset_crash_recovery,
     "IntervalFlushRecovery": test_interval_flush_recovery,
     "BackgroundCheckpointRenameCrash": test_background_checkpoint_rename_crash,
     "WriterLockConflict": test_writer_lock_conflict,

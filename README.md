@@ -107,6 +107,25 @@ HTTP 和 KV 服务不应同时指向同一个 RDB 路径。单写者锁会拒绝
 
 收到 `SIGINT` 或 `SIGTERM` 后，服务会停止接收请求、flush INTERVAL WAL，并执行最终 checkpoint。正常关闭退出码为 0 才表示最终 checkpoint 成功。
 
+### 原子 `MSET`
+
+`MSET`（命令码 13）在二进制 KV 协议中一次写入 1..127 个 `key value` 对。协议帧的
+`argc` 是 `u8`，因此最多 254 个参数，也就是 **127 对**；不是原计划中的 256 对。
+编码后的 `MTXN` payload（包含记录头）必须不超过 1 MiB。空列表、奇数参数、重复
+key、非法 key/value、Agent 保留命名空间和超限 payload 都会在写入前整体拒绝。
+
+- 服务端按 key 排序后编码为现有单条 `kTxn` WAL 记录，只分配一个 LSN，并在应用
+  成功后返回一个 `OK`；
+- 崩溃恢复按单条记录原子重放：同一 `MSET` 的所有 key 要么一起恢复，要么都不
+  恢复；
+- `MSET` 不创建事务 id、快照或事务统计，不提供快照读，也不能在显式 `BEGIN`
+  事务内执行；它不是 `BEGIN/COMMIT` 的替代品；
+- 当前没有新增 `MGET`；批量验证时逐 key `GET`；
+- `SYNC` 下只有 WAL fsync 和内存应用都完成后才确认；`INTERVAL` 仍受既有 flush
+  窗口约束。
+
+完整规则见 [KV 协议](docs/protocol-kv.md#atomic-mset)。
+
 ### Agent 持久状态后端
 
 Agent API 只存在于二进制 KV 协议中：命令码 `AGENT=12`，包含 15 个
@@ -226,9 +245,9 @@ Agent 持久状态后端均已实现。R4-D 的历史本地六配置质量门禁
 
 - Debug、Release、ASan、UBSan、ASan+UBSan、TSan 六种构建配置；
 - 每个配置 **440 项 CTest**，包含 31 个 `ProcessIntegrationTest.*` 进程级用例；
-- 当前 post-R4-D HTTP 控制面加固在 **Debug 配置通过 449/449 项 CTest**，
-  仍包含 31 个进程级用例；本次没有重跑六配置，不把 Debug 结果外推到其他
-  配置，也不继承历史提交的远程 CI；
+- 当前 post-R4-D 工作树（HTTP 控制面加固 + 8.3 改动 9 `MSET`）在 **Debug
+  配置通过 459/459 项 CTest**，包含 32 个进程级用例；本次没有重跑六配置，
+  不把 Debug 结果外推到其他配置，也不继承历史提交的远程 CI；
 - 组提交 writer 的顺序、batch 上限、queue/backlog full、append/fsync 失败、cleanup barrier、fail-stop 和 callback 恰好一次测试；
 - 后台 checkpoint 状态机、完整 live segment 保留、cleanup 失败重试、manager 析构回调安全，以及 rename 后/manifest 前崩溃恢复测试；
 - HTTP/KV 异步 mutation、断开连接安全、流水线响应顺序、SAVE/STATS 和 shutdown 失败退出码测试；
@@ -237,6 +256,7 @@ Agent 持久状态后端均已实现。R4-D 的历史本地六配置质量门禁
   control outcomes 和共享 runtime 测试；进程级 rename-before-manifest 崩溃
   用例使用独立的 `minidb_http_test_server`，生产二进制不编译 test hook；
 - 事务快照读、read-your-writes、first-committer-wins、pending commit 冲突窗口、只读提交、断连回滚、原子 `kTxn` 恢复、TTL/GC、资源上限和事务 stats 契约测试；
+- `MSET` 的 127 对 wire 上限、1 MiB 编码 payload 上限、重复 key/显式事务内拒绝、单 `kTxn`/单 LSN，以及 `SIGKILL` 后多 key 原子恢复测试；
 - Agent codec、保留命名空间、revision/CAS、幂等重放、lease/fence 接管、tool 状态机、GC、恢复 fail-stop 和 stats 契约测试；
 - Agent 进程级用例覆盖幂等崩溃恢复、lease takeover、RUNNING tool 恢复、命名空间碰撞和 stats；
 - HTTP、KV、WAL record、manifest、Agent record codec、Agent protocol 六个固定 seed fuzz target；

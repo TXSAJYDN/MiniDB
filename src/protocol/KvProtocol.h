@@ -26,6 +26,7 @@ class KvProtocol {
         kCommit = 10,
         kRollback = 11,
         kAgent = 12,
+        kMset = 13,
         kError = 100,
         kOk = 101,
         kValue = 102,
@@ -48,6 +49,12 @@ class KvProtocol {
     static constexpr uint32_t kMaxFrameSize = kMaxArgumentSize + (64u * 1024u);
     static constexpr size_t kMaxKeySize = 1024;
     static constexpr size_t kMaxArgumentCount = 255;
+    // MSET carries key/value pairs in the existing argc:u8 wire field, so
+    // its real wire limit is 127 pairs (254 arguments).  The persistence
+    // layer accepts up to WalFormat::MAX_TXN_OPS (256) entries for direct
+    // callers, but no single wire frame can exceed this protocol limit.
+    static constexpr size_t kMaxMsetPairs = kMaxArgumentCount / 2;
+    static constexpr size_t kMaxMsetPayloadSize = kMaxArgumentSize;
 
     // Throws std::invalid_argument for a command that cannot be represented
     // without narrowing or exceeding the wire limits.

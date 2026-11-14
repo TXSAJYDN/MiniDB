@@ -565,6 +565,123 @@ TEST(PersistenceManagerTest,
               MutationAdmissionStatus::kShuttingDown);
 }
 
+TEST(PersistenceManagerTest, MsetCommitsOneAtomicRecordAndRecoversEveryKey) {
+    DatabasePaths paths("minidb_persistence_mset_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    {
+        auto store = std::make_shared<KvStore>(clock);
+        PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+        std::string error;
+        ASSERT_TRUE(manager.open(&error)) << error;
+        OwnerPump pump;
+        ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error))
+            << error;
+
+        std::size_t completions = 0;
+        MutationOutcome completed;
+        ASSERT_TRUE(manager
+                        .mset_async({{"beta", "two"}, {"alpha", "one"}},
+                                    [&](MutationOutcome outcome) {
+                                        completed = std::move(outcome);
+                                        ++completions;
+                                    })
+                        .accepted());
+        ASSERT_TRUE(pump.RunUntil([&]() { return completions == 1; }));
+        ASSERT_TRUE(completed.ok()) << completed.error;
+        EXPECT_TRUE(completed.changed);
+        EXPECT_EQ(completed.lsn, 1u);
+        EXPECT_EQ(store->get("alpha"), std::optional<std::string>("one"));
+        EXPECT_EQ(store->get("beta"), std::optional<std::string>("two"));
+
+        const PersistenceSnapshot snapshot = manager.snapshot();
+        EXPECT_EQ(snapshot.last_lsn, 1u);
+        EXPECT_EQ(snapshot.next_lsn, 2u);
+        EXPECT_EQ(snapshot.persistence.mutations, 1u);
+        EXPECT_EQ(snapshot.persistence.sync_mutations, 1u);
+        EXPECT_EQ(snapshot.transactions.started, 0u);
+        EXPECT_EQ(snapshot.transactions.committed, 0u);
+        EXPECT_EQ(snapshot.transactions.commit_records, 0u);
+    }
+
+    auto recovered = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(recovered, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    EXPECT_EQ(recovered->get("alpha"), std::optional<std::string>("one"));
+    EXPECT_EQ(recovered->get("beta"), std::optional<std::string>("two"));
+    EXPECT_EQ(manager.snapshot().recovery.wal_records_replayed, 1u);
+    EXPECT_EQ(manager.snapshot().last_lsn, 1u);
+}
+
+TEST(PersistenceManagerTest, MsetRejectsInvalidBatchesBeforeAdmission) {
+    DatabasePaths paths("minidb_persistence_mset_invalid_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    auto expect_rejected = [&](MutationAdmission admission,
+                               MutationAdmissionStatus expected) {
+        EXPECT_EQ(admission.status, expected) << admission.error;
+        EXPECT_FALSE(admission.accepted());
+    };
+
+    expect_rejected(manager.mset_async({}, {}),
+                    MutationAdmissionStatus::kInvalidArgument);
+    expect_rejected(manager.mset_async({{"same", "one"}, {"same", "two"}}, {}),
+                    MutationAdmissionStatus::kInvalidArgument);
+    const std::string reserved =
+        std::string(AgentRecordCodec::kReservedPrefix) + "mset";
+    expect_rejected(manager.mset_async({{reserved, "value"}}, {}),
+                    MutationAdmissionStatus::kInvalidArgument);
+
+    std::vector<std::pair<std::string, std::string>> too_many;
+    too_many.reserve(WalFormat::MAX_TXN_OPS + 1);
+    for (std::size_t index = 0; index <= WalFormat::MAX_TXN_OPS; ++index) {
+        too_many.emplace_back("key-" + std::to_string(index), "value");
+    }
+    expect_rejected(manager.mset_async(std::move(too_many), {}),
+                    MutationAdmissionStatus::kResourceLimit);
+
+    const PersistenceSnapshot snapshot = manager.snapshot();
+    EXPECT_EQ(snapshot.last_lsn, 0u);
+    EXPECT_EQ(snapshot.persistence.mutations, 0u);
+    EXPECT_EQ(snapshot.wal.appends, 0u);
+    EXPECT_FALSE(store->get("same").has_value());
+    EXPECT_FALSE(store->get(reserved).has_value());
+}
+
+TEST(PersistenceManagerTest, MsetRejectsEncodedPayloadOverWalLimit) {
+    DatabasePaths paths("minidb_persistence_mset_payload_");
+    auto clock =
+        std::make_shared<minidb_test::FrozenClock>(1000, 1700000000000);
+    auto store = std::make_shared<KvStore>(clock);
+    PersistenceManager manager(store, paths.rdb, DurabilityMode::kSync);
+    std::string error;
+    ASSERT_TRUE(manager.open(&error)) << error;
+    OwnerPump pump;
+    ASSERT_TRUE(manager.start_group_commit(pump.dispatcher(), &error)) << error;
+
+    // The value fits the individual WAL value limit, but the transaction
+    // header/op overhead and key push the encoded MTXN payload over 1 MiB.
+    const std::string large_value(WalFormat::MAX_VALUE_SIZE, 'x');
+    const MutationAdmission admission =
+        manager.mset_async({{"large", large_value}}, {});
+    EXPECT_EQ(admission.status, MutationAdmissionStatus::kResourceLimit);
+    EXPECT_FALSE(admission.accepted());
+    EXPECT_FALSE(store->get("large").has_value());
+
+    const PersistenceSnapshot snapshot = manager.snapshot();
+    EXPECT_EQ(snapshot.last_lsn, 0u);
+    EXPECT_EQ(snapshot.persistence.mutations, 0u);
+    EXPECT_EQ(snapshot.wal.appends, 0u);
+}
+
 TEST(PersistenceManagerTest,
      AsyncCheckpointDrainsAppliesAndResumesAtTheManifestBoundary) {
     DatabasePaths paths("minidb_persistence_async_checkpoint_");

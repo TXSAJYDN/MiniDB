@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace minidb {
@@ -280,6 +281,12 @@ class PersistenceManager {
 
     MutationAdmission set_async(const std::string& key, std::string value,
                                 MutationCompletion completion);
+    // Atomic multi-key SET.  The entries are encoded as one existing kTxn
+    // WAL record and applied as one record; this is not an explicit
+    // transaction and does not create a snapshot or transaction id.
+    MutationAdmission
+    mset_async(std::vector<std::pair<std::string, std::string>> entries,
+               MutationCompletion completion);
     MutationAdmission del_async(std::string key, MutationCompletion completion);
     MutationAdmission expire_async(std::string key, std::int64_t ttl_ms,
                                    MutationCompletion completion);
@@ -355,6 +362,7 @@ class PersistenceManager {
   private:
     enum class PendingMutationKind : std::uint8_t {
         kStandalone,
+        kMset,
         kTransaction,
         kAgent,
         kAgentGc,

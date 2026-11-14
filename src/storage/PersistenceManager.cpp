@@ -1486,6 +1486,109 @@ MutationAdmission PersistenceManager::set_async(const std::string& key,
     return admit_async(std::move(record), std::move(completion));
 }
 
+MutationAdmission PersistenceManager::mset_async(
+    std::vector<std::pair<std::string, std::string>> entries,
+    MutationCompletion completion) {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    if (!opened_ || failed_) {
+        return admission_fail(failed_ ? MutationAdmissionStatus::kIoError
+                                      : MutationAdmissionStatus::kNotReady,
+                              failed_ ? mutation_io_error
+                                      : "persistence is not open");
+    }
+    if (!group_commit_started_) {
+        return admission_fail(MutationAdmissionStatus::kNotReady,
+                              "group commit writer is not started");
+    }
+    if (shutdown_requested_ || shutdown_complete_) {
+        return admission_fail(MutationAdmissionStatus::kShuttingDown,
+                              "persistence is shutting down");
+    }
+    if (!accepting_mutations_) {
+        return admission_fail(MutationAdmissionStatus::kNotReady,
+                              "persistence admission is paused");
+    }
+    if (entries.empty()) {
+        return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                              "MSET requires at least one key value pair");
+    }
+    if (entries.size() > WalFormat::MAX_TXN_OPS) {
+        return admission_fail(MutationAdmissionStatus::kResourceLimit,
+                              "MSET key count exceeds the limit");
+    }
+
+    // A canonical key order makes the MTXN payload deterministic.  Duplicate
+    // keys are rejected because the operation would otherwise be ambiguous.
+    std::sort(entries.begin(), entries.end(),
+              [](const auto& left, const auto& right) {
+                  return left.first < right.first;
+              });
+
+    std::size_t payload_size = WalFormat::TXN_HEADER_SIZE;
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        const std::string& key = entries[index].first;
+        const std::string& value = entries[index].second;
+        if (key.empty() || key.size() > WalFormat::MAX_KEY_SIZE) {
+            return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                                  "invalid key length");
+        }
+        if (is_reserved_agent_key(key)) {
+            return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                                  reserved_agent_key_error);
+        }
+        if (value.size() > WalFormat::MAX_VALUE_SIZE) {
+            return admission_fail(MutationAdmissionStatus::kResourceLimit,
+                                  "value exceeds WAL limit");
+        }
+        if (index > 0 && entries[index - 1].first == key) {
+            return admission_fail(MutationAdmissionStatus::kInvalidArgument,
+                                  "MSET contains a duplicate key");
+        }
+        const std::size_t operation_size =
+            WalFormat::TXN_OP_HEADER_SIZE + key.size() + value.size();
+        if (operation_size > WalFormat::MAX_TXN_PAYLOAD_SIZE ||
+            payload_size > WalFormat::MAX_TXN_PAYLOAD_SIZE - operation_size) {
+            return admission_fail(MutationAdmissionStatus::kResourceLimit,
+                                  "MSET payload exceeds 1 MiB");
+        }
+        payload_size += operation_size;
+    }
+
+    std::vector<WalTxnOp> operations;
+    operations.reserve(entries.size());
+    for (auto& [key, value] : entries) {
+        WalTxnOp operation;
+        operation.op = WalOp::kSet;
+        operation.key = std::move(key);
+        operation.value = std::move(value);
+        operations.push_back(std::move(operation));
+    }
+    std::string payload_error;
+    const std::vector<std::uint8_t> payload =
+        WalFormat::encode_transaction(operations, &payload_error);
+    if (payload.empty()) {
+        return admission_fail(MutationAdmissionStatus::kResourceLimit,
+                              payload_error.empty() ? "MSET payload is invalid"
+                                                    : payload_error);
+    }
+
+    std::string writer_error;
+    if (!ensure_group_commit_writer_locked(&writer_error)) {
+        return admission_fail(failed_ ? MutationAdmissionStatus::kIoError
+                                      : MutationAdmissionStatus::kNotReady,
+                              writer_error);
+    }
+
+    WalRecord record;
+    record.lsn = group_commit_writer_->next_lsn();
+    record.op = WalOp::kTxn;
+    record.key = "txn";
+    record.value.assign(reinterpret_cast<const char*>(payload.data()),
+                        payload.size());
+    return admit_async(std::move(record), std::move(completion),
+                       PendingMutationKind::kMset);
+}
+
 MutationAdmission PersistenceManager::del_async(std::string key,
                                                 MutationCompletion completion) {
     std::lock_guard<std::mutex> lock(operation_mutex_);

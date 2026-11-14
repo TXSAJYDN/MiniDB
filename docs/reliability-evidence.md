@@ -646,11 +646,12 @@ Total successful requests: 340,240. Total errors: 0. Wall-clock collection time:
 - At the time of the historical R3 run, checkpoint pause was stop-the-world
   owner-loop time; R4-B introduced the background checkpoint later.
 
-## Post-R4-D HTTP control hardening evidence
+## Post-R4-D HTTP control hardening and atomic `MSET` evidence
 
 - Date: 2026-11-14 (Asia/Shanghai)
 - Environment: Ubuntu 24.04 WSL2, x86_64, GCC 13.3.0, CMake 3.28.3
-- Scope: local Debug validation only; no performance or remote-CI claim
+- Scope: post-R4-D HTTP hardening plus atomic `MSET`; local Debug validation
+  only, with no performance or remote-CI claim
 
 The complete Debug worktree build and test gate was:
 
@@ -659,8 +660,8 @@ cmake --build build/debug -j2
 ctest --test-dir build/debug --output-on-failure -j2
 ~~~
 
-Result: **449/449 CTest passed**, including **31**
-`ProcessIntegrationTest.*` cases. The suite newly exercises:
+Result: **459/459 CTest passed**, including **32**
+`ProcessIntegrationTest.*` cases. The suite exercises:
 
 - `HEAD /health`, `HEAD /stats`, and `HEAD /kv/<key>` with GET-equivalent
   status/headers/`Content-Length` and zero body bytes, including 500, 503,
@@ -679,11 +680,21 @@ Result: **449/449 CTest passed**, including **31**
 - the process-level checkpoint crash window through
   `minidb_http_test_server`. The RDB-publication hook is compiled only when
   `MINIDB_TEST_HOOKS=1`; the production `minidb_http_server` does not install
-  or contain that test seam.
+  or contain that test seam;
+- the atomic `MSET=13` protocol extension: 127-pair wire limit, duplicate-key
+  and malformed-pair rejection, explicit-transaction refusal, the 1 MiB encoded
+  `MTXN` payload bound, one existing `kTxn` WAL record, one LSN, one completion,
+  no transaction-id/snapshot/statistics side effects, and all-or-nothing
+  recovery;
+- the process-level `MsetCrashRecovery` case: a `SYNC` `MSET` is acknowledged,
+  the server is killed with `SIGKILL`, and both keys are recovered from at least
+  one replayed WAL record after restart.
 
 This is a Debug-only local reproducibility record. It does not replace the
 historical six-configuration R4-D matrix, fuzz matrix, benchmark artifacts, or
-the GitHub Actions result for the commit containing this section.
+the GitHub Actions result for the commit containing this section. The historical
+R4-D matrix remains 440/440 per configuration with 31 process cases; the current
+Debug MSET-extended worktree is 459/459 with 32 process cases.
 
 ## What the evidence does not prove
 

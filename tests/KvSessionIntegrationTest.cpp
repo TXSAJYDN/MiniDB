@@ -808,6 +808,71 @@ TEST_F(KvPersistenceIntegrationTest, AgentGcTimerDeletesTerminalGroups) {
 }
 
 TEST_F(KvPersistenceIntegrationTest,
+       MsetCommitsOneAtomicRecordWithoutTransactionState) {
+    StartServer();
+    KvClient client;
+    client.ConnectTo(port_);
+
+    const auto response =
+        Request(&client, KvProtocol::kMset, {"alpha", "one", "beta", "two"});
+    ExpectType(response, KvProtocol::kOk);
+    EXPECT_TRUE(response.args.empty());
+
+    for (const auto& [key, expected] :
+         std::vector<std::pair<std::string, std::string>>{{"alpha", "one"},
+                                                          {"beta", "two"}}) {
+        const auto value = Request(&client, KvProtocol::kGet, {key});
+        ExpectType(value, KvProtocol::kValue);
+        ASSERT_EQ(value.args.size(), 1u);
+        EXPECT_EQ(value.args[0], expected);
+    }
+
+    const PersistenceSnapshot snapshot =
+        persistence_manager_.load()->snapshot();
+    EXPECT_EQ(snapshot.last_lsn, 1u);
+    EXPECT_EQ(snapshot.next_lsn, 2u);
+    EXPECT_EQ(snapshot.persistence.mutations, 1u);
+    EXPECT_EQ(snapshot.transactions.started, 0u);
+    EXPECT_EQ(snapshot.transactions.committed, 0u);
+    EXPECT_EQ(snapshot.transactions.commit_records, 0u);
+
+    ASSERT_GT(Begin(&client), 0u);
+    const auto in_transaction =
+        Request(&client, KvProtocol::kMset, {"txn-key", "value"});
+    ExpectType(in_transaction, KvProtocol::kError);
+    ASSERT_EQ(in_transaction.args.size(), 1u);
+    EXPECT_NE(in_transaction.args[0].find("explicit transaction"),
+              std::string::npos);
+    ExpectType(Request(&client, KvProtocol::kRollback), KvProtocol::kOk);
+    ExpectType(Request(&client, KvProtocol::kGet, {"txn-key"}),
+               KvProtocol::kNotFound);
+}
+
+TEST_F(KvPersistenceIntegrationTest, MsetPayloadAdmissionFailureWritesNoKeys) {
+    StartServer();
+    KvClient client;
+    client.ConnectTo(port_);
+
+    // Raw key+value bytes fit the protocol's 1 MiB guard, while the encoded
+    // MTXN payload (headers included) exceeds the existing WAL cap by 20
+    // bytes.  The persistence layer must reject the whole command before any
+    // WAL record or in-memory apply occurs.
+    const std::string large_value(524277, 'x');
+    const auto rejected = Request(&client, KvProtocol::kMset,
+                                  {"a", large_value, "b", large_value});
+    ExpectType(rejected, KvProtocol::kError);
+
+    ExpectType(Request(&client, KvProtocol::kGet, {"a"}),
+               KvProtocol::kNotFound);
+    ExpectType(Request(&client, KvProtocol::kGet, {"b"}),
+               KvProtocol::kNotFound);
+    const PersistenceSnapshot snapshot =
+        persistence_manager_.load()->snapshot();
+    EXPECT_EQ(snapshot.last_lsn, 0u);
+    EXPECT_EQ(snapshot.persistence.mutations, 0u);
+    EXPECT_EQ(snapshot.wal.appends, 0u);
+}
+TEST_F(KvPersistenceIntegrationTest,
        ReservedAgentKeysAreRejectedOutsideAndInsideTransactions) {
     StartServer();
     KvClient client;
@@ -865,6 +930,63 @@ TEST_F(KvSessionIntegrationTest, TransactionCommandsReportUnavailable) {
     ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
 }
 
+TEST_F(KvSessionIntegrationTest, MsetWritesAllPairsWithoutPersistence) {
+    StartServer();
+    KvClient client;
+    client.ConnectTo(port_);
+
+    const std::string binary_key("bin\0key", 7);
+    const std::string binary_value("bin\0value", 9);
+    const auto response =
+        Request(&client, KvProtocol::kMset,
+                {"alpha", "one", "beta", "two", binary_key, binary_value});
+    ExpectType(response, KvProtocol::kOk);
+    EXPECT_TRUE(response.args.empty());
+
+    const auto alpha = Request(&client, KvProtocol::kGet, {"alpha"});
+    ExpectType(alpha, KvProtocol::kValue);
+    ASSERT_EQ(alpha.args.size(), 1u);
+    EXPECT_EQ(alpha.args[0], "one");
+
+    const auto beta = Request(&client, KvProtocol::kGet, {"beta"});
+    ExpectType(beta, KvProtocol::kValue);
+    ASSERT_EQ(beta.args.size(), 1u);
+    EXPECT_EQ(beta.args[0], "two");
+
+    const auto binary = Request(&client, KvProtocol::kGet, {binary_key});
+    ExpectType(binary, KvProtocol::kValue);
+    ASSERT_EQ(binary.args.size(), 1u);
+    EXPECT_EQ(binary.args[0], binary_value);
+}
+
+TEST_F(KvSessionIntegrationTest, MsetRejectsInvalidPairLists) {
+    StartServer();
+    KvClient client;
+    client.ConnectTo(port_);
+
+    auto expect_error = [&](const std::vector<std::string>& args) {
+        const auto response = Request(&client, KvProtocol::kMset, args);
+        ExpectType(response, KvProtocol::kError);
+        ASSERT_EQ(response.args.size(), 1u);
+    };
+
+    expect_error({});
+    expect_error({"alpha"});
+    expect_error({"alpha", "one", "alpha", "two"});
+
+    const std::string reserved =
+        std::string(AgentRecordCodec::kReservedPrefix) + "m";
+    expect_error({reserved, "value"});
+
+    const std::string large_value(513 * 1024, 'x');
+    expect_error({"large-a", large_value, "large-b", large_value});
+    ExpectType(Request(&client, KvProtocol::kPing), KvProtocol::kOk);
+
+    const auto alpha = Request(&client, KvProtocol::kGet, {"alpha"});
+    ExpectType(alpha, KvProtocol::kNotFound);
+    const auto large = Request(&client, KvProtocol::kGet, {"large-a"});
+    ExpectType(large, KvProtocol::kNotFound);
+}
 TEST_F(KvSessionIntegrationTest, LargeKeyAndValueSurviveFragmentedWireInput) {
     StartServer();
     KvClient client;

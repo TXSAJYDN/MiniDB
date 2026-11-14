@@ -191,6 +191,7 @@ set(MINIDB_PROCESS_CASES
     ShutdownFailureExit
     HttpSyncCrashRecovery
     KvSyncCrashRecovery
+    MsetCrashRecovery
     IntervalFlushRecovery
     BackgroundCheckpointRenameCrash
     WriterLockConflict

@@ -6,8 +6,8 @@
 - Windows 同步工作树：`E:\c++\miniDB`
 - 远程仓库：`git@github.com:TXSAJYDN/MiniDB.git`
 - 当前发布：**v0.1.0（2026-11-12），Apache-2.0**
-- 当前阶段：**R0-R3、R4-A、R4-B、R4-C 和 R4-D 全部完成；R4-D 已通过证据提交自身的 9/9 CI 发布验收**
-- 当前测试清单：**449 项 CTest**（post-R4-D HTTP 控制面加固的 Debug 本地验证）；31 个进程级用例、六个固定 seed fuzz target；R4-D 历史六配置矩阵为每配置 440/440
+- 当前阶段：**R0-R3、R4-A、R4-B、R4-C 和 R4-D 全部完成；R4-D 已通过证据提交自身的 9/9 CI 发布验收；8.3 改动 9（`MSET`）已在本地 Debug 完成**
+- 当前测试清单：**459 项 CTest**（post-R4-D HTTP 控制面加固与 `MSET` 扩展的 Debug 本地验证）；32 个进程级用例、六个固定 seed fuzz target；R4-D 历史六配置矩阵为每配置 440/440
 
 ## 1. 当前结论
 
@@ -36,6 +36,7 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 - R4-B checkpoint admission/capture/serialize/write/fsync/manifest/cleanup 分段指标及 `background_checkpoint_state`；
 - Snapshot Isolation + first-committer-wins 显式事务，per-key 版本链、私有写集和单条 `kTxn` 原子提交；
 - 事务活跃/版本/提交/冲突/GC 诊断指标及 `BEGIN/COMMIT/ROLLBACK` 协议；
+- 原子 `MSET=13`：1..127 对 key/value 编码为现有单条 `kTxn`，单 LSN 原子应用与恢复；显式事务内拒绝，不提供快照读或 `MGET`；
 - 二进制 KV `AGENT=12` 持久状态后端，包含 session、tool、lease/fence、generic record 和 idempotency；
 - Agent mutation 与幂等结果在同一 `kTxn`、同一 LSN 原子提交，重放不新增 WAL/LSN；
 - Agent 保留命名空间、启动 marker/记录校验、只读恢复、周期 GC、资源上限和 `agent` stats；
@@ -60,7 +61,8 @@ MiniDB 已从单一 mini KV + RDB 快照升级为一条可以被测试和证伪�
 | R4-B 后台全量 checkpoint | DONE | ADR-007、两阶段 barrier、独立 snapshot capture、后台 RDB I/O、完整 live segment manifest、348 项测试和正式 artifact |
 | R4-C MVCC/事务 | DONE | ADR-008、版本链、Snapshot Isolation、first-committer-wins、单记录 `kTxn`、GC/TTL、事务协议和恢复；395 项测试 |
 | R4-D Agent 持久状态后端 | DONE; run 43101139773 9/9 | ADR-009（Accepted）、`AGENT=12`、MDAR/MDOR、幂等/CAS/lease/fence、session/tool/generic/GC、恢复和 stats；440 项测试、31 个进程用例、六个 fuzz target |
-| Post-R4-D HTTP 控制面加固 | DONE（本地 Debug） | typed control outcomes、共享 `ServerPersistenceRuntime`、JSON escaping、HEAD 语义、严格 query/TTL 契约和独立 test hook 二进制；449 项测试、31 个进程用例；远程 CI 需由该提交自身完成 |
+| Post-R4-D HTTP 控制面加固 | DONE（本地 Debug） | typed control outcomes、共享 `ServerPersistenceRuntime`、JSON escaping、HEAD 语义、严格 query/TTL 契约和独立 test hook 二进制；当时 449 项测试、31 个进程用例；远程 CI 需由该提交自身完成 |
+| 8.3 改动 9：原子 `MSET` | DONE（本地 Debug） | `MSET=13`、127 对 wire 上限、1 MiB 编码 payload 上限、单 `kTxn`/单 LSN、显式事务内拒绝和 `SIGKILL` 恢复；459 项测试、32 个进程用例；不新增持久化格式 |
 
 ## 3. 新定位与范围
 
@@ -204,9 +206,12 @@ R4-A 组提交、R4-B 后台 checkpoint、R4-C MVCC 事务与 R4-D Agent 状态�
   3,526.336；checkpoint probe 5 轮 SAVE 全部成功、0 checkpoint failure，总耗时
   中位数 387,509 us；显式 backpressure 233 次，不是已确认写丢失；
 - 本地证据不替代远程 CI，也不构成生产验收。
-- post-R4-D HTTP 控制面加固的当前 Debug 门禁为 **449/449 CTest**，包含 31 个
-  进程级用例；本次未重跑 Release、ASan、UBSan、ASan+UBSan 或 TSan，也不把
-  历史 R4-D 的六配置/远程 CI 结果继承给该工作树。
+- post-R4-D HTTP 控制面加固与 8.3 改动 9 `MSET` 的当前 Debug 门禁为
+  **459/459 CTest**，包含 32 个进程级用例；本次未重跑 Release、ASan、UBSan、
+  ASan+UBSan 或 TSan，也不把历史 R4-D 的六配置/远程 CI 结果继承给该工作树。
+- `MSET` 当前证据包括：codec/127 对 wire 上限、重复 key、空/奇数参数、显式事务
+  内拒绝、1 MiB 编码 payload 拒绝、单 `kTxn`/单 LSN、无事务状态副作用，以及
+  `SYNC` 成功后 `SIGKILL`、重启逐 key 恢复的进程级用例。
 
 正式 benchmark 原始数据：
 
